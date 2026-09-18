@@ -1,0 +1,455 @@
+:root{--bg:#141619;--pan:#1a1d21;--rai:#212529;--ln:#2b3036;--ln2:#383e46;
+--ink:#e8eaed;--ink2:#a2a9b3;--ink3:#6f7782;--sig:#7fb2e8;--sigbg:#16283c;
+--warn:#d9a441;--warnbg:#2e2510;--ok:#6fbf95;--r:5px}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--ink);font:13px/1.5 ui-sans-serif,system-ui,"Segoe UI",Roboto,sans-serif}
+.num{font-variant-numeric:tabular-nums;font-family:ui-monospace,Menlo,Consolas,monospace}
+.app{display:grid;grid-template-columns:186px 1fr 336px;
+grid-template-rows:42px 296px 1fr 38px;height:100vh;
+grid-template-areas:"top top top" "time time time" "rail stage insp" "act act act"}
+/* top */
+.top{grid-area:top;display:flex;align-items:center;gap:10px;padding:0 12px;
+background:var(--pan);border-bottom:1px solid var(--ln)}
+.mark{font-weight:600}.mark span{color:var(--sig)}
+.chipf{display:flex;align-items:center;gap:6px;padding:3px 9px;background:var(--rai);
+border:1px solid var(--ln);border-radius:var(--r);font-size:12px}
+.dot{width:6px;height:6px;border-radius:50%;background:var(--ok)}
+.seg{display:flex;background:var(--rai);border:1px solid var(--ln);border-radius:var(--r);overflow:hidden}
+.seg button{background:none;border:0;color:var(--ink2);padding:4px 12px;font:inherit;cursor:pointer}
+.seg button.on{background:var(--sigbg);color:var(--sig)}
+.btn{background:var(--rai);border:1px solid var(--ln2);color:var(--ink);padding:5px 10px;
+border-radius:var(--r);font:inherit;cursor:pointer;white-space:nowrap}
+.btn:hover{border-color:var(--sig)}
+.btn.go{background:var(--sig);border-color:var(--sig);color:#0d1620;font-weight:500}
+.btn.sm{padding:3px 8px;font-size:11px}
+.btn.dg{border-color:#6b3a3a;color:#e0a0a0}
+/* ---------- TIMELINE (top, full width) ---------- */
+.time{grid-area:time;background:var(--pan);border-bottom:1px solid var(--ln);
+display:flex;flex-direction:column;overflow:hidden}
+.tb{display:flex;align-items:center;gap:5px;padding:5px 10px;border-bottom:1px solid var(--ln);flex-wrap:wrap}
+.sep{width:1px;height:16px;background:var(--ln2);margin:0 4px}
+.lbl{font-size:11px;color:var(--ink2)}
+.nin{width:52px;background:#0f1114;color:var(--ink);border:1px solid var(--ln2);
+border-radius:4px;padding:2px 5px;font:inherit;font-size:11px}
+.chk{display:inline-flex;align-items:center;gap:3px;font-size:11px;color:var(--ink2);cursor:pointer}
+.wininfo{color:#5a80b0;font-size:11px}
+.tc{margin-left:auto;font-size:11px;color:var(--ink)}
+.cvwrap{flex:1;position:relative;overflow:hidden;background:#0f1114}
+.zoom{height:16px;background:#131619;border-top:1px solid var(--ln);position:relative}
+.zwin{position:absolute;top:2px;bottom:2px;background:rgba(255,255,255,.10);
+border:1px solid rgba(255,255,255,.5);border-radius:2px}
+/* canvas fake */
+.rul{height:19px;position:relative;border-bottom:1px solid #23272c;font-size:10px;color:var(--ink3)}
+.tk{position:absolute;top:4px;padding-left:3px;border-left:1px solid #333a42}
+.winstrip{height:15px;position:relative}
+.band{position:absolute;top:2px;bottom:2px}
+.ovl{position:absolute;top:2px;bottom:2px;background:rgba(255,255,255,.22)}
+.tint{position:absolute;top:0;bottom:0}
+.bline{position:absolute;top:0;bottom:0;width:0;border-left:1px dashed rgba(255,200,80,.55)}
+.tracks{position:relative}
+.trk{position:relative;border-bottom:1px solid #23272c}
+.tlab{position:absolute;left:5px;top:3px;font-size:9px;color:var(--ink3);z-index:4}
+.seg-c{position:absolute;border-radius:3px;overflow:hidden;cursor:pointer;
+display:flex;align-items:center;font-size:10px;color:#0d1620;padding:0 5px;white-space:nowrap}
+.seg-c.sel{outline:2px solid #fff;outline-offset:-1px}
+.thumb{position:absolute;top:0;bottom:0;left:0;width:34px;background:#2a2f36;
+display:grid;place-items:center;font-size:8px;color:#8b939d}
+.ph{position:absolute;top:0;bottom:0;width:1px;background:#fff;z-index:6}
+.ph::after{content:"";position:absolute;top:0;left:-4px;border:4px solid transparent;border-top-color:#fff}
+/* rail */
+.rail{grid-area:rail;background:var(--pan);border-right:1px solid var(--ln);overflow-y:auto;padding:8px 0}
+.rh{font-size:10px;color:var(--ink3);padding:9px 12px 4px}
+.st{display:flex;gap:9px;padding:7px 12px;cursor:pointer;border-left:2px solid transparent;color:var(--ink2)}
+.st:hover{background:var(--rai)}
+.st.on{background:var(--rai);border-left-color:var(--sig);color:var(--ink)}
+.st .g{width:17px;height:17px;border-radius:50%;border:1px solid var(--ln2);display:grid;
+place-items:center;font-size:9px;color:var(--ink3);flex:none;margin-top:1px}
+.st.on .g{border-color:var(--sig);color:var(--sig)}
+.st .g.ok{background:var(--ok);border-color:var(--ok);color:#0d1a13}
+.st small{display:block;font-size:10px;color:var(--ink3)}
+/* stage */
+.stage{grid-area:stage;overflow-y:auto;padding:12px 14px}
+.pane{display:none}.pane.on{display:block}
+.bar{display:flex;align-items:center;gap:8px;margin-bottom:10px}
+.bar h2{font-size:15px;font-weight:500}
+.pill{padding:2px 8px;border-radius:9px;border:1px solid var(--ln2);background:var(--rai);
+color:var(--ink2);font-size:11px}
+.pill.w{border-color:var(--warn);color:var(--warn);background:var(--warnbg)}
+.grp{margin-bottom:15px}
+.gl{display:flex;align-items:baseline;gap:8px;margin-bottom:7px}
+.gl h3{font-size:12px;font-weight:500;color:var(--ink2)}
+.gl em{font-style:normal;font-size:10px;color:var(--ink3)}
+.gl .sp{margin-left:auto;display:flex;gap:4px}
+.refs{display:grid;grid-template-columns:repeat(auto-fill,minmax(96px,1fr));gap:8px}
+.ref{background:var(--rai);border:1px solid var(--ln);border-radius:var(--r);overflow:hidden;cursor:grab;position:relative}
+.ref.sel{border-color:var(--sig);box-shadow:0 0 0 1px var(--sig)}
+.ref .th{height:62px;display:grid;place-items:center;font-size:10px;color:var(--ink3);background:#0f1114}
+.ref .mt{padding:4px 6px;display:flex;gap:5px;align-items:center}
+.ref .ix{font-size:10px;color:var(--ink3)}
+.ref .nm{font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.tag{position:absolute;top:4px;right:4px;font-size:9px;padding:0 5px;border-radius:3px;
+background:var(--sigbg);color:var(--sig);border:1px solid #2c4a68}
+.slot{border:1px dashed var(--ln2);border-radius:var(--r);height:92px;display:grid;
+place-items:center;color:var(--ink3);font-size:10px;cursor:pointer;text-align:center}
+.slot:hover{border-color:var(--sig);color:var(--sig)}
+.row{display:flex;align-items:center;gap:8px;margin-bottom:8px}
+.row label{flex:none;width:144px;font-size:11px;color:var(--ink2)}
+.row .v{margin-left:auto;font-size:11px}
+select,input[type=text],textarea{background:#0f1114;color:var(--ink);border:1px solid var(--ln2);
+border-radius:var(--r);padding:5px 7px;font:inherit;flex:1;min-width:0}
+textarea{width:100%;resize:vertical;min-height:54px}
+input[type=range]{-webkit-appearance:none;flex:1;height:3px;background:var(--ln2);border-radius:2px}
+input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:12px;height:12px;
+border-radius:50%;background:var(--sig);cursor:pointer}
+.two{display:grid;grid-template-columns:1fr 1fr;gap:0 20px}
+.card{background:var(--pan);border:1px solid var(--ln);border-radius:var(--r);padding:10px 11px;margin-bottom:10px}
+.card h4{font-size:11px;color:var(--ink3);margin-bottom:8px}
+.note{display:flex;gap:6px;padding:7px 8px;border-radius:var(--r);font-size:11px;line-height:1.45;
+background:var(--warnbg);border:1px solid #4a3a15;color:#e6c98a;margin:8px 0}
+.note.ok{background:#12261d;border-color:#25503b;color:#9ed9bb}
+.tabs{display:flex;gap:2px;border-bottom:1px solid var(--ln);margin-bottom:11px;flex-wrap:wrap}
+.tabs button{background:none;border:0;border-bottom:2px solid transparent;color:var(--ink2);
+padding:6px 10px;font:inherit;cursor:pointer;font-size:12px}
+.tabs button.on{color:var(--sig);border-bottom-color:var(--sig)}
+/* inspector */
+.insp{grid-area:insp;background:var(--pan);border-left:1px solid var(--ln);display:flex;flex-direction:column;overflow:hidden}
+.ih{padding:9px 12px;border-bottom:1px solid var(--ln)}
+.ik{font-size:10px;color:var(--sig)}
+.ih h3{font-size:14px;font-weight:500}
+.ib{flex:1;overflow-y:auto;padding:2px 12px 14px}
+.fs{border-bottom:1px solid var(--ln);padding:9px 0}.fs:last-child{border-bottom:0}
+.fs h4{font-size:10px;color:var(--ink3);margin-bottom:7px}
+.fs .row label{width:92px}
+.hint{font-size:10px;color:var(--ink3);margin:-4px 0 8px 100px}
+.chips{display:flex;flex-wrap:wrap;gap:4px}
+.chip{font-size:10px;padding:2px 6px;border-radius:3px;background:var(--rai);
+border:1px solid var(--ln2);color:var(--ink2);cursor:pointer}
+.chip.on{background:var(--sigbg);border-color:#2c4a68;color:var(--sig)}
+.adv{font-size:11px;color:var(--sig);cursor:pointer}
+.act{grid-area:act;background:var(--pan);border-top:1px solid var(--ln);display:flex;
+align-items:center;gap:8px;padding:0 12px}
+.stat{font-size:11px;color:var(--ink2);margin-left:auto;display:flex;gap:12px;align-items:center}
+
+/* --- H3 Director: iframe host adjustments --- */
+html,body,#root{height:100%;margin:0;padding:0;background:var(--bg);color:var(--ink);
+  font:12px/1.45 ui-sans-serif,system-ui,'Segoe UI',Roboto,sans-serif;}
+#root{display:flex;flex-direction:column;overflow:hidden}
+*{box-sizing:border-box}
+canvas{display:block}
+
+/* ===== H3 Director — additions ===== */
+
+/* Rail: every row the same height, every icon the same box */
+.rail .st{display:flex;align-items:center;gap:9px;width:100%;min-height:44px;
+  padding:7px 10px;text-align:left;border:1px solid transparent;border-radius:var(--r);
+  background:transparent;color:var(--ink);cursor:pointer}
+.rail .st:hover{background:var(--pan);border-color:var(--ln)}
+.rail .st.on{background:var(--sigbg);border-color:var(--sig)}
+.rail .st>div{flex:1;min-width:0;font-size:12px;line-height:1.25}
+.rail .st small{display:block;color:var(--ink3);font-size:10px;white-space:nowrap;
+  overflow:hidden;text-overflow:ellipsis}
+.rail .g{display:inline-flex;align-items:center;justify-content:center;
+  width:26px;height:26px;flex:0 0 26px;border-radius:var(--r);
+  background:var(--rai);border:1px solid var(--ln2);color:var(--ink2)}
+.rail .st.on .g{border-color:var(--sig);color:var(--sig)}
+.rail .g.ok{color:var(--ok);border-color:var(--ok)}
+.rail .g svg{display:block}
+
+/* Timeline waveform + thumbnails.
+   NOTE: .seg-c must stay position:absolute (set above). Overriding it to
+   relative makes every segment flow inline, stacking across all lanes and
+   past the last track. */
+.trk{overflow:hidden}
+canvas.wave{position:absolute;inset:0;width:100%;height:100%;pointer-events:none}
+.seg-c .thumb{position:absolute;left:2px;top:2px;bottom:2px;display:flex;
+  align-items:center;justify-content:center;overflow:hidden;border-radius:3px;
+  background:rgba(0,0,0,.25);font-size:9px}
+.seg-c .thumb img{width:100%;height:100%;object-fit:cover;display:block}
+.seg-c .handle{position:absolute;top:0;bottom:0;width:7px;cursor:ew-resize;
+  background:rgba(0,0,0,.18)}
+.seg-c .handle:hover{background:rgba(255,255,255,.35)}
+.seg-c .handle.l{left:0;border-radius:3px 0 0 3px}
+.seg-c .handle.r{right:0;border-radius:0 3px 3px 0}
+
+/* Reference tiles */
+.dropzone{border:1px dashed var(--ln2);border-radius:var(--r);padding:6px;min-height:76px}
+.dropzone.over{border-color:var(--sig);background:var(--sigbg)}
+.ref{position:relative}
+.ref .th{height:58px;display:flex;align-items:center;justify-content:center;
+  overflow:hidden;border-radius:var(--r);background:var(--rai)}
+.ref .th img{width:100%;height:100%;object-fit:cover;display:block}
+.ref .th.mini-wave{padding:4px 3px}
+.ref .zoom-b,.ref .x-b{position:absolute;top:3px;width:18px;height:18px;padding:0;
+  border:1px solid var(--ln2);border-radius:3px;background:rgba(10,12,15,.78);
+  color:var(--ink2);font-size:11px;line-height:1;cursor:pointer}
+.ref .zoom-b{right:3px}
+.ref .x-b{left:3px;color:var(--warn)}
+.ref .zoom-b:hover,.ref .x-b:hover{border-color:var(--sig);color:var(--sig)}
+.slot.off{opacity:.42;cursor:not-allowed;border-style:dashed}
+.slot.off small{color:var(--warn);font-size:9px}
+
+/* Inspector extras */
+.rh2{font-size:10px;letter-spacing:.06em;text-transform:uppercase;color:var(--ink3);
+  margin:0 0 6px}
+.chk{display:flex;align-items:center;gap:7px;padding:4px 0;font-size:12px;cursor:pointer}
+.chk input{margin:0}
+.hint{margin:4px 0 0;font-size:10.5px;color:var(--ink3);line-height:1.35}
+.mprev{display:block;width:100%;height:120px;padding:0;margin:0 0 8px;overflow:hidden;
+  border:1px solid var(--ln2);border-radius:var(--r);background:var(--rai);cursor:zoom-in}
+.mprev img{width:100%;height:100%;object-fit:contain;display:block}
+.v.good{color:var(--ok)}
+.v.bad{color:var(--warn)}
+
+/* Full-size preview */
+.pv-back{position:fixed;inset:0;z-index:90;background:rgba(8,10,12,.86);
+  display:flex;align-items:center;justify-content:center;padding:22px}
+.pv{display:flex;flex-direction:column;width:min(880px,92vw);height:min(660px,88vh);
+  background:var(--pan);border:1px solid var(--ln2);border-radius:8px;overflow:hidden}
+.pv-h{display:flex;align-items:center;gap:12px;padding:8px 10px;
+  border-bottom:1px solid var(--ln);background:var(--rai)}
+.pv-n{flex:1;min-width:0;font-size:12px;overflow:hidden;text-overflow:ellipsis;
+  white-space:nowrap}
+.pv-b{display:flex;align-items:center;justify-content:center;padding:10px;
+  overflow:auto;min-height:0;background:#0e1013}
+.pv-b img,.pv-b video{max-width:88vw;max-height:78vh;display:block}
+.pv-b audio{width:min(560px,84vw)}
+
+/* Generation status */
+.status-live{border-color:var(--sig)!important}
+.gen-log{max-height:260px;overflow:auto;font-size:11px;line-height:1.5}
+
+.seg-x{position:absolute;top:1px;right:1px;width:15px;height:15px;padding:0;z-index:3;
+  border:1px solid rgba(0,0,0,.35);border-radius:3px;background:rgba(10,12,15,.72);
+  color:#fff;font-size:12px;line-height:1;cursor:pointer}
+.seg-x:hover{background:var(--warn);color:#1b1408}
+.btn.warn{border-color:var(--warn);color:var(--warn)}
+.btn.warn:hover{background:var(--warnbg)}
+
+.miss{display:inline-flex;align-items:center;justify-content:center;width:100%;height:100%;
+  color:var(--warn);background:var(--warnbg);font-weight:700;font-size:13px}
+
+.seg-c[data-xwin="1"]{box-shadow:inset 0 0 0 1.5px var(--warn)}
+.seg-c[data-xwin="1"]::after{content:"\26A0";position:absolute;right:3px;bottom:1px;
+  font-size:9px;color:var(--warn);pointer-events:none}
+.warnbox{border:1px solid var(--warn);background:var(--warnbg);border-radius:var(--r);padding:8px}
+
+.rul .tk::before{content:"";position:absolute;left:0;bottom:-4px;width:1px;height:6px;
+  background:var(--ln2)}
+.rul .tk.minor::before{height:3px;background:var(--ln)}
+
+/* out-of-range items keep their size; they are flagged, never truncated */
+.seg-c[data-oor="1"]{opacity:.45;outline:1px dashed var(--warn);outline-offset:-1px}
+.askbar{display:flex;align-items:center;gap:8px;padding:7px 10px;margin:0 0 6px;
+  border:1px solid var(--warn);background:var(--warnbg);border-radius:var(--r);font-size:12px}
+.askbar .sp{flex:1}
+
+/* Schedule / preview modal. Without these the sheet grew past the viewport and
+   the Close button at the bottom was unreachable. */
+.modal{position:fixed;inset:0;z-index:95;background:rgba(8,10,12,.82);
+  display:flex;align-items:center;justify-content:center;padding:24px}
+.modal .sheet{display:flex;flex-direction:column;width:min(880px,92vw);
+  max-height:86vh;background:var(--pan);border:1px solid var(--ln2);
+  border-radius:8px;overflow:hidden;box-shadow:0 18px 48px rgba(0,0,0,.5)}
+.modal .sheet>h3{flex:0 0 auto;display:flex;align-items:center;margin:0;
+  padding:10px 12px;font-size:13px;border-bottom:1px solid var(--ln);
+  background:var(--rai)}
+.modal .sheet>.body{flex:1 1 auto;overflow-y:auto;padding:12px;min-height:0}
+.modal .sheet pre{white-space:pre-wrap;word-break:break-word;margin:0;
+  font-size:11.5px;line-height:1.5}
+.modal .x{margin-left:auto;width:26px;height:26px;padding:0;line-height:1;
+  font-size:15px;border:1px solid var(--ln2);border-radius:var(--r);
+  background:var(--pan);color:var(--ink2);cursor:pointer}
+.modal .x:hover{border-color:var(--sig);color:var(--sig)}
+
+.pv{max-height:92vh}
+.pv-h{flex:0 0 auto}
+
+/* Every labelled tick shows its number; minors are marks only. */
+.rul .tk{position:absolute;top:3px;font-size:9.5px;color:var(--ink3);
+  transform:translateX(2px);pointer-events:none;white-space:nowrap}
+.rul .tk::before{content:"";position:absolute;left:-2px;bottom:-5px;width:1px;height:7px;
+  background:var(--ln2)}
+.rul .tk.minor::before{height:3px;background:var(--ln)}
+
+/* Expandable prompt fields */
+.pbox{display:flex;flex-direction:column;gap:3px}
+.pbox textarea{width:100%;resize:vertical;min-height:64px}
+.pbox-head{display:flex;align-items:center;gap:8px;padding:0 1px}
+.pbox-lbl{font-size:10px;letter-spacing:.05em;text-transform:uppercase;color:var(--ink3)}
+.pbox-count{flex:1;text-align:right;font-size:10px;color:var(--ink3)}
+.pbox-x{flex:0 0 auto;padding:1px 7px;line-height:1.5;font-size:10px;
+  border:1px solid var(--ln2);border-radius:3px;background:var(--rai);
+  color:var(--ink2);cursor:pointer;white-space:nowrap}
+.pbox-x:hover{border-color:var(--sig);color:var(--sig);background:var(--sigbg)}
+.sheet.pbig{width:min(1000px,94vw);height:min(760px,88vh)}
+.sheet.pbig .body{display:flex;padding:10px}
+.sheet.pbig textarea{flex:1;width:100%;resize:none;font-size:13px;line-height:1.6;
+  padding:12px;background:#0e1013;color:var(--ink);border:1px solid var(--ln);
+  border-radius:var(--r)}
+.pbig-foot{flex:0 0 auto;display:flex;align-items:center;gap:10px;padding:8px 12px;
+  border-top:1px solid var(--ln);background:var(--rai)}
+.pbig-foot .num{flex:1;color:var(--ink3);font-size:11px}
+.btn.sm.on{border-color:var(--sig);color:var(--sig);background:var(--sigbg)}
+.build-badge{margin-left:auto;padding:2px 7px;border:1px solid var(--ln2);border-radius:10px;
+  color:var(--ink3);font-size:10px;letter-spacing:.03em}
+.lora-list{display:flex;flex-direction:column;gap:4px;max-height:340px;overflow-y:auto;
+  border:1px solid var(--ln);border-radius:var(--r);padding:6px}
+.lora{padding:5px 7px;border:1px solid transparent;border-radius:var(--r)}
+.lora.on{border-color:var(--sig);background:var(--sigbg)}
+.lora-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11.5px}
+.lora-w{padding:4px 0 2px 22px}
+.lora-w .row{gap:8px}
+.lora-w label{min-width:62px;color:var(--ink3);font-size:10.5px}
+/* a drop anywhere in the References pane is accepted */
+.pane.on{position:relative}
+.dropzone{min-height:86px}
+
+/* Toast: fixed, out of the layout, and never over the controls.
+   It had NO styles at all, so it rendered as a block in normal flow and
+   pushed the buttons below the fold. */
+.toast{position:fixed;left:50%;bottom:14px;transform:translateX(-50%);z-index:120;
+  max-width:min(680px,86vw);padding:8px 14px;border:1px solid var(--ln2);
+  border-radius:16px;background:rgba(26,29,33,.96);color:var(--ink);
+  font-size:12px;line-height:1.4;text-align:center;pointer-events:none;
+  box-shadow:0 6px 18px rgba(0,0,0,.45)}
+
+/* Confirm dialog */
+.sheet.confirm{width:min(520px,92vw)}
+.sheet.confirm .body p{margin:0;font-size:12.5px;line-height:1.6;color:var(--ink2)}
+.confirm-foot{flex:0 0 auto;display:flex;justify-content:flex-end;gap:8px;
+  padding:9px 12px;border-top:1px solid var(--ln);background:var(--rai)}
+
+/* Active state: outline the button, never fill it - a filled button hides its icon. */
+.btn.sm.on,.btn.on{border-color:var(--ok)!important;color:var(--ok)!important;
+  background:transparent!important;box-shadow:inset 0 0 0 1px var(--ok)}
+.btn.sm.on svg,.btn.on svg{color:var(--ok)}
+.rail .g.ok{color:var(--ok);border-color:var(--ok);background:var(--rai)}
+.seg button.on{border-color:var(--sig);color:var(--sig);background:transparent;
+  box-shadow:inset 0 0 0 1px var(--sig)}
+
+/* Real progress bar. It had no styles, so it never rendered. */
+.prog{position:relative;height:8px;border-radius:5px;overflow:hidden;
+  background:var(--rai);border:1px solid var(--ln2)}
+.prog>span{display:block;height:100%;background:linear-gradient(90deg,var(--sig),var(--ok));
+  transition:width .35s ease}
+.prog.err>span{background:var(--warn)}
+.prog.idle>span{background:var(--ln2)}
+
+/* Something hidden underneath on a track */
+.seg-c[data-under="1"]::before{content:"";position:absolute;left:0;top:0;bottom:0;width:3px;
+  background:repeating-linear-gradient(135deg,var(--warn) 0 3px,transparent 3px 6px)}
+.ovl-badge{position:absolute;left:5px;top:1px;z-index:3;padding:0 4px;border-radius:3px;
+  background:var(--warnbg);color:var(--warn);font-size:8.5px;line-height:13px;
+  border:1px solid var(--warn);pointer-events:none}
+
+/* Floating video monitor */
+.monitor{position:fixed;z-index:88;width:340px;background:var(--pan);
+  border:1px solid var(--ln2);border-radius:8px;overflow:hidden;
+  box-shadow:0 10px 30px rgba(0,0,0,.5)}
+.monitor-h{display:flex;align-items:center;gap:8px;padding:5px 8px;cursor:move;
+  background:var(--rai);border-bottom:1px solid var(--ln)}
+.monitor-n{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+  font-size:11px;color:var(--ink2)}
+.monitor video{display:block;width:100%;background:#000}
+.monitor-f{padding:4px 8px;font-size:9.5px;color:var(--ink3);border-top:1px solid var(--ln)}
+.ih-row{display:flex;align-items:center;gap:10px}
+.ih-row h3{flex:1;min-width:0;margin:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.seg.ih-mode{flex:0 0 auto}
+.seg.ih-mode button{padding:1px 7px;font-size:10px}
+
+/* A gap marker on the guidance track is not a clip - show it as an opening. */
+.seg-c[data-bridge="1"]{background:repeating-linear-gradient(135deg,
+  rgba(127,178,232,.20) 0 6px, rgba(127,178,232,.08) 6px 12px)!important;
+  border:1px dashed var(--sig)}
+.seg-c[data-bridge="1"]::after{content:"bridge";position:absolute;right:4px;top:1px;
+  font-size:8.5px;color:var(--sig);pointer-events:none}
+
+/* Resizable popouts: drag the bottom-right corner. */
+.pv{resize:both;overflow:hidden;min-width:320px;min-height:240px;
+  max-width:96vw;max-height:94vh}
+.pv-b{flex:1 1 auto;min-height:0}
+.pv-b img,.pv-b video{max-width:100%;max-height:100%;width:auto;height:auto;
+  object-fit:contain}
+.monitor{resize:both;overflow:hidden;min-width:240px;min-height:180px;
+  max-width:92vw;max-height:88vh;display:flex;flex-direction:column}
+.monitor video{flex:1 1 auto;min-height:0;object-fit:contain}
+/* a visible grip so the corner reads as draggable */
+.pv::after,.monitor::after{content:"";position:absolute;right:2px;bottom:2px;
+  width:10px;height:10px;pointer-events:none;
+  background:linear-gradient(135deg,transparent 45%,var(--ln2) 45%,var(--ln2) 55%,
+    transparent 55%,transparent 70%,var(--ln2) 70%,var(--ln2) 80%,transparent 80%)}
+/* .monitor MUST stay position:fixed - it is placed by left/top from state.
+   Forcing it relative made it fly off as soon as you dragged it. */
+.pv{position:relative}
+.monitor{position:fixed}
+
+.modal .sheet{resize:both;overflow:hidden;min-width:360px;min-height:220px}
+.modal .sheet.confirm{resize:none}
+
+/* Resize grips must not sit on top of the drag handle or the video. */
+.monitor{resize:both;overflow:hidden;min-width:260px;min-height:200px;
+  max-width:92vw;max-height:88vh;display:flex;flex-direction:column}
+.monitor-h{flex:0 0 auto;user-select:none;touch-action:none}
+.monitor video{flex:1 1 auto;min-height:0;width:100%;object-fit:contain;background:#000}
+.monitor-f{flex:0 0 auto}
+
+.note .warn{color:var(--warn)}
+
+/* --- LoRA stack: ordered, one card per LoRA --- */
+.lora-stack{display:flex;flex-direction:column;gap:8px;margin-top:8px}
+.lora-stack .lora{border:1px solid var(--line);border-radius:var(--r);padding:8px}
+.lora-head{display:flex;align-items:center;gap:8px}
+.lora-head .lora-name{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.lora-ord{display:inline-flex;align-items:center;justify-content:center;
+  min-width:20px;height:20px;border-radius:10px;background:var(--chip);
+  font-size:11px;font-variant-numeric:tabular-nums}
+
+/* --- big prompt editor (double-click a prompt on the timeline) --- */
+.pe-back{position:fixed;inset:0;z-index:70;background:rgba(6,10,14,.62);
+  display:flex;align-items:center;justify-content:center;padding:24px}
+.pe-win{width:min(860px,94vw);max-height:82vh;display:flex;flex-direction:column;
+  gap:8px;background:var(--panel);border:1px solid var(--line);
+  border-radius:var(--r);padding:12px;box-shadow:0 18px 60px rgba(0,0,0,.5)}
+.pe-head{display:flex;align-items:center;gap:10px}
+.pe-title{font-weight:600}
+.pe-meta{flex:1;font-size:12px;opacity:.7;font-variant-numeric:tabular-nums}
+.pe-win textarea{flex:1;min-height:46vh;resize:vertical;width:100%;
+  font:13px/1.5 var(--mono,ui-monospace,monospace);padding:10px;
+  background:var(--input,var(--bg));color:inherit;
+  border:1px solid var(--line);border-radius:var(--r)}
+.pe-foot{display:flex;gap:12px;align-items:baseline;font-size:12px;opacity:.75}
+.pe-foot .hint{flex:1;text-align:right}
+
+/* --- built-in manual --- */
+.man-back{position:fixed;inset:0;z-index:72;background:rgba(6,10,14,.62);
+  display:flex;align-items:center;justify-content:center;padding:24px}
+.man-win{width:min(960px,95vw);height:min(80vh,760px);display:flex;flex-direction:column;
+  background:var(--panel);border:1px solid var(--line);border-radius:var(--r);
+  box-shadow:0 18px 60px rgba(0,0,0,.5);overflow:hidden}
+.man-head{display:flex;align-items:center;gap:10px;padding:10px 12px;
+  border-bottom:1px solid var(--line)}
+.man-title{flex:1;font-weight:600}
+.man-body{flex:1;display:flex;min-height:0}
+.man-nav{width:210px;flex:0 0 210px;border-right:1px solid var(--line);
+  padding:8px;overflow:auto;display:flex;flex-direction:column;gap:2px}
+.man-link{text-align:left;background:none;border:0;color:inherit;cursor:pointer;
+  padding:7px 9px;border-radius:var(--r);font:inherit;font-size:13px;opacity:.8}
+.man-link:hover{background:var(--chip)}
+.man-link.on{background:var(--chip);opacity:1;font-weight:600}
+.man-text{flex:1;overflow:auto;padding:16px 20px;line-height:1.6;font-size:13.5px}
+.man-text h3{margin:0 0 10px}
+.man-text p{margin:0 0 10px}
+.man-text ol,.man-text dl{margin:0 0 10px}
+.man-text dt{font-weight:600;margin-top:8px}
+.man-text dd{margin:2px 0 0 16px;opacity:.9}
+.man-text code{background:var(--chip);padding:1px 5px;border-radius:4px}
+.man-text .tip{border-left:3px solid var(--ok,#3fb27f);padding-left:10px;opacity:.95}
+@media (max-width:720px){
+  .man-body{flex-direction:column}
+  .man-nav{width:auto;flex:0 0 auto;flex-direction:row;overflow-x:auto;
+    border-right:0;border-bottom:1px solid var(--line)}
+}
+
+/* a label with hover help gets a faint underline so it is discoverable */
+.row > label.has-help{text-decoration:underline dotted 1px;
+  text-underline-offset:3px;text-decoration-color:var(--line);cursor:help}

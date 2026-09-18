@@ -1,0 +1,15 @@
+{
+  "model": {
+    "name": "MiniMax H3 Hybrid AV 33B",
+    "architecture": "minimax_h3_hybrid",
+    "base_model_type": "minimax_h3_fl2va",
+    "description": "Hybrid H3: FL2VA target/source soundtrack conditioning combined with Ref2VA visual reference conditioning.",
+    "URLs": [
+      "https://huggingface.co/DeepBeepMeep/MiniMax-H3/resolve/main/MiniMax-H3-FL2VA_bf16.safetensors"
+    ],
+    "hybrid_overlay_filename": "MiniMax-H3-Ref2VA_bf16.safetensors",
+    "hybrid_overlay_repo_id": "DeepBeepMeep/MiniMax-H3",
+    "hybrid_overlay_source_folder": ""
+  },
+  "prompt": "subject_definitions:\n<Subject 1> is the person or character in <Picture 1>, preserving their identity and recognizable appearance.\n[Shot 1] A cinematic performance shot in which <Subject 1> performs the requested action and visibly mouths/sings the supplied soundtrack naturally and in sync with the target audio.\noverall_soundscape: Use the supplied source soundtrack as the target audio."
+}

@@ -1,0 +1,19 @@
+{
+  "name": "H3 Director",
+  "author": "The-ShadowWalker",
+  "version": "1.0.0",
+  "description": "Timeline director for MiniMax H3 with a React UI, including the Hybrid AV model backend.",
+  "type": [
+    "app",
+    "model"
+  ],
+  "model_handlers": [
+    ".models.minimax_h3_hybrid_handler"
+  ],
+  "defaults": "./defaults",
+  "profiles": "./profiles",
+  "date": "",
+  "wan2gp_version": "",
+  "id": "h3_director2",
+  "entrypoint": "plugin"
+}
