@@ -6,6 +6,21 @@ function clean(text: string) {
   return (text || "").replace(/\s+/g, " ").trim();
 }
 
+/**
+ * Remove any [/duration=...] the user typed into a prompt.
+ *
+ * The timeline is what decides how long a window is, and this relay emits one
+ * authoritative tag per window from the segment's length. A tag left inside the
+ * prompt body becomes a SECOND tag in the same block: Wan2GP takes the last one
+ * it sees, and the plugin counted tags rather than blocks, so five 15s windows
+ * were re-fitted as ten 7.6s ones and every window came out half length.
+ *
+ * Other slash commands are left alone -- only duration is ours to own.
+ */
+function stripDurationTags(text: string) {
+  return (text || "").replace(/\[\s*\/\s*duration\s*=[^\]]*\]/gi, " ");
+}
+
 function segsForWindow(segs: Segment[], w: WindowSpan): Segment[] {
   return segs
     .filter((s) => s.track === "video" && s.start < w.end && s.start + s.length > w.start)
@@ -30,7 +45,7 @@ export function buildPromptRelay(session: SessionPayload, wins: WindowSpan[]) {
     // The global prompt goes in ONCE per window, ahead of the shots. It used
     // to be substituted for every empty segment, so a 15s single window came
     // out repeating it once per gap.
-    const global = clean(session.global_prompt || "");
+    const global = clean(stripDurationTags(session.global_prompt || ""));
     if (global) bits.push(global);
     const written = covering.filter((seg) => clean(seg.prompt).length > 0);
     if (written.length === 0) {
@@ -38,7 +53,7 @@ export function buildPromptRelay(session: SessionPayload, wins: WindowSpan[]) {
     } else {
       let last = "";
       for (const seg of written) {
-        const body = clean(seg.prompt);
+        const body = clean(stripDurationTags(seg.prompt));
         if (body === last) continue;          // never repeat the same line twice
         last = body;
         const t0 = formatTimecode(seg.start / fps);

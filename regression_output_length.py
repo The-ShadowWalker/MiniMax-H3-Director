@@ -252,6 +252,76 @@ if real_plan is not None and hasattr(fs, "build_frame_scheduler"):
         ok_summary("44.6s song -> %d windows declaring %s -> %d frames (%.2fs)"
                    % (nwin, durations, got, got / FPS))
 
+# --------------------------------------------------------------------------
+# 6. a prompt that already carries its own [/duration=] tag
+# --------------------------------------------------------------------------
+# A project prompt written elsewhere (or imported from the older plugin) often
+# begins with its own [/duration=15s]. The relay adds one per window too, so a
+# block ends up with two. WanGP still makes ONE window per block -- but the
+# plugin used to count tags, so five 15s blocks were re-fitted as ten 7.6s
+# windows and every window came out half length.
+print("\nblocks carrying an extra /duration tag:")
+
+import re as _re
+_cls = None
+for _n in ast.parse(plugin_src).body:
+    if isinstance(_n, ast.ClassDef) and any(
+            isinstance(f, ast.FunctionDef) and f.name == "_fix_duration_tags" for f in _n.body):
+        _cls = _n
+        break
+
+if _cls is None:
+    check("plugin defines _fix_duration_tags", False, "method not found")
+else:
+    _methods = [f for f in _cls.body if isinstance(f, ast.FunctionDef)
+                and f.name in ("_fix_duration_tags", "_refit_durations")]
+    for _m in _methods:
+        _m.decorator_list = []
+    _ns = dict(ns)
+    _ns["re"] = _re
+    _ns["trace"] = lambda *a, **k: None
+    exec(compile(ast.Module(body=_methods, type_ignores=[]), "plugin.py", "exec"), _ns)
+
+    class _Host:
+        _grid = GRID
+        _DURATION_TAG = _re.compile(r"\[\s*/\s*duration\s*=\s*([0-9]*\.?[0-9]+)\s*s\s*\]", _re.I)
+        _fix_duration_tags = _ns["_fix_duration_tags"]
+        _refit_durations = _ns["_refit_durations"]
+
+    _host = _Host()
+
+    def _windows_from(prompt, target, win=WIN, ovl=OVL):
+        out = _host._fix_duration_tags(prompt, target, win, ovl, FPS)
+        declared = [round(float(x) * FPS) for x in _Host._DURATION_TAG.findall(out)]
+        outs = ns["_scheduler_outputs"](declared, win, ovl, GRID)
+        return declared, outs, out
+
+    # five 15s blocks, each ALSO carrying the user's own tag
+    _target = 1800
+    _clean, _dirty = [], []
+    for _i in range(5):
+        _clean.append("[/duration=15.08s]\nshot %d" % (_i + 1))
+        _dirty.append("[/duration=15.08s]\n[/duration=15s] shot %d" % (_i + 1))
+    _cd, _co, _ = _windows_from("\n\n".join(_clean), _target)
+    _dd, _do, _dout = _windows_from("\n\n".join(_dirty), _target)
+
+    check("an extra tag per block does not change the window count",
+          len(_dd) == len(_cd) == 5,
+          "clean=%d windows, with extra tags=%d windows" % (len(_cd), len(_dd)))
+    check("an extra tag per block does not halve the windows",
+          _do == _co,
+          "clean outputs %s, with extra tags %s" % (_co, _do))
+    check("each block ends up with exactly one duration tag",
+          all(len(_Host._DURATION_TAG.findall(b)) == 1
+              for b in _re.split(r"\n\s*\n", _dout) if b.strip()),
+          "a block still carries more than one tag")
+    check("the timeline is still covered",
+          sum(_do) >= _target,
+          "%d frames for a %d-frame timeline" % (sum(_do), _target))
+    if _do == _co and sum(_do) >= _target and len(_dd) == 5:
+        ok_summary("5 blocks x 2 tags -> %d windows of %s frames = %d (%.2fs), timeline %d"
+                   % (len(_do), _do[0], sum(_do), sum(_do) / FPS, _target))
+
 print()
 if FAILURES:
     print("%d of %d OUTPUT LENGTH CHECK(S) FAILED" % (len(FAILURES), CHECKS))

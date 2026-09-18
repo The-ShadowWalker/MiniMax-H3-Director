@@ -26,7 +26,7 @@ import gradio as gr
 
 from shared.utils.plugins import WAN2GPPlugin
 
-PLUGIN_VERSION = "1.0.0"
+PLUGIN_VERSION = "1.0.1"
 PLUGIN_ID = "h3_director2"
 PLUGIN_NAME = "H3 Director"
 LOG_PREFIX = "[H3-D]"
@@ -3444,41 +3444,55 @@ class H3Director2Plugin(WAN2GPPlugin):
 
         Every block carrying a /duration tag puts WanGP on its scheduler path,
         where each window OUTPUTS exactly what it declares and the overlap is
-        generated on top. So three 15s windows really are 45s of video -- the
-        arithmetic the original plugin relied on.
+        generated on top. So three 15s windows really are 45s of video.
 
-        This used to distribute the COMPENSATED REQUEST instead of the
-        timeline. On a 44.6s song that handed out 1034 frames across three
-        windows, WanGP produced 1033, and the last 1.5s of the song was cut
-        off. The tags now carry the timeline, and the tail window is sized
-        against the real window geometry so the total can never fall short.
+        Work BY BLOCK, never by tag. WanGP splits the prompt on blank lines and
+        makes one window per block; a block holding two tags is still one
+        window, and Wan2GP simply takes the last tag it sees. Counting tags
+        instead of blocks is what halved every window when a prompt arrived
+        with a [/duration=] already typed into it: five blocks carrying two
+        tags each were re-fitted as ten windows of 7.6s.
+
+        Any extra tags inside a block are dropped, so only one survives.
         """
-        tags = self._DURATION_TAG.findall(prompt or "")
-        if not tags or not target or fps <= 0:
+        if not target or fps <= 0:
             return prompt
-        n = len(tags)
-        old_total = sum(float(t) for t in tags) * fps
+        text = (prompt or "").replace("\r\n", "\n")
+        blocks = re.split(r"(\n\s*\n)", text)          # keep the separators
+        idx = [i for i in range(0, len(blocks), 2) if blocks[i].strip()]
+        tagged = [i for i in idx if self._DURATION_TAG.search(blocks[i])]
+        if not tagged:
+            return prompt
+
+        n = len(tagged)
+        old_total = sum(float(t) for t in self._DURATION_TAG.findall(text)) * fps
 
         durations, outputs = plan_duration_frames(int(target), win, ovl, self._grid)
-
         if len(durations) != n:
-            # The UI decides how many blocks there are; it must agree with what
-            # the timeline needs, or a window ends up starved or unused.
-            trace("WARNING: %d duration tag(s) but this %d-frame timeline needs %d window(s); "
-                  "re-fitting the tags to the %d block(s) present"
-                  % (n, int(target), len(durations), n))
+            # The blocks are the user's per-window prompts, so their count is
+            # theirs to keep -- spread the timeline over exactly this many.
+            trace("duration tags: %d block(s) present but this %d-frame timeline "
+                  "would prefer %d window(s); fitting to the blocks"
+                  % (n, int(target), len(durations)))
             durations, outputs = self._refit_durations(int(target), win, ovl, n)
 
-        vals = iter(durations)
+        for slot, i in enumerate(tagged):
+            frames = durations[slot] if slot < len(durations) else durations[-1]
+            replacement = "[/duration=%.2fs]" % (frames / float(fps))
+            seen = {"n": 0}
 
-        def sub(_m):
-            try:
-                f = next(vals)
-            except StopIteration:
-                return _m.group(0)
-            return "[/duration=%.2fs]" % (f / float(fps))
+            def sub(_m, _rep=replacement, _seen=seen):
+                _seen["n"] += 1
+                # One tag per block: the first becomes the real duration, any
+                # others are removed rather than left to override it.
+                return _rep if _seen["n"] == 1 else ""
 
-        out = self._DURATION_TAG.sub(sub, prompt, count=n)
+            blocks[i] = self._DURATION_TAG.sub(sub, blocks[i])
+            if seen["n"] > 1:
+                trace("block %d carried %d duration tag(s); kept one"
+                      % (slot + 1, seen["n"]))
+
+        out = "".join(blocks)
         total = sum(outputs)
         trace("duration tags: %d window(s) declaring %s -> WanGP outputs %s = %d frames (%.2fs), "
               "timeline %d (%.2fs)%s"
