@@ -15,8 +15,7 @@ H3 Director works out the settings and generates the video.
 
 ---
 
-<!-- Add a screenshot of the plugin tab here before publishing:
-     ![H3 Director](docs/screenshot.png) -->
+<img width="1916" height="1004" alt="Screenshot 2026-09-18 133506" src="https://github.com/user-attachments/assets/79920284-6c20-4114-8e14-157d0ae2102c" />
 
 ## Overview
 
