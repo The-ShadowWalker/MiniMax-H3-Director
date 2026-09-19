@@ -453,3 +453,24 @@ canvas.wave{position:absolute;inset:0;width:100%;height:100%;pointer-events:none
 /* a label with hover help gets a faint underline so it is discoverable */
 .row > label.has-help{text-decoration:underline dotted 1px;
   text-underline-offset:3px;text-decoration-color:var(--line);cursor:help}
+
+/* --- manual window lengths --- */
+.winlist{display:flex;flex-direction:column;gap:4px;margin:8px 0}
+.winlist .row input[type=range]{flex:1}
+.winlist .v.dim{opacity:.55;min-width:46px;text-align:right}
+.warnbox{display:flex;flex-direction:column;gap:4px;font-size:12.5px}
+
+/* --- window size labels and manual drag handles --- */
+.wlab{position:absolute;top:50%;transform:translate(-50%,-50%);
+  font-size:10px;font-variant-numeric:tabular-nums;pointer-events:none;
+  color:#08121c;background:rgba(255,255,255,.72);border-radius:3px;
+  padding:0 4px;white-space:nowrap}
+.whandle{position:absolute;top:0;bottom:0;width:11px;margin-left:-5px;
+  cursor:ew-resize;z-index:7;background:rgba(255,255,255,.4);
+  border-left:1px solid rgba(255,255,255,.95);border-right:1px solid rgba(255,255,255,.95);
+  touch-action:none}
+.whandle:hover{background:rgba(255,220,120,.85)}
+/* the full-height grab area over the tracks: invisible until pointed at */
+.whandle.tall{background:transparent;border-left:1px solid rgba(255,200,80,.85);
+  border-right:none;width:13px;margin-left:-6px}
+.whandle.tall:hover{background:rgba(255,200,80,.22)}

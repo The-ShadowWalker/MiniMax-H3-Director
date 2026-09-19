@@ -15,9 +15,15 @@ import { demoSession, uid } from "./defaults";
 import {
   estimateMinutes,
   H3,
+  readDurationSeconds,
   realWindows,
+  seedWindowFrames,
   snapWindowPair,
+  spansFromFrames,
   planDurations,
+  validateWindowFrames,
+  windowCeilingFrames,
+  windowFloorFrames,
   windowSecondsWarning,
 } from "./h3";
 import { buildPromptRelay } from "./prompt";
@@ -52,6 +58,17 @@ export interface DirectorState extends SessionPayload {
   /** The built-in manual (Help button on the timeline). */
   manualOpen: boolean;
   setManualOpen: (v: boolean) => void;
+  /** Turn hand-set window lengths on or off. Seeds from the automatic plan. */
+  setManualWindows: (on: boolean) => void;
+  /** Move the boundary BEFORE window `i` to `frame`, resizing both neighbours. */
+  dragWindowEdge: (i: number, frame: number) => void;
+  /** Give window `i` exactly this many frames, taking the difference from the
+   *  next window so the total still matches the timeline. */
+  setWindowFrames: (i: number, frames: number) => void;
+  /** Throw away the hand-set layout and go back to equal windows. */
+  resetWindowFrames: () => void;
+  /** Resize windows to the durations typed into the prompts. */
+  applyPromptDurations: () => void;
   setMonitor: (m: { mediaId: string; name: string; start: number; x?: number; y?: number } | null) => void;
   lockClipAudio: boolean;
   statusOpen: boolean;
@@ -184,6 +201,101 @@ export const useDirector = create<DirectorState>()((set, get) => ({
       setPromptEdit: (id) => set({ promptEdit: id }),
       manualOpen: false,
       setManualOpen: (v) => set({ manualOpen: v }),
+
+      setManualWindows: (on) =>
+        set((st) => {
+          const total = totalFrames(st);
+          const saved = st.timeline.windowFrames;
+          // A layout saved against a different timeline length or overlap no
+          // longer adds up. Rather than hand back something broken, start from
+          // the automatic plan -- the warning would otherwise fire the instant
+          // an old project was reopened.
+          const fits =
+            !!saved && saved.length > 0 &&
+            saved.reduce((a, b) => a + b, 0) === total &&
+            validateWindowFrames(saved, total, st.timeline.slidingWindowOverlap, st.fps).length === 0;
+          const frames = on
+            ? (fits ? saved : seedWindowFrames(total, st.timeline.slidingWindowSize, st.timeline.slidingWindowOverlap))
+            : saved;
+          return {
+            timeline: { ...st.timeline, manualWindows: on, windowFrames: frames },
+            dirty: (markDirty(), true),
+          };
+        }),
+
+      dragWindowEdge: (i, frame) =>
+        set((st) => {
+          const frames = [...(st.timeline.windowFrames || [])];
+          if (i < 1 || i >= frames.length) return {};
+          // The boundary before window i: everything earlier is fixed, so the
+          // previous window grows or shrinks and window i takes the opposite.
+          const before = frames.slice(0, i - 1).reduce((a, b) => a + b, 0);
+          const pair = frames[i - 1] + frames[i];
+          const floor = windowFloorFrames();
+          const ceil = windowCeilingFrames(st.timeline.slidingWindowOverlap);
+          let prev = Math.round(frame) - before;
+          prev = Math.max(floor, Math.min(prev, pair - floor));
+          prev = Math.min(prev, ceil);
+          let next = pair - prev;
+          if (next > ceil) { next = ceil; prev = pair - next; }
+          if (prev < floor || next < floor) return {};
+          frames[i - 1] = prev;
+          frames[i] = next;
+          return { timeline: { ...st.timeline, windowFrames: frames }, dirty: (markDirty(), true) };
+        }),
+
+      setWindowFrames: (i, want) =>
+        set((st) => {
+          const frames = [...(st.timeline.windowFrames || [])];
+          if (i < 0 || i >= frames.length) return {};
+          const floor = windowFloorFrames();
+          const ceil = windowCeilingFrames(st.timeline.slidingWindowOverlap);
+          const n = Math.max(floor, Math.min(ceil, Math.round(want)));
+          const j = i + 1 < frames.length ? i + 1 : i - 1;
+          if (j < 0) {
+            frames[i] = n;
+          } else {
+            const pair = frames[i] + frames[j];
+            const other = pair - n;
+            if (other < floor || other > ceil) return {};   // refuse rather than break the total
+            frames[i] = n;
+            frames[j] = other;
+          }
+          return { timeline: { ...st.timeline, windowFrames: frames }, dirty: (markDirty(), true) };
+        }),
+
+      applyPromptDurations: () =>
+        set((st) => {
+          const lay = windowLayout(st);
+          const want = promptDurationFrames(st, lay.spans);
+          if (!want.some((x) => x != null)) return {};
+          const frames = lay.frames.map((f, i) => (want[i] == null ? f : (want[i] as number)));
+          // Whatever the prompts do not account for lands on the last window,
+          // so the total still matches the timeline.
+          const fixedTo = frames.length - 1;
+          const sum = frames.reduce((a, b) => a + b, 0);
+          if (sum !== lay.maxF) frames[fixedTo] += lay.maxF - sum;
+          const floor = windowFloorFrames();
+          const ceil = windowCeilingFrames(lay.ovl);
+          if (frames.some((f) => f < floor || f > ceil)) {
+            return { toast: "Those prompt lengths do not fit the model's window limits" };
+          }
+          return {
+            timeline: { ...st.timeline, manualWindows: true, windowFrames: frames },
+            dirty: (markDirty(), true),
+            toast: "Windows resized to match the prompts",
+          };
+        }),
+
+      resetWindowFrames: () =>
+        set((st) => ({
+          timeline: {
+            ...st.timeline,
+            windowFrames: seedWindowFrames(
+              totalFrames(st), st.timeline.slidingWindowSize, st.timeline.slidingWindowOverlap),
+          },
+          dirty: (markDirty(), true),
+        })),
       lockClipAudio: true,
       durationLocked: false,
       loopPlayback: false,
@@ -636,6 +748,8 @@ export const useDirector = create<DirectorState>()((set, get) => ({
         const d = demoSession();
         d.project_name = "untitled";
         d.timeline.segments = [];
+        d.timeline.manualWindows = false;      // a new project starts on equal windows
+        d.timeline.windowFrames = undefined;
         d.refs = { ...d.refs, images: [], videos: [], audio: [] };
         d.global_prompt = "";
         d.hardcuts = "";
@@ -699,10 +813,31 @@ export const useDirector = create<DirectorState>()((set, get) => ({
           return;
         }
         const maxF = totalFrames(s);
+        // Hand-set windows that no longer add up would silently generate the
+        // wrong length. Refuse and say which, rather than find out afterwards.
+        const lay = windowLayout(s);
+        if (lay.manual) {
+          const bad = validateWindowFrames(lay.frames, maxF, lay.ovl, s.fps);
+          if (bad.length) {
+            set({
+              statusOpen: true, pane: "gen", advTab: "window",
+              toast: bad[0].text,
+              job: { ...s.job, logs: [
+                ...s.job.logs,
+                ...bad.map((b) => ({ t: Date.now(), level: "err" as const, msg: b.text })),
+                { t: Date.now(), level: "info" as const,
+                  msg: "Fix the window lengths under Sliding Window, or press Even them out." },
+              ] },
+            });
+            return;
+          }
+        }
         // Ask for the window count WanGP will really run, so the status does
         // not start at one number and correct itself to another mid-job. The
         // prompt carries /duration tags, so this is the scheduler's count.
-        const { windows: n } = planDurations(maxF, s.timeline.slidingWindowSize, s.timeline.slidingWindowOverlap);
+        const n = lay.manual
+          ? lay.frames.length
+          : planDurations(maxF, s.timeline.slidingWindowSize, s.timeline.slidingWindowOverlap).windows;
         const here = scope === "here";
         const startW = here
           ? realWindows(maxF, s.timeline.slidingWindowSize, s.timeline.slidingWindowOverlap).findIndex(
@@ -1035,26 +1170,105 @@ export function hydrateDirector() {
   });
 }
 
+/** The window layout in force: hand-set when manual mode is on, else the
+ *  automatic plan. Everything that draws or counts windows goes through here
+ *  so the timeline, the status and what is generated cannot disagree. */
+export function windowLayout(s: Pick<DirectorState, "duration_sec" | "fps" | "timeline">) {
+  const maxF = Math.max(1, Math.round(s.duration_sec * s.fps));
+  const win = s.timeline.slidingWindowSize;
+  const ovl = s.timeline.slidingWindowOverlap;
+  const manual = !!s.timeline.manualWindows;
+  const frames = manual && s.timeline.windowFrames && s.timeline.windowFrames.length
+    ? s.timeline.windowFrames
+    : null;
+  if (frames) {
+    return { maxF, win, ovl, manual: true, frames, spans: spansFromFrames(frames) };
+  }
+  const spans = realWindows(maxF, win, ovl);
+  return {
+    maxF, win, ovl, manual: false,
+    frames: spans.map((w) => w.end - w.start),
+    spans,
+  };
+}
+
+/**
+ * What each window's prompt ASKS for, in frames, or null where no prompt in
+ * that window carries a [/duration=..s].
+ *
+ * A duration typed into a prompt is treated as intent, not instruction: it is
+ * never sent to Wan2GP (the relay strips it), it only tells us the window the
+ * writer had in mind. Where it disagrees with the window, we say so and offer
+ * to resize -- the window is what actually governs.
+ */
+export function promptDurationFrames(
+  s: Pick<DirectorState, "fps" | "timeline">,
+  spans: { start: number; end: number }[],
+): (number | null)[] {
+  const fps = Math.max(1, s.fps || 24);
+  const texts = s.timeline.segments
+    .filter((x) => x.track === "video" && x.kind === "text" && (x.prompt || "").trim())
+    .sort((a, b) => a.start - b.start);
+  return spans.map((w) => {
+    const inWin = texts.filter((t) => t.start >= w.start && t.start < w.end);
+    for (const t of inWin) {
+      const sec = readDurationSeconds(t.prompt || "");
+      if (sec != null) return Math.round(sec * fps);
+    }
+    return null;
+  });
+}
+
+export type PromptWindowMismatch = {
+  window: number; promptFrames: number; windowFrames: number; text: string;
+};
+
+/** Windows whose prompt asks for a different length than the window has. */
+export function usePromptWindowMismatches(): PromptWindowMismatch[] {
+  return useDirector((s) => {
+    const lay = windowLayout(s);
+    const want = promptDurationFrames(s, lay.spans);
+    const fps = Math.max(1, s.fps || 24);
+    const out: PromptWindowMismatch[] = [];
+    want.forEach((w, i) => {
+      if (w == null) return;
+      const have = lay.frames[i];
+      if (Math.abs(w - have) <= 1) return;          // same to within a frame
+      out.push({
+        window: i + 1, promptFrames: w, windowFrames: have,
+        text: `Window ${i + 1}: the prompt asks for ${(w / fps).toFixed(2)}s but the window is ${(have / fps).toFixed(2)}s.`,
+      });
+    });
+    return out;
+  });
+}
+
 export function useWindowStats() {
   return useDirector((s) => {
-    const maxF = Math.max(1, Math.round(s.duration_sec * s.fps));
-    const win = s.timeline.slidingWindowSize;
-    const ovl = s.timeline.slidingWindowOverlap;
-    const { windows, total } = planDurations(maxF, win, ovl);
+    const { maxF, win, ovl, manual, frames, spans } = windowLayout(s);
+    const auto = planDurations(maxF, win, ovl);
+    const windows = manual ? frames.length : auto.windows;
+    const total = manual ? frames.reduce((a, b) => a + b, 0) : auto.total;
     const exact = total === maxF;
     const newFrames = win - ovl;
     const warning = windowSecondsWarning(win, ovl, s.fps);
     const minutes = estimateMinutes(windows, Number(s.advanced.steps) || 20);
-    const spans = realWindows(maxF, win, ovl);
-    // A tail window that adds only a sliver still costs a full pass. Say so,
-    // and say what window size would hold the timeline in one window fewer --
-    // never change their setting silently.
+
+    // Hand-set layouts are checked against the model's real limits; the
+    // automatic one cannot break them by construction.
+    const problems = manual ? validateWindowFrames(frames, maxF, ovl, s.fps) : [];
+
     let runtHint: string | null = null;
-    if (total > maxF + 1) {
+    if (!manual && total > maxF + 1) {
       runtHint = `Generates ${(total / s.fps).toFixed(2)}s to cover a ` +
         `${(maxF / s.fps).toFixed(2)}s timeline (the window grid cannot land exactly).`;
     }
-    return { maxF, windows, newFrames, exact, warning, minutes, spans, total, runtHint };
+    return {
+      maxF, windows, newFrames, exact, warning, minutes, spans, total, runtHint,
+      manual, frames, problems,
+      floor: windowFloorFrames(),
+      ceiling: windowCeilingFrames(ovl),
+    };
   });
 }
 

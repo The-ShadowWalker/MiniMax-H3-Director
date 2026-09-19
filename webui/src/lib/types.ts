@@ -158,6 +158,10 @@ export interface SessionPayload {
     snap: boolean;
     allowPastCap: boolean;
     playhead: number;
+    /** Set the window lengths by hand instead of letting them come out equal. */
+    manualWindows?: boolean;
+    /** Per-window OUTPUT lengths in frames, used only when manualWindows is on. */
+    windowFrames?: number[];
     segments: Segment[];
   };
 }

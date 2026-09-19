@@ -123,6 +123,28 @@ export function Timeline() {
   const xOf = (f: number) => ((f - viewStart) / vis) * width;
   const fOf = (x: number) => viewStart + (x / Math.max(1, width)) * vis;
 
+  // Dragging a window boundary. Used by the handle in the band strip and by
+  // the full-height one over the tracks, so both behave identically.
+  const startEdgeDrag = (i: number) => (e: React.PointerEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    e.stopPropagation();
+    const el = e.currentTarget;
+    const host = el.parentElement;
+    if (!host) return;
+    const rect = host.getBoundingClientRect();
+    el.setPointerCapture(e.pointerId);
+    const move = (ev: PointerEvent) =>
+      s.dragWindowEdge(i, Math.round(fOf(ev.clientX - rect.left)));
+    const up = () => {
+      el.removeEventListener("pointermove", move);
+      el.removeEventListener("pointerup", up);
+      el.removeEventListener("pointercancel", up);
+    };
+    el.addEventListener("pointermove", move);
+    el.addEventListener("pointerup", up);
+    el.addEventListener("pointercancel", up);
+  };
+
   const dragged = useRef(false);
   const drag = useRef<{
     id: string;
@@ -410,6 +432,26 @@ export function Timeline() {
         <span className="wininfo num">
           {stats.windows} windows × {stats.newFrames} new frames
         </span>
+        <label
+          className="chk"
+          title="Set each window's length yourself. Turn this on and the window boundaries below become draggable."
+        >
+          <input
+            type="checkbox"
+            checked={!!s.timeline.manualWindows}
+            onChange={(e) => {
+              s.setManualWindows(e.target.checked);
+              if (e.target.checked && !s.timeline.showWindows) {
+                // Nothing to drag if the bands are hidden.
+                s.patchTimeline({ showWindows: true });
+              }
+              s.setToast(e.target.checked
+                ? "Manual windows on — drag the boundaries in the band strip"
+                : "Back to equal windows");
+            }}
+          />{" "}
+          manual
+        </label>
         <label className="chk">
           <input
             type="checkbox"
@@ -549,6 +591,33 @@ export function Timeline() {
                 }}
               />
             ))}
+          {/* How long each window is, so the size is never a guess. */}
+          {s.timeline.showWindows &&
+            stats.spans.map((w) => {
+              const px = xOf(w.end) - xOf(w.start);
+              if (px < 34) return null;
+              return (
+                <span
+                  key={`wl${w.i}`}
+                  className="wlab"
+                  style={{ left: xOf(w.start) + px / 2 }}
+                  title={`Window ${w.i + 1}: ${w.end - w.start} frames`}
+                >
+                  {((w.end - w.start) / s.fps).toFixed(2)}s
+                </span>
+              );
+            })}
+          {/* In manual mode every inner boundary is a handle. */}
+          {s.timeline.showWindows && stats.manual &&
+            stats.spans.slice(1).map((w) => (
+              <div
+                key={`wh${w.i}`}
+                className="whandle"
+                style={{ left: xOf(w.start) }}
+                title={`Drag to resize windows ${w.i} and ${w.i + 1}`}
+                onPointerDown={startEdgeDrag(w.i)}
+              />
+            ))}
         </div>
         <div className="tracks">
           {s.timeline.showWindows &&
@@ -566,6 +635,18 @@ export function Timeline() {
           {s.timeline.showWindows &&
             stats.spans.slice(1).map((w) => (
               <div key={`bl${w.i}`} className="bline" style={{ left: xOf(w.start) }} />
+            ))}
+          {/* The band strip is only a few pixels tall, so the boundary is also
+              grabbable down the full height of the tracks. */}
+          {s.timeline.showWindows && stats.manual &&
+            stats.spans.slice(1).map((w) => (
+              <div
+                key={`th${w.i}`}
+                className="whandle tall"
+                style={{ left: xOf(w.start) }}
+                title={`Drag to resize windows ${w.i} and ${w.i + 1}`}
+                onPointerDown={startEdgeDrag(w.i)}
+              />
             ))}
 
           {TRACKS.map((tr, ti) => {

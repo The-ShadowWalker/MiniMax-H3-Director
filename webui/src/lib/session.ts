@@ -1,5 +1,5 @@
 import { buildPromptRelay } from "./prompt";
-import { realWindows } from "./h3";
+import { realWindows, spansFromFrames } from "./h3";
 import type { SessionPayload } from "./types";
 
 export function downloadJson(payload: SessionPayload) {
@@ -32,7 +32,11 @@ export async function readSessionFile(file: File): Promise<SessionPayload> {
 export function buildGenerationPlan(p: SessionPayload) {
   const fps = p.fps || 24;
   const total = Math.round(p.duration_sec * fps);
-  const wins = realWindows(total, p.timeline.slidingWindowSize, p.timeline.slidingWindowOverlap);
+  // Hand-set windows when manual mode is on, otherwise the automatic plan.
+  const manual = !!p.timeline.manualWindows && !!(p.timeline.windowFrames || []).length;
+  const wins = manual
+    ? spansFromFrames(p.timeline.windowFrames as number[])
+    : realWindows(total, p.timeline.slidingWindowSize, p.timeline.slidingWindowOverlap);
   const { combined, windows } = buildPromptRelay(p, wins);
 
   const segs = p.timeline.segments || [];
@@ -116,6 +120,11 @@ export function buildGenerationPlan(p: SessionPayload) {
     numbering_offset:
       (first ? 1 : 0) + (last ? 1 : 0) +
       images.filter((x) => x !== first && x !== last).length,
+    // When the windows were set by hand, their lengths ARE the plan: Python
+    // writes one /duration tag per window from these instead of working out
+    // equal ones.
+    manual_windows: manual,
+    window_frames: manual ? (p.timeline.windowFrames as number[]) : undefined,
     image_ref_mode: p.refs.imageMode,
     audio_source: p.audio.source,
     reference_mode: p.pipeline !== "FL2VA",

@@ -341,6 +341,100 @@ export function capacityForWindows(n: number, win: number, ovl: number): number 
   return windowSize + Math.max(0, n - 1) * Math.max(1, windowSize - overlap);
 }
 
+// ---------------------------------------------------------------------------
+// manual windows: the user sets each window's length by hand
+// ---------------------------------------------------------------------------
+// WanGP's scheduler takes each window's /duration independently, so windows do
+// not have to be equal. Two hard limits come from the model, not from us:
+//   * a window cannot output fewer frames than the model's minimum; and
+//   * a window's PASS is its output plus the overlap, which must stay inside
+//     the model's largest window.
+
+/** Fewest OUTPUT frames a single window can produce. */
+export function windowFloorFrames(): number {
+  return H3.FRAMES_MIN;
+}
+
+/** Most OUTPUT frames a single window can produce at this overlap. */
+export function windowCeilingFrames(ovl: number): number {
+  return Math.max(H3.FRAMES_MIN, H3.WINDOW_MAX - Math.max(0, Math.floor(ovl)));
+}
+
+/** Turn per-window lengths into timeline spans. */
+export function spansFromFrames(frames: number[]): WindowSpan[] {
+  const out: WindowSpan[] = [];
+  let at = 0;
+  frames.forEach((f, i) => {
+    out.push({ i, start: at, end: at + Math.max(1, Math.round(f)) });
+    at += Math.max(1, Math.round(f));
+  });
+  return out;
+}
+
+/** The seconds a [/duration=..s] in a prompt asks for, or null if there is none. */
+export function readDurationSeconds(text: string): number | null {
+  const m = /\[\s*\/\s*duration\s*=\s*([0-9]*\.?[0-9]+)\s*s\s*\]/i.exec(text || "");
+  if (!m) return null;
+  const n = parseFloat(m[1]);
+  return Number.isFinite(n) && n > 0 ? n : null;
+}
+
+export type WindowProblem = { window: number | null; text: string; kind: "total" | "floor" | "ceiling" };
+
+/**
+ * Everything wrong with a hand-set window layout, in the order it matters.
+ * An empty array means the layout is good to generate.
+ */
+export function validateWindowFrames(
+  frames: number[],
+  totalFrames: number,
+  ovl: number,
+  fps: number,
+): WindowProblem[] {
+  const problems: WindowProblem[] = [];
+  const f = Math.max(1, fps || 24);
+  const floor = windowFloorFrames();
+  const ceil = windowCeilingFrames(ovl);
+  const sum = frames.reduce((a, b) => a + Math.max(0, Math.round(b)), 0);
+
+  if (sum !== totalFrames) {
+    const diff = sum - totalFrames;
+    problems.push({
+      window: null,
+      kind: "total",
+      text: diff > 0
+        ? `Windows total ${(sum / f).toFixed(2)}s, ${(diff / f).toFixed(2)}s MORE than the ${(totalFrames / f).toFixed(2)}s timeline.`
+        : `Windows total ${(sum / f).toFixed(2)}s, ${(-diff / f).toFixed(2)}s SHORT of the ${(totalFrames / f).toFixed(2)}s timeline.`,
+    });
+  }
+  frames.forEach((raw, i) => {
+    const n = Math.round(raw);
+    if (n < floor) {
+      problems.push({
+        window: i + 1, kind: "floor",
+        text: `Window ${i + 1} is ${(n / f).toFixed(2)}s — below the model's ${(floor / f).toFixed(2)}s minimum.`,
+      });
+    } else if (n > ceil) {
+      problems.push({
+        window: i + 1, kind: "ceiling",
+        text: `Window ${i + 1} is ${(n / f).toFixed(2)}s — above the ${(ceil / f).toFixed(2)}s a single pass can hold at overlap ${ovl}.`,
+      });
+    }
+  });
+  return problems;
+}
+
+/** A starting layout for manual mode: whatever the automatic plan would do. */
+export function seedWindowFrames(totalFrames: number, win: number, ovl: number): number[] {
+  const { outputs } = planDurations(totalFrames, win, ovl);
+  const frames = outputs.slice();
+  // The automatic plan may overshoot by a few frames to land on a legal count;
+  // manual mode is exact, so give the remainder to the last window.
+  const sum = frames.reduce((a, b) => a + b, 0);
+  if (frames.length && sum !== totalFrames) frames[frames.length - 1] += totalFrames - sum;
+  return frames.map((n) => Math.max(1, Math.round(n)));
+}
+
 export type WindowSpan = { i: number; start: number; end: number };
 
 /**

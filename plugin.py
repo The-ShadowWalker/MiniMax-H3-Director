@@ -26,7 +26,7 @@ import gradio as gr
 
 from shared.utils.plugins import WAN2GPPlugin
 
-PLUGIN_VERSION = "1.0.1"
+PLUGIN_VERSION = "1.1.1"
 PLUGIN_ID = "h3_director2"
 PLUGIN_NAME = "H3 Director"
 LOG_PREFIX = "[H3-D]"
@@ -3144,6 +3144,17 @@ class H3Director2Plugin(WAN2GPPlugin):
             # window outputs what it declares. Without tags the DEFAULT window
             # plan applies, where video_length is the whole output length.
             tagged = bool(self._DURATION_TAG.search(settings.get("prompt", "")))
+            plan_in = data.get("settings") or {}
+            manual_windows = None
+            if plan_in.get("manual_windows"):
+                wf = [int(x) for x in (plan_in.get("window_frames") or []) if int(x) > 0]
+                if wf:
+                    manual_windows = wf
+                    total_wf = sum(wf)
+                    if total_wf != target:
+                        trace("length WARNING: hand-set windows total %d frame(s) (%.2fs) but the "
+                              "timeline is %d (%.2fs)"
+                              % (total_wf, total_wf / fps_now, target, target / fps_now))
             if bridge_frames:
                 # A bridge pass keeps the continuation arithmetic it already
                 # had -- its geometry carries a source clip, which neither of
@@ -3154,9 +3165,11 @@ class H3Director2Plugin(WAN2GPPlugin):
             elif tagged:
                 # The tags govern; video_length is not what sets the length.
                 req = solve_video_length(target, win, ovl, self._grid)
-                windows = scheduler_window_count(target, win, ovl, self._grid)
-                trace("length: target=%d (%.2fs) -> SCHEDULER path, %d window(s) from /duration tags"
-                      % (target, target / fps_now, windows))
+                windows = (len(manual_windows) if manual_windows
+                           else scheduler_window_count(target, win, ovl, self._grid))
+                trace("length: target=%d (%.2fs) -> SCHEDULER path, %d window(s) from /duration tags%s"
+                      % (target, target / fps_now, windows,
+                         " (set by hand)" if manual_windows else ""))
             else:
                 req = solve_video_length(target, win, ovl, self._grid)
                 out = real_output_frames(req, win, ovl, self._grid)
@@ -3170,7 +3183,8 @@ class H3Director2Plugin(WAN2GPPlugin):
                           "a soundtrack longer than the video will be cut off" % (target - out))
             settings["video_length"] = req
             settings["prompt"] = self._fix_duration_tags(
-                settings.get("prompt", ""), target, win, ovl, fps_now)
+                settings.get("prompt", ""), target, win, ovl, fps_now,
+                manual=manual_windows)
 
         # DOTTED access on purpose: _callback_uses_api_session() inspects
         # co_names, and getattr(self, "_wangp_session") puts the name in
@@ -3439,7 +3453,7 @@ class H3Director2Plugin(WAN2GPPlugin):
 
     _DURATION_TAG = re.compile(r"\[/duration=([0-9.]+)s\]")
 
-    def _fix_duration_tags(self, prompt, target, win, ovl, fps):
+    def _fix_duration_tags(self, prompt, target, win, ovl, fps, manual=None):
         """Make the per-window [/duration=] tags cover the TIMELINE.
 
         Every block carrying a /duration tag puts WanGP on its scheduler path,
@@ -3467,7 +3481,16 @@ class H3Director2Plugin(WAN2GPPlugin):
         n = len(tagged)
         old_total = sum(float(t) for t in self._DURATION_TAG.findall(text)) * fps
 
-        durations, outputs = plan_duration_frames(int(target), win, ovl, self._grid)
+        if manual:
+            # The user set these lengths by hand. Honour them exactly; the UI
+            # has already checked them against the model's floor and ceiling
+            # and against the timeline total.
+            durations = [max(1, int(d)) for d in manual]
+            outputs = _scheduler_outputs(durations, win, ovl, self._grid)
+            trace("window lengths set by hand: %s frame(s) = %s"
+                  % (durations, ", ".join("%.2fs" % (d / float(fps)) for d in durations)))
+        else:
+            durations, outputs = plan_duration_frames(int(target), win, ovl, self._grid)
         if len(durations) != n:
             # The blocks are the user's per-window prompts, so their count is
             # theirs to keep -- spread the timeline over exactly this many.

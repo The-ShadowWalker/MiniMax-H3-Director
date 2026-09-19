@@ -1,7 +1,7 @@
 type SessionPayloadLike = Record<string, unknown>;
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { helpFor } from "../lib/help";
-import { useDirector, useWindowStats } from "../lib/store";
+import { useDirector, usePromptWindowMismatches, useWindowStats } from "../lib/store";
 import {
   ATTENTION_CHOICES,
   AUDIO_SOURCES_HYBRID,
@@ -1105,10 +1105,79 @@ function GenPane() {
             are always the windows actually generated. Prompts and injected frames are placed
             against those bands.
           </div>
-          <div className="note ok">
-            Your window size and overlap are never changed to make the arithmetic work. Only the
-            internal request length is compensated, so a 59s timeline returns 59s.
-          </div>
+
+          <label className="chk" title="Give each window its own length instead of letting them come out equal. Drag the boundaries on the timeline, or type a length below.">
+            <input
+              type="checkbox"
+              checked={!!s.timeline.manualWindows}
+              onChange={(e) => s.setManualWindows(e.target.checked)}
+            />
+            Set window lengths by hand
+          </label>
+
+          {!s.timeline.manualWindows && (
+            <div className="note ok">
+              Windows come out equal, with the last one taking what is left. Your window size and
+              overlap are never changed to make the arithmetic work.
+            </div>
+          )}
+
+          {s.timeline.manualWindows && (
+            <>
+              <div className="note">
+                Each window can be {(stats.floor / s.fps).toFixed(2)}s to {(stats.ceiling / s.fps).toFixed(2)}s
+                at overlap {s.timeline.slidingWindowOverlap}. The lengths must add up to the
+                {" "}{(stats.maxF / s.fps).toFixed(2)}s timeline. Changing one takes the difference
+                from its neighbour, so the total stays right.
+              </div>
+
+              <div className="winlist">
+                {stats.frames.map((f, i) => (
+                  <div className="row" key={i}>
+                    <label title={`Window ${i + 1} of ${stats.frames.length}`}>Window {i + 1}</label>
+                    <input
+                      type="range"
+                      min={stats.floor}
+                      max={stats.ceiling}
+                      step={1}
+                      value={f}
+                      onChange={(e) => s.setWindowFrames(i, Number(e.target.value))}
+                    />
+                    <span className="v num">{(f / s.fps).toFixed(2)}s</span>
+                    <span className="v num dim">{f}f</span>
+                  </div>
+                ))}
+              </div>
+
+              <Row label="">
+                <button
+                  className="btn sm"
+                  type="button"
+                  title="Go back to equal windows with the last one taking the remainder."
+                  onClick={() => s.resetWindowFrames()}
+                >
+                  Even them out
+                </button>
+                <span className="hint" style={{ flex: 1 }}>
+                  Total {(stats.total / s.fps).toFixed(2)}s of {(stats.maxF / s.fps).toFixed(2)}s
+                </span>
+              </Row>
+
+              <PromptWindowWarning />
+
+              {stats.problems.length > 0 ? (
+                <div className="warnbox">
+                  {stats.problems.map((pr, i) => (
+                    <div key={i}>{pr.text}</div>
+                  ))}
+                </div>
+              ) : (
+                <div className="note ok">
+                  {stats.frames.length} window(s) adding up to the timeline exactly.
+                </div>
+              )}
+            </>
+          )}
         </div>
       )}
       {s.advTab === "misc" && (
@@ -1206,6 +1275,32 @@ function useLoraInfo(): { info: LoraInfo | null; busy: boolean; reload: () => Pr
 /** How many guidance phases the model runs. This belongs with the model
  *  settings rather than the LoRA tab: the phase count is a property of the
  *  checkpoint, and the LoRA sliders merely follow it. */
+/** A duration typed into a prompt that disagrees with its window. The window
+ *  governs; this offers to move the window to the prompt instead. */
+function PromptWindowWarning() {
+  const s = useDirector();
+  const mism = usePromptWindowMismatches();
+  if (mism.length === 0) return null;
+  return (
+    <div className="warnbox">
+      {mism.map((m) => <div key={m.window}>{m.text}</div>)}
+      <div style={{ marginTop: 4 }}>
+        <button
+          className="btn sm"
+          type="button"
+          title="Resize the windows so they match the durations written in the prompts."
+          onClick={() => s.applyPromptDurations()}
+        >
+          Resize windows to match the prompts
+        </button>
+        <span className="hint" style={{ marginLeft: 8 }}>
+          Otherwise the window lengths are what gets generated.
+        </span>
+      </div>
+    </div>
+  );
+}
+
 function GuidancePhases() {
   const s = useDirector();
   const { info } = useLoraInfo();
