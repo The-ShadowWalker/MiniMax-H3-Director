@@ -6,6 +6,14 @@
 const fs = require("fs"), path = require("path");
 const { execSync } = require("child_process");
 
+// The guard reads webui/src regardless of where it was started from. Run from
+// the repo root it used to hand tsc no project at all, which prints the help
+// text and exits non-zero -- a "failure" that says nothing about the code.
+const WEBUI = fs.existsSync(path.join(__dirname, "webui", "tsconfig.json"))
+  ? path.join(__dirname, "webui")
+  : __dirname;
+process.chdir(WEBUI);
+
 // A real typecheck. esbuild does not scope-check, so "sfx is not defined" and
 // "PromptBox is not defined" both built cleanly and blanked the app at runtime.
 try {

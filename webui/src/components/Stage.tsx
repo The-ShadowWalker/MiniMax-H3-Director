@@ -4,12 +4,9 @@ import { helpFor } from "../lib/help";
 import { useDirector, usePromptWindowMismatches, useWindowStats } from "../lib/store";
 import {
   ATTENTION_CHOICES,
-  AUDIO_SOURCES_HYBRID,
   CACHE_TYPES,
-  CONTROL_AUDIO_MODES,
   FBC_STRENGTHS,
   FL2VA_GUIDE,
-  IMAGE_REF_MODES,
   PIPELINE_CHOICES,
   PRIORITY_CHOICES,
   RESOLUTIONS,
@@ -266,6 +263,23 @@ function MiniWave({ peaks }: { peaks: number[] }) {
   );
 }
 
+/** Open a reference in the viewer.
+ *
+ *  Always opens, even when the file is gone: passing the media id through as
+ *  `need:` lets the viewer say "no longer on disk" rather than the click
+ *  appearing to be ignored, which is what happened before -- a reference whose
+ *  file had not been restored simply swallowed both the double-click and the
+ *  zoom button. */
+function openRefPreview(
+  s: { setPreview: (p: { url: string; kind: string; name: string }) => void },
+  kind: "image" | "video" | "audio",
+  ref: { mediaId?: string; url?: string; name?: string },
+) {
+  const mi = getMedia(ref.mediaId);
+  const url = mi?.url || servedUrl(mi) || (ref.mediaId ? `need:${ref.mediaId}` : ref.url || "need:");
+  s.setPreview({ url, kind, name: ref.name || "reference" });
+}
+
 function RefsPane() {
   const s = useDirector();
   const fileRef = useRef<HTMLInputElement>(null);
@@ -392,15 +406,18 @@ function RefsPane() {
                 drag.current = null;
               }}
             >
-              <div className="th">{(() => {
+              <div
+                className="th"
+                title="Double-click to view it full size"
+                onDoubleClick={(ev) => { ev.stopPropagation(); openRefPreview(s, "image", r); }}
+              >{(() => {
                 const mi = getMedia(r.mediaId);
                 if (mi?.missing) return <span className="miss" title="File not on disk">!</span>;
                 const src = mi?.thumb || servedUrl(mi) || r.url;
                 return src ? <img src={src} alt="" /> : r.label;
               })()}</div>
               <button type="button" className="zoom-b" title="View full size"
-                onClick={(ev) => { ev.stopPropagation(); const mi = getMedia(r.mediaId); const u = mi?.url || servedUrl(mi) || (r.mediaId ? `need:${r.mediaId}` : r.url); if (u) s.setPreview({ url: u, kind: "image", name: r.name }); }}>⤢</button>
-              {r.isRefMod && <span className="tag">RefMod</span>}
+                onClick={(ev) => { ev.stopPropagation(); openRefPreview(s, "image", r); }}>⤢</button>
               <div className="mt">
                 <span className="ix num">{i + 1}</span>
                 <span className="nm">{r.name}</span>
@@ -423,16 +440,6 @@ function RefsPane() {
           multiple
           onChange={(e) => { const fs = Array.from(e.target.files ?? []); e.target.value = ""; void addRefFiles(fs); }}
         />
-        <div className="row" style={{ marginTop: 9 }}>
-          <label>How to use them</label>
-          <select value={s.refs.imageMode} onChange={(e) => s.patchRefs({ imageMode: e.target.value })}>
-            {IMAGE_REF_MODES.map((o) => (
-              <option key={o.value} value={o.value}>
-                {o.label}
-              </option>
-            ))}
-          </select>
-        </div>
         <Row label="Reference detail" value={`${s.refs.imageDetail}%`}>
           <input
             type="range"
@@ -462,9 +469,13 @@ function RefsPane() {
             const m = getMedia(v.mediaId);
             return (
               <div key={v.id} className="ref">
-                <div className="th">{m?.missing ? <span className="miss">!</span> : m?.thumb ? <img src={m.thumb} alt="" /> : "\u25B6"}</div>
+                <div
+                  className="th"
+                  title="Double-click to play it"
+                  onDoubleClick={() => openRefPreview(s, "video", v)}
+                >{m?.missing ? <span className="miss">!</span> : m?.thumb ? <img src={m.thumb} alt="" /> : "\u25B6"}</div>
                 <button type="button" className="zoom-b" title="View full size"
-                  onClick={() => { const u = m?.url || servedUrl(m) || (v.mediaId ? `need:${v.mediaId}` : v.url); if (u) s.setPreview({ url: u, kind: "video", name: v.name }); }}>⤢</button>
+                  onClick={() => openRefPreview(s, "video", v)}>⤢</button>
                 <div className="mt">
                   <span className="nm">{v.name}</span>
                   <span className="ix num">{m?.durationSec ? fmtDuration(m.durationSec) : ""}</span>
@@ -511,9 +522,13 @@ function RefsPane() {
             const m = getMedia(v.mediaId);
             return (
               <div key={v.id} className="ref">
-                <div className="th mini-wave"><MiniWave peaks={m?.peaks || []} /></div>
+                <div
+                  className="th mini-wave"
+                  title="Double-click to play it"
+                  onDoubleClick={() => openRefPreview(s, "audio", v)}
+                ><MiniWave peaks={m?.peaks || []} /></div>
                 <button type="button" className="zoom-b" title="Play"
-                  onClick={() => { const u = m?.url || servedUrl(m) || (v.mediaId ? `need:${v.mediaId}` : v.url); if (u) s.setPreview({ url: u, kind: "audio", name: v.name }); }}>⤢</button>
+                  onClick={() => openRefPreview(s, "audio", v)}>⤢</button>
                 <div className="mt">
                   <span className="nm">{v.name}</span>
                   <span className="ix num">{m?.durationSec ? fmtDuration(m.durationSec) : ""}</span>
@@ -587,24 +602,6 @@ function AudioPane() {
 
       <div className="card">
         <h4>Guidance</h4>
-        <Row label="Audio source">
-          <select value={s.audio.source} onChange={(e) => s.patchAudio({ source: e.target.value })}>
-            {AUDIO_SOURCES_HYBRID.map((o) => (
-              <option key={o.value} value={o.value}>
-                {o.label}
-              </option>
-            ))}
-          </select>
-        </Row>
-        <Row label="Control-video audio">
-          <select value={s.audio.controlVideoAudio} onChange={(e) => s.patchAudio({ controlVideoAudio: e.target.value })}>
-            {CONTROL_AUDIO_MODES.map((o) => (
-              <option key={o.value} value={o.value}>
-                {o.label}
-              </option>
-            ))}
-          </select>
-        </Row>
         <div className="note">
           Both audio lanes mix to one guidance track before generation. Longest wins, so a short clip can't truncate the song.
         </div>

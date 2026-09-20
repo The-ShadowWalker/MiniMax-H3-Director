@@ -7,7 +7,7 @@ function id(prefix: string) {
 
 export const DEMO_REFS: RefImage[] = [
   { id: "r1", name: "island_sheet", label: "sky island" },
-  { id: "r2", name: "alien_identity", label: "alien", isRefMod: true },
+  { id: "r2", name: "alien_identity", label: "alien" },
   { id: "r3", name: "alien_sheet_4", label: "detail" },
   { id: "r4", name: "wolf_ref", label: "wolf" },
   { id: "r5", name: "falls_env", label: "waterfall" },

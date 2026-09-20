@@ -103,6 +103,13 @@ check("the Win box is enabled in automatic mode", !!winBefore && !winBefore.disa
 // --- handles appear only in manual mode --------------------------------
 check("no drag handles before it is on", (await page.$$("\.whandle")).length === 0);
 
+// Where the borders sit while the plugin is choosing the windows itself.
+// Flipping to manual must hand back exactly these windows: the user asked
+// for control of the layout, not a different layout.
+const bordersOf = () => page.$$eval(".winstrip .band",
+  (e) => e.map((x) => Number(x.dataset.frames)));
+const autoBorders = await bordersOf();
+
 if (toggle) {
   await page.evaluate(() => {
     [...document.querySelectorAll("label.chk")]
@@ -124,6 +131,13 @@ if (toggle) {
     "flagged on entry: " + JSON.stringify(seeded));
   console.log("       seeded layout: " +
     seeded.map((b) => b.sec.toFixed(2) + "s").join(", "));
+
+  // The borders must not jump just because the toggle was clicked.
+  const manualBorders = await bordersOf();
+  check("the borders do not move when switching to manual",
+    autoBorders.length === manualBorders.length &&
+      autoBorders.every((f, i) => f === manualBorders[i]),
+    "auto " + autoBorders.join(",") + "  ->  manual " + manualBorders.join(","));
 
   const winAfter = await winBox();
   check("the Win box is disabled in manual mode", !!winAfter && winAfter.disabled,
@@ -224,6 +238,79 @@ if (toggle) {
   } else {
     check("there was an out-of-range band to check", badCols.length > 0);
   }
+}
+
+// --- the borders hold at every timeline length -----------------------------
+// Laying the timeline out in automatic mode and then clicking manual must hand
+// back the SAME borders. Two things used to move them: manual seeded itself
+// with an even division instead of the drawn plan, and it preferred a layout
+// saved earlier in the project over the one on screen. 16s and 32s are the
+// lengths whose automatic plan ends in a short tail -- exactly the ones that
+// used to be re-evened.
+{
+  const setDuration = async (secs) => {
+    const handle = await page.evaluateHandle(() => {
+      const lbl = [...document.querySelectorAll(".tb .lbl")]
+        .find((l) => l.textContent.trim().startsWith("Duration"));
+      if (!lbl) return null;
+      let n = lbl.nextElementSibling;
+      while (n && n.tagName !== "INPUT") n = n.querySelector ? n.querySelector("input") : null;
+      return n;
+    });
+    const input = handle.asElement();
+    if (!input) return false;
+    await input.click({ clickCount: 3 });
+    await page.keyboard.press("Control+A");
+    await page.keyboard.type(String(secs));
+    await page.keyboard.press("Enter");
+    await page.waitForTimeout(450);
+    return true;
+  };
+  const setManual = async (on) => {
+    await page.evaluate((want) => {
+      const box = [...document.querySelectorAll("label.chk")]
+        .find((l) => l.textContent.trim().toLowerCase() === "manual")
+        .querySelector("input");
+      if (box.checked !== want) box.click();
+    }, on);
+    await page.waitForTimeout(400);
+  };
+  const borders = () => page.$$eval(".winstrip .band",
+    (e) => e.map((x) => Number(x.dataset.frames)));
+
+  const moved = [];
+  const reds = [];
+  for (const secs of [16, 30, 32, 45, 60, 75]) {
+    await setManual(false);
+    if (!(await setDuration(secs))) break;
+    const before = await borders();
+    await setManual(true);
+    const after = await borders();
+    const same = before.length === after.length && before.every((f, i) => f === after[i]);
+    if (!same) moved.push(`${secs}s: [${before}] -> [${after}]`);
+    const bad = await page.$$eval(".winstrip .band",
+      (e) => e.filter((x) => x.dataset.bad).length);
+    if (bad) reds.push(`${secs}s: ${bad} red`);
+  }
+  check("the borders hold at every timeline length", moved.length === 0,
+    moved.join("   |   "));
+  check("and none of those layouts starts out red", reds.length === 0,
+    reds.join("   |   "));
+
+  // Toggling off and straight back on must be a no-op too: the saved layout
+  // used to win over what was on screen.
+  await setManual(false);
+  const autoAgain = await borders();
+  await setManual(true);
+  await setManual(false);
+  await setManual(true);
+  const afterCycles = await borders();
+  check("toggling manual off and on twice changes nothing",
+    autoAgain.length === afterCycles.length && autoAgain.every((f, i) => f === afterCycles[i]),
+    "[" + autoAgain + "] -> [" + afterCycles + "]");
+  // Hand the next block the state it expects: manual on, so the Sliding Window
+  // panel shows its Windows +/- control.
+  await setManual(true);
 }
 
 // --- adding windows: a short timeline split into several -------------------
@@ -406,6 +493,66 @@ if (toggle) {
     check("PDD off restores the normal step count", off !== 8 && off === before,
       "steps stayed at " + off + " (was " + before + " before PDD)");
     console.log("       steps " + before + " -> PDD on " + on + " -> PDD off " + off);
+  }
+}
+
+// --- double-click a reference to inspect it --------------------------------
+{
+  await page.evaluate(() => {
+    const rail = [...document.querySelectorAll("button, [role=button], .rail-item, li, div")]
+      .find((b) => (b.textContent || "").trim().startsWith("References"));
+    if (rail) rail.click();
+  });
+  await page.waitForTimeout(500);
+
+  const thumbs = await page.$$(".ref .th");
+  check("there are reference tiles to open", thumbs.length > 0,
+    "no .ref .th tiles in the References pane");
+
+  if (thumbs.length) {
+    await thumbs[0].dblclick();
+    await page.waitForTimeout(600);
+    const open = await page.$(".pv");
+    check("double-clicking a reference opens the viewer", !!open,
+      "no preview panel appeared");
+
+    if (open) {
+      // it should actually show something, not an empty shell
+      const kinds = await page.evaluate(() => ({
+        img: !!document.querySelector(".pv-b img"),
+        vid: !!document.querySelector(".pv-b video"),
+        aud: !!document.querySelector(".pv-b audio"),
+        err: !!document.querySelector(".pv-b .err"),
+      }));
+      check("the viewer shows the media itself",
+        kinds.img || kinds.vid || kinds.aud || kinds.err,
+        "nothing rendered inside the viewer: " + JSON.stringify(kinds));
+
+      // draggable by the title bar
+      const head = await page.$(".pv-h");
+      const b0 = await open.boundingBox();
+      const hb = await head.boundingBox();
+      await page.mouse.move(hb.x + 40, hb.y + hb.height / 2);
+      await page.mouse.down();
+      await page.mouse.move(hb.x + 40 + 90, hb.y + hb.height / 2 + 60, { steps: 10 });
+      await page.mouse.up();
+      await page.waitForTimeout(250);
+      const b1 = await open.boundingBox();
+      check("the viewer can be dragged by its title bar",
+        Math.abs(b1.x - b0.x) > 20 || Math.abs(b1.y - b0.y) > 20,
+        "it did not move: " + JSON.stringify([b0.x, b0.y]) + " -> " + JSON.stringify([b1.x, b1.y]));
+
+      const resizable = await page.$eval(".pv",
+        (el) => getComputedStyle(el).resize);
+      check("the viewer is resizable", resizable === "both",
+        "CSS resize is '" + resizable + "'");
+
+      await page.keyboard.press("Escape");
+      await page.waitForTimeout(300);
+      check("Escape closes the viewer", !(await page.$(".pv")));
+      console.log("       viewer moved " + Math.round(b1.x - b0.x) + "," +
+                  Math.round(b1.y - b0.y) + "px and resizes '" + resizable + "'");
+    }
   }
 }
 

@@ -46,7 +46,6 @@ export interface RefImage {
   name: string;
   label: string;
   url?: string;
-  isRefMod?: boolean;
 }
 
 export interface RefClip {
@@ -220,23 +219,6 @@ export const VIDEO_VAE_CHOICES = [
 export const PRIORITY_CHOICES = [
   { value: "", label: "Lower VRAM (default)" },
   { value: "lower_ram", label: "Lower RAM" },
-] as const;
-
-export const IMAGE_REF_MODES = [
-  { value: "I", label: "Reference images (Ref2VA)" },
-  { value: "KI", label: "First image sets dimensions" },
-  { value: "", label: "Generate without reference images" },
-] as const;
-
-export const AUDIO_SOURCES_HYBRID = [
-  { value: "A", label: "Soundtrack drives generation" },
-  { value: "", label: "Generate audio from prompt" },
-  { value: "K", label: "Soundtrack + reference voice" },
-] as const;
-
-export const CONTROL_AUDIO_MODES = [
-  { value: "mix", label: "Mixed into guidance" },
-  { value: "mute", label: "Muted — reference only" },
 ] as const;
 
 export const FL2VA_GUIDE = [

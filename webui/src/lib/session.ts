@@ -125,8 +125,6 @@ export function buildGenerationPlan(p: SessionPayload) {
     // equal ones.
     manual_windows: manual,
     window_frames: manual ? (p.timeline.windowFrames as number[]) : undefined,
-    image_ref_mode: p.refs.imageMode,
-    audio_source: p.audio.source,
     reference_mode: p.pipeline !== "FL2VA",
   };
 }

@@ -454,7 +454,15 @@ export function validateWindowFrames(
   }
   frames.forEach((raw, i) => {
     const n = Math.round(raw);
-    if (n < floor) {
+    // The LAST window of a multi-window layout is allowed to be short. That is
+    // how WanGP's own plan ends -- the pass is padded up to the model's minimum
+    // and the extra frames are trimmed off the output -- so flagging it here
+    // would paint the automatic layout red for doing the normal thing. A lone
+    // window below the minimum has nothing to trim from and is still an error.
+    const tail = i === frames.length - 1 && frames.length > 1;
+    if (n < floor && tail) {
+      /* fine: WanGP pads this pass and trims the result */
+    } else if (n < floor) {
       problems.push({
         window: i + 1, kind: "floor", blocking: true,
         text: `Window ${i + 1} is ${(n / f).toFixed(2)}s. The model cannot generate less than ${(floor / f).toFixed(2)}s (${floor} frames).`,
@@ -485,34 +493,55 @@ export function windowLimitsText(ovl: number, fps: number): string {
 }
 
 /**
- * The layout manual mode starts from: the fewest windows that can hold the
- * timeline, divided as evenly as the frame count allows.
+ * The layout manual mode starts from.
  *
- * It used to copy the automatic plan's outputs and dump the difference on the
- * last window. The automatic plan deliberately OVERSHOOTS to land on legal
- * frame counts, so forcing the last window to absorb a negative remainder
- * produced runts: a 16s timeline seeded as [362, 22], and 22 frames is far
- * below what the model can generate. Even division cannot do that.
+ * FIRST CHOICE: exactly the boundaries automatic mode is already drawing. If
+ * all you did was tick the box, nothing on screen should move -- the bands
+ * used to shift by a few frames because automatic draws the scheduler's
+ * snapped OUTPUT lengths while manual seeded an even division.
+ *
+ * FALLBACK: an even division, used when the automatic layout cannot be edited
+ * as-is -- on a short timeline it ends in a runt (a 16s timeline draws as
+ * [362, 22], and 22 frames is far below what the model can generate). Taking
+ * that as a starting point would show red the instant manual mode was opened.
  */
 export function seedWindowFrames(totalFrames: number, win: number, ovl: number): number[] {
   const total = Math.max(1, Math.round(totalFrames));
+
+  const drawn = realWindows(total, win, ovl)
+    .map((w) => Math.max(0, w.end - w.start))
+    .filter((n) => n > 0);
+  // Whatever automatic mode has drawn is exactly what WanGP's own scheduler
+  // does, so it is always a layout the model can run -- hand it straight over
+  // and the borders do not move by so much as a frame. It is deliberately NOT
+  // validated first: a layout that ends in a short tail window is what the
+  // automatic plan produces anyway, and rejecting it here was the only reason
+  // the bands ever jumped.
+  const drawnSum = drawn.reduce((a, b) => a + b, 0);
+  if (drawn.length && drawnSum === total) return drawn;
+
+  // --- even division ---
   const specMax = windowSpecMaxFrames(H3.FPS);
   const hardMax = windowCeilingFrames(ovl);
   const floor = windowFloorFrames();
-
-  // Stay inside MiniMax's documented window where the requested size allows,
-  // and never propose more than the model can actually run in one pass.
   const per = Math.max(1, Math.min(win || specMax, specMax, hardMax));
   let n = Math.max(1, Math.ceil(total / per));
-  // Do not make so many windows that each falls under the model's minimum.
   const most = Math.max(1, Math.floor(total / floor));
   if (n > most) n = most;
 
   const each = Math.floor(total / n);
   const frames = Array.from({ length: n }, () => each);
   let left = total - each * n;
-  for (let i = 0; i < n && left > 0; i++, left--) frames[i] += 1;   // spread the remainder
+  for (let i = 0; i < n && left > 0; i++, left--) frames[i] += 1;
   return frames;
+}
+
+/** Would switching to manual keep the boundaries exactly where they are? */
+export function seedMatchesAuto(totalFrames: number, win: number, ovl: number): boolean {
+  const total = Math.max(1, Math.round(totalFrames));
+  const drawn = realWindows(total, win, ovl).map((w) => w.end - w.start).filter((n) => n > 0);
+  const seed = seedWindowFrames(total, win, ovl);
+  return drawn.length === seed.length && drawn.every((n, i) => n === seed[i]);
 }
 
 export type WindowSpan = { i: number; start: number; end: number };

@@ -481,3 +481,9 @@ canvas.wave{position:absolute;inset:0;width:100%;height:100%;pointer-events:none
 .winstrip .band[data-selected]{outline:2px solid #fff;outline-offset:-2px;
   box-shadow:0 0 0 1px rgba(0,0,0,.45) inset;filter:brightness(1.25)}
 .winstrip .band{cursor:pointer}
+
+/* preview: movable by its title bar, still resizable from the corner */
+.pv-h{cursor:move;user-select:none;touch-action:none}
+.pv-h button{cursor:pointer}
+.pv-kind{font-size:10px;text-transform:uppercase;letter-spacing:.06em;
+  opacity:.6;padding:1px 6px;border:1px solid var(--line);border-radius:10px}

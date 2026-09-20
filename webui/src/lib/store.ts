@@ -219,18 +219,18 @@ export const useDirector = create<DirectorState>()((set, get) => ({
       setManualWindows: (on) =>
         set((st) => {
           const total = totalFrames(st);
-          const saved = st.timeline.windowFrames;
-          // A layout saved against a different timeline length or overlap no
-          // longer adds up. Rather than hand back something broken, start from
-          // the automatic plan -- the warning would otherwise fire the instant
-          // an old project was reopened.
-          const fits =
-            !!saved && saved.length > 0 &&
-            saved.reduce((a, b) => a + b, 0) === total &&
-            validateWindowFrames(saved, total, st.timeline.slidingWindowOverlap, st.fps).length === 0;
+          // Turning manual ON hands over the layout that is on screen RIGHT
+          // NOW, always. It used to prefer a layout saved earlier in the
+          // project, which is why the borders jumped a few frames: the saved
+          // one was drawn by an older build, or before the timeline changed.
+          // Manual mode is "let me move these borders", not "load some other
+          // borders" -- a saved layout is restored by opening the project,
+          // which does not come through here.
           const frames = on
-            ? (fits ? saved : seedWindowFrames(total, st.timeline.slidingWindowSize, st.timeline.slidingWindowOverlap))
-            : saved;
+            ? seedWindowFrames(
+                total, st.timeline.slidingWindowSize, st.timeline.slidingWindowOverlap)
+            : st.timeline.windowFrames;
+
           return {
             timeline: { ...st.timeline, manualWindows: on, windowFrames: frames },
             dirty: (markDirty(), true),
