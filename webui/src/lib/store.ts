@@ -23,6 +23,7 @@ import {
   planDurations,
   validateWindowFrames,
   windowCeilingFrames,
+  windowLimitsText,
   windowFloorFrames,
   windowSecondsWarning,
 } from "./h3";
@@ -69,6 +70,19 @@ export interface DirectorState extends SessionPayload {
   resetWindowFrames: () => void;
   /** Resize windows to the durations typed into the prompts. */
   applyPromptDurations: () => void;
+  /** Divide the timeline evenly into exactly this many windows. */
+  setWindowCount: (n: number) => void;
+  /** The window picked out on the timeline, or null. Backspace/Delete removes it. */
+  selectedWindow: number | null;
+  selectWindow: (i: number | null) => void;
+  /** Remove the selected window, folding its frames into a neighbour. */
+  removeSelectedWindow: () => void;
+  /** Put a new window boundary at this frame, splitting whatever window it falls in. */
+  addWindowAt: (frame: number) => void;
+  /** Split window `i` into two halves. */
+  splitWindow: (i: number) => void;
+  /** Fold window `i` into its neighbour, removing one window. */
+  mergeWindow: (i: number) => void;
   setMonitor: (m: { mediaId: string; name: string; start: number; x?: number; y?: number } | null) => void;
   lockClipAudio: boolean;
   statusOpen: boolean;
@@ -227,20 +241,39 @@ export const useDirector = create<DirectorState>()((set, get) => ({
         set((st) => {
           const frames = [...(st.timeline.windowFrames || [])];
           if (i < 1 || i >= frames.length) return {};
-          // The boundary before window i: everything earlier is fixed, so the
-          // previous window grows or shrinks and window i takes the opposite.
           const before = frames.slice(0, i - 1).reduce((a, b) => a + b, 0);
-          const pair = frames[i - 1] + frames[i];
-          const floor = windowFloorFrames();
-          const ceil = windowCeilingFrames(st.timeline.slidingWindowOverlap);
-          let prev = Math.round(frame) - before;
-          prev = Math.max(floor, Math.min(prev, pair - floor));
-          prev = Math.min(prev, ceil);
-          let next = pair - prev;
-          if (next > ceil) { next = ceil; prev = pair - next; }
-          if (prev < floor || next < floor) return {};
-          frames[i - 1] = prev;
-          frames[i] = next;
+
+          // NOTHING is clamped to the model's limits here. Arranging a layout
+          // means putting one window out of range to get the next one right,
+          // and a boundary that stops dead is worse than one that lets you
+          // overshoot. The limits are reported in the panel, shown on the
+          // bands, and enforced at Generate -- not with the mouse.
+          //
+          // The only floor is one frame, because a window of zero is not a
+          // window. The total stays equal to the timeline: what one window
+          // gains, the ones after it give up, nearest first.
+          let prev = Math.max(1, Math.round(frame) - before);
+          const tailTotal = frames.slice(i).reduce((a, b) => a + b, 0);
+          const tailCount = frames.length - i;
+          prev = Math.min(prev, frames[i - 1] + tailTotal - tailCount);  // leave 1 each
+          let delta = prev - frames[i - 1];
+          if (delta === 0) return {};
+
+          const tail = frames.slice(i);
+          let need = delta;
+          for (let k = 0; k < tail.length && need !== 0; k++) {
+            if (need > 0) {
+              const take = Math.min(tail[k] - 1, need);
+              if (take > 0) { tail[k] -= take; need -= take; }
+            } else {
+              tail[k] += -need;                 // the nearest window absorbs it all
+              need = 0;
+            }
+          }
+          const moved = delta - need;
+          if (moved === 0) return {};
+          frames[i - 1] += moved;
+          for (let k = 0; k < tail.length; k++) frames[i + k] = tail[k];
           return { timeline: { ...st.timeline, windowFrames: frames }, dirty: (markDirty(), true) };
         }),
 
@@ -248,16 +281,16 @@ export const useDirector = create<DirectorState>()((set, get) => ({
         set((st) => {
           const frames = [...(st.timeline.windowFrames || [])];
           if (i < 0 || i >= frames.length) return {};
-          const floor = windowFloorFrames();
-          const ceil = windowCeilingFrames(st.timeline.slidingWindowOverlap);
-          const n = Math.max(floor, Math.min(ceil, Math.round(want)));
+          const n = Math.max(1, Math.round(want));
           const j = i + 1 < frames.length ? i + 1 : i - 1;
           if (j < 0) {
             frames[i] = n;
           } else {
+            // Same rule as dragging: free to be out of range, but the total
+            // must keep matching the timeline.
             const pair = frames[i] + frames[j];
             const other = pair - n;
-            if (other < floor || other > ceil) return {};   // refuse rather than break the total
+            if (other < 1) return {};
             frames[i] = n;
             frames[j] = other;
           }
@@ -285,6 +318,83 @@ export const useDirector = create<DirectorState>()((set, get) => ({
             dirty: (markDirty(), true),
             toast: "Windows resized to match the prompts",
           };
+        }),
+
+      selectedWindow: null,
+      selectWindow: (i) => set({ selectedWindow: i }),
+
+      removeSelectedWindow: () => {
+        const st = get();
+        const i = st.selectedWindow;
+        const frames = st.timeline.windowFrames || [];
+        if (i == null || i < 0 || i >= frames.length) return;
+        if (frames.length < 2) { set({ toast: "The last window cannot be removed" }); return; }
+        get().mergeWindow(i);
+        // Keep a sensible selection: the window that absorbed it.
+        set((s2) => ({
+          selectedWindow: Math.min(i, (s2.timeline.windowFrames || []).length - 1),
+          toast: `Window ${i + 1} removed`,
+        }));
+      },
+
+      addWindowAt: (frame) =>
+        set((st) => {
+          const frames = [...(st.timeline.windowFrames || [])];
+          if (!frames.length) return {};
+          const at = Math.round(frame);
+          // Which window does the marker fall in, and how far into it?
+          let start = 0;
+          for (let i = 0; i < frames.length; i++) {
+            const end = start + frames[i];
+            if (at > start && at < end) {
+              const left = at - start;
+              const right = end - at;
+              frames.splice(i, 1, left, right);
+              return {
+                timeline: { ...st.timeline, manualWindows: true, windowFrames: frames },
+                selectedWindow: i,
+                dirty: (markDirty(), true),
+                toast: `Window split at ${(at / Math.max(1, st.fps)).toFixed(2)}s`,
+              };
+            }
+            start = end;
+          }
+          return { toast: "Move the playhead inside a window to split it there" };
+        }),
+
+      setWindowCount: (n) =>
+        set((st) => {
+          const total = totalFrames(st);
+          const count = Math.max(1, Math.min(64, Math.round(n)));
+          // Even shares, with the remainder on the last so the total is exact.
+          const each = Math.floor(total / count);
+          const frames = Array.from({ length: count }, () => Math.max(1, each));
+          const sum = frames.reduce((a, b) => a + b, 0);
+          frames[count - 1] += total - sum;
+          return {
+            timeline: { ...st.timeline, manualWindows: true, windowFrames: frames },
+            dirty: (markDirty(), true),
+          };
+        }),
+
+      splitWindow: (i) =>
+        set((st) => {
+          const frames = [...(st.timeline.windowFrames || [])];
+          if (i < 0 || i >= frames.length || frames[i] < 2) return {};
+          const half = Math.floor(frames[i] / 2);
+          frames.splice(i, 1, half, frames[i] - half);
+          return { timeline: { ...st.timeline, windowFrames: frames }, dirty: (markDirty(), true) };
+        }),
+
+      mergeWindow: (i) =>
+        set((st) => {
+          const frames = [...(st.timeline.windowFrames || [])];
+          if (frames.length < 2 || i < 0 || i >= frames.length) return {};
+          // Fold into the next window, or into the previous one at the end.
+          const j = i + 1 < frames.length ? i + 1 : i - 1;
+          frames[j] += frames[i];
+          frames.splice(i, 1);
+          return { timeline: { ...st.timeline, windowFrames: frames }, dirty: (markDirty(), true) };
         }),
 
       resetWindowFrames: () =>
@@ -817,19 +927,38 @@ export const useDirector = create<DirectorState>()((set, get) => ({
         // wrong length. Refuse and say which, rather than find out afterwards.
         const lay = windowLayout(s);
         if (lay.manual) {
-          const bad = validateWindowFrames(lay.frames, maxF, lay.ovl, s.fps);
-          if (bad.length) {
+          const found = validateWindowFrames(lay.frames, maxF, lay.ovl, s.fps);
+          const blocking = found.filter((b) => b.blocking);
+          const advisory = found.filter((b) => !b.blocking);
+          if (blocking.length) {
+            // Stop and say exactly what is wrong and what the limits are, so
+            // the layout can be fixed. Nothing was clamped on the way in, so
+            // this is the first and only place it is enforced.
             set({
               statusOpen: true, pane: "gen", advTab: "window",
-              toast: bad[0].text,
+              toast: blocking[0].text,
               job: { ...s.job, logs: [
                 ...s.job.logs,
-                ...bad.map((b) => ({ t: Date.now(), level: "err" as const, msg: b.text })),
+                { t: Date.now(), level: "err" as const,
+                  msg: `Cannot generate: ${blocking.length} window problem(s).` },
+                ...blocking.map((b) => ({ t: Date.now(), level: "err" as const, msg: b.text })),
                 { t: Date.now(), level: "info" as const,
-                  msg: "Fix the window lengths under Sliding Window, or press Even them out." },
+                  msg: windowLimitsText(lay.ovl, s.fps) },
+                { t: Date.now(), level: "info" as const,
+                  msg: "Adjust the boundaries on the timeline, or press Even them out under Sliding Window." },
               ] },
             });
             return;
+          }
+          if (advisory.length) {
+            // Out of MiniMax's documented range but still generates. Say so
+            // and carry on -- it is the user's call, not ours.
+            set({
+              job: { ...s.job, logs: [
+                ...s.job.logs,
+                ...advisory.map((b) => ({ t: Date.now(), level: "warn" as const, msg: b.text })),
+              ] },
+            });
           }
         }
         // Ask for the window count WanGP will really run, so the status does

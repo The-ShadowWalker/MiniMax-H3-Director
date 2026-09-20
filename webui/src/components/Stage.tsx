@@ -1125,11 +1125,43 @@ function GenPane() {
           {s.timeline.manualWindows && (
             <>
               <div className="note">
-                Each window can be {(stats.floor / s.fps).toFixed(2)}s to {(stats.ceiling / s.fps).toFixed(2)}s
-                at overlap {s.timeline.slidingWindowOverlap}. The lengths must add up to the
-                {" "}{(stats.maxF / s.fps).toFixed(2)}s timeline. Changing one takes the difference
-                from its neighbour, so the total stays right.
+                Drag the boundaries on the timeline, or use the sliders below. Nothing is clamped
+                while you arrange — a window may sit out of range until you fix its neighbour.
+                <br />
+                <b>Hard limits:</b> {(stats.floor / s.fps).toFixed(2)}s to {(stats.ceiling / s.fps).toFixed(2)}s
+                per window at overlap {s.timeline.slidingWindowOverlap}, and the lengths must add up
+                to the {(stats.maxF / s.fps).toFixed(2)}s timeline. Generate refuses outside those.
+                <br />
+                <b>MiniMax documents {H3.OFFICIAL_MIN_SEC}–{H3.MAX_WINDOW_SEC}s per window.</b>{" "}
+                Longer still generates; quality past {H3.MAX_WINDOW_SEC}s is not something the model promises.
               </div>
+
+              <Row label="Windows">
+                <button
+                  className="btn sm"
+                  type="button"
+                  disabled={stats.frames.length <= 1}
+                  title="One window fewer — the last two are folded together."
+                  onClick={() => s.setWindowCount(stats.frames.length - 1)}
+                >
+                  &minus;
+                </button>
+                <span className="v num" style={{ minWidth: 28, textAlign: "center" }}>
+                  {stats.frames.length}
+                </span>
+                <button
+                  className="btn sm"
+                  type="button"
+                  title="One window more — the timeline is divided evenly again."
+                  onClick={() => s.setWindowCount(stats.frames.length + 1)}
+                >
+                  +
+                </button>
+                <span className="hint" style={{ flex: 1 }}>
+                  Evenly divided: {(stats.maxF / Math.max(1, stats.frames.length) / s.fps).toFixed(2)}s each.
+                  Split or fold single windows below.
+                </span>
+              </Row>
 
               <div className="winlist">
                 {stats.frames.map((f, i) => (
@@ -1145,6 +1177,24 @@ function GenPane() {
                     />
                     <span className="v num">{(f / s.fps).toFixed(2)}s</span>
                     <span className="v num dim">{f}f</span>
+                    <button
+                      className="btn sm"
+                      type="button"
+                      disabled={f < 2}
+                      title="Split this window into two halves"
+                      onClick={() => s.splitWindow(i)}
+                    >
+                      Split
+                    </button>
+                    <button
+                      className="btn sm warn"
+                      type="button"
+                      disabled={stats.frames.length < 2}
+                      title="Fold this window into its neighbour"
+                      onClick={() => s.mergeWindow(i)}
+                    >
+                      &times;
+                    </button>
                   </div>
                 ))}
               </div>
@@ -1166,9 +1216,11 @@ function GenPane() {
               <PromptWindowWarning />
 
               {stats.problems.length > 0 ? (
-                <div className="warnbox">
+                <div className={stats.problems.some((p) => p.blocking) ? "warnbox" : "warnbox soft"}>
                   {stats.problems.map((pr, i) => (
-                    <div key={i}>{pr.text}</div>
+                    <div key={i}>
+                      <b>{pr.blocking ? "Blocks generation:" : "Out of spec:"}</b> {pr.text}
+                    </div>
                   ))}
                 </div>
               ) : (

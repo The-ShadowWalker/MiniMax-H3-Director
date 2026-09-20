@@ -133,9 +133,28 @@ export function Timeline() {
     if (!host) return;
     const rect = host.getBoundingClientRect();
     el.setPointerCapture(e.pointerId);
-    const move = (ev: PointerEvent) =>
-      s.dragWindowEdge(i, Math.round(fOf(ev.clientX - rect.left)));
+
+    // A pointer fires far faster than the screen refreshes. Applying every
+    // event re-rendered the whole timeline dozens of times a frame, which is
+    // what made the drag feel like it was dragging its heels; coalescing onto
+    // the next animation frame keeps it smooth and loses nothing, since only
+    // the latest position matters.
+    let pending: number | null = null;
+    let raf = 0;
+    const flush = () => {
+      raf = 0;
+      if (pending == null) return;
+      const at = pending;
+      pending = null;
+      s.dragWindowEdge(i, at);
+    };
+    const move = (ev: PointerEvent) => {
+      pending = Math.round(fOf(ev.clientX - rect.left));
+      if (!raf) raf = requestAnimationFrame(flush);
+    };
     const up = () => {
+      if (raf) { cancelAnimationFrame(raf); raf = 0; }
+      flush();                                  // never drop the final position
       el.removeEventListener("pointermove", move);
       el.removeEventListener("pointerup", up);
       el.removeEventListener("pointercancel", up);
@@ -144,6 +163,23 @@ export function Timeline() {
     el.addEventListener("pointerup", up);
     el.addEventListener("pointercancel", up);
   };
+
+  // Delete or Backspace removes the selected window. Ignored while typing,
+  // so it never eats a character out of a prompt or a number field.
+  useEffect(() => {
+    if (!stats.manual || s.selectedWindow == null) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Delete" && e.key !== "Backspace") return;
+      const t = e.target as HTMLElement | null;
+      const tag = (t && t.tagName) || "";
+      if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" ||
+          (t && t.isContentEditable)) return;
+      e.preventDefault();
+      s.removeSelectedWindow();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [stats.manual, s.selectedWindow, s]);
 
   const dragged = useRef(false);
   const drag = useRef<{
@@ -387,10 +423,54 @@ export function Timeline() {
           );
         })()}
         <span className="sep" />
+        <label
+          className="chk"
+          title="Set each window's length yourself. Turn this on and the window boundaries below become draggable."
+        >
+          <input
+            type="checkbox"
+            checked={!!s.timeline.manualWindows}
+            onChange={(e) => {
+              s.setManualWindows(e.target.checked);
+              if (e.target.checked && !s.timeline.showWindows) {
+                // Nothing to drag if the bands are hidden.
+                s.patchTimeline({ showWindows: true });
+              }
+              s.setToast(e.target.checked
+                ? "Manual windows on — drag the boundaries in the band strip"
+                : "Back to equal windows");
+            }}
+          />{" "}
+          manual
+        </label>
+        {s.timeline.manualWindows && (
+          <button
+            className="btn sm"
+            type="button"
+            title="Add a window boundary at the playhead, splitting the window it sits in."
+            onClick={() => s.addWindowAt(s.timeline.playhead)}
+          >
+            + window
+          </button>
+        )}
+        {s.timeline.manualWindows && s.selectedWindow != null && (
+          <button
+            className="btn sm warn"
+            type="button"
+            title="Remove the selected window (Delete or Backspace)."
+            onClick={() => s.removeSelectedWindow()}
+          >
+            &minus; window
+          </button>
+        )}
         <span className="lbl">Win</span>
         <input
           className="nin num"
           value={s.timeline.slidingWindowSize}
+          disabled={!!s.timeline.manualWindows}
+          title={s.timeline.manualWindows
+            ? "Not used while window lengths are set by hand — drag the boundaries instead."
+            : "Frames generated per window, about 15s at 24fps."}
           onKeyDown={(e) => {
             if (e.key === "ArrowUp" || e.key === "ArrowDown") {
               e.preventDefault();
@@ -430,28 +510,10 @@ export function Timeline() {
           onChange={(e) => s.setOvl(Number(e.target.value))}
         />
         <span className="wininfo num">
-          {stats.windows} windows × {stats.newFrames} new frames
+          {stats.manual
+            ? `${stats.windows} windows · set by hand`
+            : `${stats.windows} windows × ${stats.newFrames} new frames`}
         </span>
-        <label
-          className="chk"
-          title="Set each window's length yourself. Turn this on and the window boundaries below become draggable."
-        >
-          <input
-            type="checkbox"
-            checked={!!s.timeline.manualWindows}
-            onChange={(e) => {
-              s.setManualWindows(e.target.checked);
-              if (e.target.checked && !s.timeline.showWindows) {
-                // Nothing to drag if the bands are hidden.
-                s.patchTimeline({ showWindows: true });
-              }
-              s.setToast(e.target.checked
-                ? "Manual windows on — drag the boundaries in the band strip"
-                : "Back to equal windows");
-            }}
-          />{" "}
-          manual
-        </label>
         <label className="chk">
           <input
             type="checkbox"
@@ -569,17 +631,45 @@ export function Timeline() {
         </div>
         <div className="winstrip">
           {s.timeline.showWindows &&
-            stats.spans.map((w, i) => (
-              <div
-                key={w.i}
-                className="band"
-                style={{
-                  left: xOf(w.start),
-                  width: Math.max(1, xOf(w.end) - xOf(w.start)),
-                  background: i % 2 === 0 ? "rgba(64,118,208,.85)" : "rgba(208,148,64,.85)",
-                }}
-              />
-            ))}
+            stats.spans.map((w, i) => {
+              // A window outside the model's limits is coloured as you drag,
+              // so it is obvious long before Generate refuses it.
+              const bad = stats.problems.find((p) => p.window === i + 1);
+              // ONE colour for "outside the limits". The amber used for
+              // out-of-spec was almost the same as the normal alternating
+              // band, so a bad window looked like an ordinary one. Red means
+              // out of range, whatever kind; the panel says which.
+              const colour = bad
+                ? "rgba(226,42,42,.92)"
+                : (i % 2 === 0 ? "rgba(64,118,208,.85)" : "rgba(208,148,64,.85)");
+              return (
+                <div
+                  key={w.i}
+                  className="band"
+                  // The size label is hidden on a narrow band, so carry the
+                  // real length here too: hover, and for the UI smoke test.
+                  data-frames={w.end - w.start}
+                  data-sec={((w.end - w.start) / s.fps).toFixed(2)}
+                  data-bad={bad ? (bad.blocking ? "block" : "spec") : undefined}
+                  data-selected={stats.manual && s.selectedWindow === i ? "1" : undefined}
+                  onClick={(e) => {
+                    if (!stats.manual) return;
+                    e.stopPropagation();
+                    s.selectWindow(s.selectedWindow === i ? null : i);
+                  }}
+                  title={bad
+                    ? bad.text
+                    : stats.manual
+                      ? `Window ${i + 1}: ${((w.end - w.start) / s.fps).toFixed(2)}s — click to select, then Delete or Backspace to remove it`
+                      : `Window ${i + 1}: ${((w.end - w.start) / s.fps).toFixed(2)}s`}
+                  style={{
+                    left: xOf(w.start),
+                    width: Math.max(1, xOf(w.end) - xOf(w.start)),
+                    background: colour,
+                  }}
+                />
+              );
+            })}
           {s.timeline.showWindows &&
             stats.spans.slice(1).map((w) => (
               <div
@@ -628,7 +718,9 @@ export function Timeline() {
                 style={{
                   left: xOf(w.start),
                   width: Math.max(1, xOf(w.end) - xOf(w.start)),
-                  background: i % 2 === 0 ? "rgba(64,118,208,.05)" : "rgba(208,148,64,.05)",
+                  background: stats.problems.some((p) => p.window === i + 1)
+                    ? "rgba(226,42,42,.10)"
+                    : i % 2 === 0 ? "rgba(64,118,208,.05)" : "rgba(208,148,64,.05)",
                 }}
               />
             ))}

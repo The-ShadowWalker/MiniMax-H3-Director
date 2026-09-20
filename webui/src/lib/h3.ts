@@ -16,7 +16,10 @@ export const H3 = {
   OVERLAP_MAX: 120,
   OVERLAP_DEFAULT: 18,
   FPS: 24,
+  // MiniMax documents 4-15 seconds per generation window. Wan2GP's own slider
+  // goes to 481 frames (20.04s), so beyond 15s is out of spec but still runs.
   MAX_WINDOW_SEC: 15,
+  OFFICIAL_MIN_SEC: 4,
   STEPS_DEFAULT: 20,
   FLOW_SHIFT: 12,
   GUIDANCE: 1,
@@ -355,6 +358,30 @@ export function windowFloorFrames(): number {
   return H3.FRAMES_MIN;
 }
 
+/**
+ * The largest window still INSIDE MiniMax's documented 15 seconds.
+ *
+ * Not simply 15 x fps. The model only accepts frame counts on its own grid,
+ * and near 15s that grid offers 345 (14.375s) or 362 (15.083s) -- there is no
+ * exact 15s. 362 is what Wan2GP ships as the default window, so 362 IS the
+ * fifteen-second window as far as this model is concerned.
+ *
+ * Comparing against a literal 360 made the DEFAULT layout flag itself: a plain
+ * 60s timeline seeds to [362, 361, 361, 356] and the first three were reported
+ * as out of spec the moment manual mode was switched on.
+ */
+export function windowSpecMaxFrames(fps: number): number {
+  const f = Math.max(1, fps || 24);
+  const want = H3.MAX_WINDOW_SEC * f;
+  const step = H3.WINDOW_STEP;
+  const offset = H3.WINDOW_OFFSET;
+  const lower = Math.floor((want - offset) / step) * step + offset;
+  const upper = lower + step;
+  const nearest = want - lower <= upper - want ? lower : upper;
+  // Never report the model's own default window as out of spec.
+  return Math.max(nearest, H3.WINDOW_DEFAULT);
+}
+
 /** Most OUTPUT frames a single window can produce at this overlap. */
 export function windowCeilingFrames(ovl: number): number {
   return Math.max(H3.FRAMES_MIN, H3.WINDOW_MAX - Math.max(0, Math.floor(ovl)));
@@ -379,11 +406,29 @@ export function readDurationSeconds(text: string): number | null {
   return Number.isFinite(n) && n > 0 ? n : null;
 }
 
-export type WindowProblem = { window: number | null; text: string; kind: "total" | "floor" | "ceiling" };
+export type WindowProblem = {
+  window: number | null;
+  text: string;
+  kind: "total" | "floor" | "ceiling" | "spec";
+  /** blocking problems make the generation wrong; advisory ones only risk quality. */
+  blocking: boolean;
+};
 
 /**
- * Everything wrong with a hand-set window layout, in the order it matters.
- * An empty array means the layout is good to generate.
+ * Everything wrong with a hand-set window layout.
+ *
+ * Two different limits, and they are not the same thing:
+ *
+ *   BLOCKING  - the model cannot do it. Fewer frames than frames_minimum, or a
+ *               pass (window + overlap) larger than the biggest window Wan2GP
+ *               offers. These produce a wrong or failed generation.
+ *   ADVISORY  - MiniMax documents 4-15 seconds per window. Past 15s still runs
+ *               and Wan2GP's own slider allows it; quality is the risk, so it
+ *               is said plainly and left to the user.
+ *
+ * Nothing here clamps anything. Window lengths are free to be wrong while a
+ * layout is being arranged -- you often have to put one window out of range to
+ * get the next one right. This just reports.
  */
 export function validateWindowFrames(
   frames: number[],
@@ -395,44 +440,79 @@ export function validateWindowFrames(
   const f = Math.max(1, fps || 24);
   const floor = windowFloorFrames();
   const ceil = windowCeilingFrames(ovl);
+  const specMax = windowSpecMaxFrames(f);
   const sum = frames.reduce((a, b) => a + Math.max(0, Math.round(b)), 0);
 
   if (sum !== totalFrames) {
     const diff = sum - totalFrames;
     problems.push({
-      window: null,
-      kind: "total",
+      window: null, kind: "total", blocking: true,
       text: diff > 0
-        ? `Windows total ${(sum / f).toFixed(2)}s, ${(diff / f).toFixed(2)}s MORE than the ${(totalFrames / f).toFixed(2)}s timeline.`
-        : `Windows total ${(sum / f).toFixed(2)}s, ${(-diff / f).toFixed(2)}s SHORT of the ${(totalFrames / f).toFixed(2)}s timeline.`,
+        ? `The windows total ${(sum / f).toFixed(2)}s, ${(diff / f).toFixed(2)}s MORE than the ${(totalFrames / f).toFixed(2)}s timeline.`
+        : `The windows total ${(sum / f).toFixed(2)}s, ${(-diff / f).toFixed(2)}s SHORT of the ${(totalFrames / f).toFixed(2)}s timeline.`,
     });
   }
   frames.forEach((raw, i) => {
     const n = Math.round(raw);
     if (n < floor) {
       problems.push({
-        window: i + 1, kind: "floor",
-        text: `Window ${i + 1} is ${(n / f).toFixed(2)}s — below the model's ${(floor / f).toFixed(2)}s minimum.`,
+        window: i + 1, kind: "floor", blocking: true,
+        text: `Window ${i + 1} is ${(n / f).toFixed(2)}s. The model cannot generate less than ${(floor / f).toFixed(2)}s (${floor} frames).`,
       });
     } else if (n > ceil) {
       problems.push({
-        window: i + 1, kind: "ceiling",
-        text: `Window ${i + 1} is ${(n / f).toFixed(2)}s — above the ${(ceil / f).toFixed(2)}s a single pass can hold at overlap ${ovl}.`,
+        window: i + 1, kind: "ceiling", blocking: true,
+        text: `Window ${i + 1} is ${(n / f).toFixed(2)}s. With overlap ${ovl} that needs a ${n + ovl}-frame pass, past the ${H3.WINDOW_MAX}-frame maximum — ${(ceil / f).toFixed(2)}s is the most a window can be.`,
+      });
+    } else if (n > specMax) {
+      problems.push({
+        window: i + 1, kind: "spec", blocking: false,
+        text: `Window ${i + 1} is ${(n / f).toFixed(2)}s. MiniMax documents ${H3.OFFICIAL_MIN_SEC}-${H3.MAX_WINDOW_SEC}s per window — it will still generate, but quality past ${H3.MAX_WINDOW_SEC}s is not something the model promises.`,
       });
     }
   });
   return problems;
 }
 
-/** A starting layout for manual mode: whatever the automatic plan would do. */
+/** The limits, in words, for a warning that has to explain itself. */
+export function windowLimitsText(ovl: number, fps: number): string {
+  const f = Math.max(1, fps || 24);
+  return `Each window must be ${(windowFloorFrames() / f).toFixed(2)}s to ` +
+    `${(windowCeilingFrames(ovl) / f).toFixed(2)}s at overlap ${ovl}, and MiniMax ` +
+    `documents ${H3.OFFICIAL_MIN_SEC}-${H3.MAX_WINDOW_SEC}s per window ` +
+    `(${(windowSpecMaxFrames(f) / f).toFixed(2)}s on this model's frame grid). ` +
+    `The lengths must also add up to the timeline.`;
+}
+
+/**
+ * The layout manual mode starts from: the fewest windows that can hold the
+ * timeline, divided as evenly as the frame count allows.
+ *
+ * It used to copy the automatic plan's outputs and dump the difference on the
+ * last window. The automatic plan deliberately OVERSHOOTS to land on legal
+ * frame counts, so forcing the last window to absorb a negative remainder
+ * produced runts: a 16s timeline seeded as [362, 22], and 22 frames is far
+ * below what the model can generate. Even division cannot do that.
+ */
 export function seedWindowFrames(totalFrames: number, win: number, ovl: number): number[] {
-  const { outputs } = planDurations(totalFrames, win, ovl);
-  const frames = outputs.slice();
-  // The automatic plan may overshoot by a few frames to land on a legal count;
-  // manual mode is exact, so give the remainder to the last window.
-  const sum = frames.reduce((a, b) => a + b, 0);
-  if (frames.length && sum !== totalFrames) frames[frames.length - 1] += totalFrames - sum;
-  return frames.map((n) => Math.max(1, Math.round(n)));
+  const total = Math.max(1, Math.round(totalFrames));
+  const specMax = windowSpecMaxFrames(H3.FPS);
+  const hardMax = windowCeilingFrames(ovl);
+  const floor = windowFloorFrames();
+
+  // Stay inside MiniMax's documented window where the requested size allows,
+  // and never propose more than the model can actually run in one pass.
+  const per = Math.max(1, Math.min(win || specMax, specMax, hardMax));
+  let n = Math.max(1, Math.ceil(total / per));
+  // Do not make so many windows that each falls under the model's minimum.
+  const most = Math.max(1, Math.floor(total / floor));
+  if (n > most) n = most;
+
+  const each = Math.floor(total / n);
+  const frames = Array.from({ length: n }, () => each);
+  let left = total - each * n;
+  for (let i = 0; i < n && left > 0; i++, left--) frames[i] += 1;   // spread the remainder
+  return frames;
 }
 
 export type WindowSpan = { i: number; start: number; end: number };

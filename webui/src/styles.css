@@ -474,3 +474,10 @@ canvas.wave{position:absolute;inset:0;width:100%;height:100%;pointer-events:none
 .whandle.tall{background:transparent;border-left:1px solid rgba(255,200,80,.85);
   border-right:none;width:13px;margin-left:-6px}
 .whandle.tall:hover{background:rgba(255,200,80,.22)}
+.warnbox.soft{opacity:.9}
+.warnbox.soft b{color:var(--warn)}
+
+/* a selected window band */
+.winstrip .band[data-selected]{outline:2px solid #fff;outline-offset:-2px;
+  box-shadow:0 0 0 1px rgba(0,0,0,.45) inset;filter:brightness(1.25)}
+.winstrip .band{cursor:pointer}

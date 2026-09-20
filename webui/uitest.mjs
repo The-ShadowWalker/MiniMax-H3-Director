@@ -72,11 +72,33 @@ const toggle = await page.evaluate(() => {
   if (!m) return null;
   const tb = m.closest(".tb");
   const txt = tb ? tb.textContent.replace(/\s+/g, " ") : "";
-  return { inToolbar: !!tb, nearWindowControls: /Win/.test(txt) && /Ovl/.test(txt) };
+  // The "Win" label must come AFTER the toggle in document order.
+  const winLabel = [...document.querySelectorAll(".tb .lbl")]
+    .find((l) => l.textContent.trim() === "Win");
+  const before = winLabel
+    ? !!(m.compareDocumentPosition(winLabel) & Node.DOCUMENT_POSITION_FOLLOWING)
+    : false;
+  return {
+    inToolbar: !!tb,
+    nearWindowControls: /Win/.test(txt) && /Ovl/.test(txt),
+    beforeWin: before,
+  };
 });
 check("manual window toggle exists", !!toggle, "no 'manual' checkbox found");
 check("it sits on the timeline toolbar", !!toggle && toggle.inToolbar);
 check("beside the Win / Ovl controls", !!toggle && toggle.nearWindowControls);
+check("it comes immediately before Win", !!toggle && toggle.beforeWin,
+  "the toggle is after the Win control");
+
+// the window-size box is live until lengths are set by hand
+const winBox = () => page.evaluate(() => {
+  const lbl = [...document.querySelectorAll(".tb .lbl")]
+    .find((l) => l.textContent.trim() === "Win");
+  const input = lbl && lbl.nextElementSibling;
+  return input ? { disabled: !!input.disabled } : null;
+});
+const winBefore = await winBox();
+check("the Win box is enabled in automatic mode", !!winBefore && !winBefore.disabled);
 
 // --- handles appear only in manual mode --------------------------------
 check("no drag handles before it is on", (await page.$$("\.whandle")).length === 0);
@@ -91,6 +113,21 @@ if (toggle) {
 
   const handles = (await page.$$(".whandle")).length;
   check("drag handles appear when it is on", handles > 0, "still none after toggling");
+
+  // Switching to manual must never immediately show a problem. The seeded
+  // layout used to flag itself: the model's own 362-frame window was compared
+  // against a literal 15s (360 frames), and short timelines seeded runts.
+  const seeded = await page.$$eval(".winstrip .band",
+    (e) => e.map((x) => ({ sec: parseFloat(x.dataset.sec), bad: x.dataset.bad || "" })));
+  check("switching to manual shows no red windows",
+    seeded.every((b) => !b.bad),
+    "flagged on entry: " + JSON.stringify(seeded));
+  console.log("       seeded layout: " +
+    seeded.map((b) => b.sec.toFixed(2) + "s").join(", "));
+
+  const winAfter = await winBox();
+  check("the Win box is disabled in manual mode", !!winAfter && winAfter.disabled,
+    "the window-size box is still editable and no longer means anything");
 
   const labels = await page.$$eval(".wlab", (e) => e.map((x) => x.textContent));
   check("every window shows its length", labels.length > 0, "no size labels drawn");
@@ -119,6 +156,201 @@ if (toggle) {
       Math.abs(sum(before) - sum(after)) < 0.1,
       sum(before).toFixed(2) + "s -> " + sum(after).toFixed(2) + "s");
     console.log("       " + JSON.stringify(before) + " -> " + JSON.stringify(after));
+
+    // --- how far can the boundary actually travel? --------------------
+    // Trading only with the immediate neighbour stopped the boundary dead
+    // after ~8s, because the neighbour hit its ceiling first. Dragging the
+    // full width should reach the model's real floor and ceiling.
+    const bandSecs = () =>
+      page.$$eval(".winstrip .band", (e) => e.map((x) => parseFloat(x.dataset.sec)));
+    const firstOf = async () => (await bandSecs())[0];
+    const sweep = async (toX) => {
+      const bb = await h.boundingBox();
+      await page.mouse.move(bb.x + bb.width / 2, bb.y + bb.height / 2);
+      await page.mouse.down();
+      await page.mouse.move(toX, bb.y + bb.height / 2, { steps: 25 });
+      await page.mouse.up();
+      await page.waitForTimeout(300);
+      return firstOf();
+    };
+    const page_w = page.viewportSize().width;
+    const lo = await sweep(4);
+    const hi = await sweep(page_w - 4);
+    const travel = hi - lo;
+    check("the boundary travels freely, not just between two windows",
+      travel > 10,
+      "only " + travel.toFixed(2) + "s of travel — it is still hitting a wall");
+    console.log("       window 1 reaches " + lo.toFixed(2) + "s .. " + hi.toFixed(2) +
+                "s  (" + travel.toFixed(2) + "s of travel)");
+
+    // Arranging a layout means being allowed to overshoot. The border must
+    // NOT stop at the model's limits -- those are reported, not enforced here.
+    check("dragging is allowed BELOW the model minimum (4.46s)", lo < 4.46,
+      "stopped at " + lo.toFixed(2) + "s — the drag is still being clamped");
+    check("dragging is allowed ABOVE the per-window maximum (19.29s)", hi > 19.29,
+      "stopped at " + hi.toFixed(2) + "s — the drag is still being clamped");
+
+    // ...and an out-of-range window has to be visible before Generate.
+    const flagged = await page.$$eval(".winstrip .band[data-bad]", (e) => e.length);
+    check("an out-of-range window is coloured on the timeline", flagged > 0,
+      "no band was flagged after dragging past the limits");
+
+    const sumNow = (await bandSecs()).reduce((a, b) => a + b, 0);
+    check("the total survives a full-width sweep",
+      Math.abs(sumNow - sum(before)) < 0.5,
+      sum(before).toFixed(2) + "s -> " + sumNow.toFixed(2) + "s");
+  }
+}
+
+// --- an out-of-range band must be OBVIOUSLY different, not a near-match ----
+// The first attempt used an amber almost identical to the normal alternating
+// band colour, so a bad window looked like an ordinary one.
+{
+  const cols = await page.$$eval(".winstrip .band", (els) =>
+    els.map((b) => ({ bad: b.dataset.bad || "", bg: b.style.background })));
+  const parse = (c) => (c.match(/\d+/g) || []).slice(0, 3).map(Number);
+  const badCols = cols.filter((c) => c.bad).map((c) => parse(c.bg));
+  // The normal alternating palette, which "bad" must not resemble.
+  const okCols = [[64, 118, 208], [208, 148, 64]];
+  if (badCols.length) {
+    const isRed = badCols.every(([r, g, b]) => r > 180 && r - g > 100 && r - b > 100);
+    check("an out-of-range band is unmistakably red", isRed,
+      "bad bands are " + JSON.stringify(badCols));
+    const far = badCols.every(([r1, g1, b1]) =>
+      okCols.every(([r2, g2, b2]) =>
+        Math.abs(r1 - r2) + Math.abs(g1 - g2) + Math.abs(b1 - b2) > 120));
+    check("it is not a near-match for a normal band", far,
+      "bad " + JSON.stringify(badCols) + " vs normal " + JSON.stringify(okCols));
+  } else {
+    check("there was an out-of-range band to check", badCols.length > 0);
+  }
+}
+
+// --- adding windows: a short timeline split into several -------------------
+{
+  // NumField commits on blur / Enter, so drive it like a person would.
+  const setDur = async (secs) => {
+    const handle = await page.evaluateHandle(() => {
+      const lbl = [...document.querySelectorAll(".tb .lbl")]
+        .find((l) => l.textContent.trim().startsWith("Duration"));
+      if (!lbl) return null;
+      let n = lbl.nextElementSibling;
+      while (n && n.tagName !== "INPUT") n = n.querySelector ? n.querySelector("input") : null;
+      return n;
+    });
+    const input = handle.asElement();
+    if (!input) return false;
+    await input.click({ clickCount: 3 });
+    await page.keyboard.press("Control+A");
+    await page.keyboard.type(String(secs));
+    await page.keyboard.press("Enter");
+    await page.waitForTimeout(500);
+    return true;
+  };
+  const durOk = await setDur(15);
+  check("the timeline duration could be set for this test", durOk,
+    "could not find the Duration field");
+
+  // The Sliding window tab lives inside the Generation pane, so open that first.
+  await page.evaluate(() => {
+    const rail = [...document.querySelectorAll("button, [role=button], .rail-item, li, div")]
+      .find((b) => (b.textContent || "").trim().startsWith("Generation"));
+    if (rail) rail.click();
+  });
+  await page.waitForTimeout(400);
+  await page.evaluate(() => {
+    const tab = [...document.querySelectorAll("button")]
+      .find((b) => /^sliding window$/i.test((b.textContent || "").trim()));
+    if (tab) tab.click();
+  });
+  await page.waitForTimeout(400);
+
+  const plus = await page.evaluateHandle(() => {
+    const row = [...document.querySelectorAll(".row")]
+      .find((r) => r.querySelector("label") &&
+                   r.querySelector("label").textContent.trim() === "Windows");
+    return row ? [...row.querySelectorAll("button")].find((b) => b.textContent.trim() === "+") : null;
+  });
+  const el = plus.asElement();
+  if (el) {
+    const counts = [];
+    for (let k = 0; k < 2; k++) {
+      await el.click();
+      await page.waitForTimeout(350);
+      counts.push((await page.$$(".winstrip .band")).length);
+    }
+    check("adding windows works on a short timeline", counts[counts.length - 1] >= 3,
+      "band count went " + JSON.stringify(counts));
+    const secs = await page.$$eval(".winstrip .band",
+      (e) => e.map((x) => parseFloat(x.dataset.sec)));
+    const tot = secs.reduce((a, b) => a + b, 0);
+    check("the split windows still add up to the timeline",
+      Math.abs(tot - 15) < 0.2, tot.toFixed(2) + "s for a 15.00s timeline");
+    console.log("       15s timeline as " + secs.length + " windows: " +
+                JSON.stringify(secs.map((x) => x.toFixed(2))));
+  } else {
+    check("the Windows +/- control exists", false, "not found in the Sliding Window panel");
+  }
+}
+
+// --- select a window, then remove it with the keyboard --------------------
+{
+  const bands = () => page.$$(".winstrip .band");
+  const count = async () => (await bands()).length;
+  const secs = () => page.$$eval(".winstrip .band", (e) => e.map((x) => parseFloat(x.dataset.sec)));
+
+  const n0 = await count();
+  const total0 = (await secs()).reduce((a, b) => a + b, 0);
+
+  // click the second band to select it
+  const all = await bands();
+  if (all.length >= 2) {
+    await all[1].click();
+    await page.waitForTimeout(300);
+    const sel = await page.$$eval(".winstrip .band[data-selected]", (e) => e.length);
+    check("clicking a window selects it", sel === 1,
+      sel + " bands report as selected");
+
+    await page.keyboard.press("Delete");
+    await page.waitForTimeout(350);
+    const n1 = await count();
+    check("Delete removes the selected window", n1 === n0 - 1,
+      n0 + " windows -> " + n1);
+    const total1 = (await secs()).reduce((a, b) => a + b, 0);
+    check("removing a window keeps the total", Math.abs(total1 - total0) < 0.2,
+      total0.toFixed(2) + "s -> " + total1.toFixed(2) + "s");
+
+    // Backspace as well
+    const before2 = await count();
+    (await bands())[0] && await (await bands())[0].click();
+    await page.waitForTimeout(250);
+    await page.keyboard.press("Backspace");
+    await page.waitForTimeout(350);
+    check("Backspace removes it too", (await count()) === before2 - 1,
+      before2 + " windows -> " + (await count()));
+
+    // --- + window adds a boundary at the playhead -----------------------
+    const before3 = await count();
+    const total3 = (await secs()).reduce((a, b) => a + b, 0);
+    const addBtn = await page.evaluateHandle(() =>
+      [...document.querySelectorAll(".tb button")]
+        .find((b) => /\+\s*window/i.test(b.textContent || "")));
+    const ab = addBtn.asElement();
+    check("there is an Add window button", !!ab, "no '+ window' button on the toolbar");
+    if (ab) {
+      await ab.click();
+      await page.waitForTimeout(350);
+      const after3 = await count();
+      check("+ window adds a window", after3 === before3 + 1,
+        before3 + " windows -> " + after3);
+      const total4 = (await secs()).reduce((a, b) => a + b, 0);
+      check("adding a window keeps the total", Math.abs(total4 - total3) < 0.2,
+        total3.toFixed(2) + "s -> " + total4.toFixed(2) + "s");
+      console.log("       " + before3 + " windows -> " + after3 +
+                  ", total " + total4.toFixed(2) + "s");
+    }
+  } else {
+    check("there were enough windows to test selection", false);
   }
 }
 
