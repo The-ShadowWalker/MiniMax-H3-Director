@@ -728,13 +728,43 @@ function GenPane() {
                 checked={!!s.advanced.pdd}
                 onChange={(e) => {
                   const on = e.target.checked;
-                  // Selecting PDD switches to the *_pdd model type, which locks
-                  // steps to 8, one guidance phase and the Euler solver.
-                  s.patchAdvanced(
-                    on
-                      ? { pdd: true, steps: 8, guidance_phases: 1, sample_solver: "euler" }
-                      : { pdd: false },
-                  );
+                  if (on) {
+                    // PDD locks steps to 8, one guidance phase and Euler.
+                    // Remember what they were, so turning it off is a real undo.
+                    s.patchAdvanced({
+                      pdd: true,
+                      pre_pdd: {
+                        steps: s.advanced.steps,
+                        guidance_phases: s.advanced.guidance_phases,
+                        sample_solver: s.advanced.sample_solver ?? s.advanced.solver,
+                        solver: s.advanced.solver,
+                      },
+                      steps: 8,
+                      guidance_phases: 1,
+                      sample_solver: "euler",
+                      solver: "euler",
+                    });
+                  } else {
+                    // Turning PDD off used to set only `pdd: false` and leave
+                    // steps at 8, so the generation still ran as an 8-step PDD
+                    // job. Put back what was there, or the normal defaults.
+                    const prev = (s.advanced.pre_pdd || {}) as Record<string, unknown>;
+                    const prevSteps = Number(prev.steps);
+                    const prevPhases = Number(prev.guidance_phases);
+                    s.patchAdvanced({
+                      pdd: false,
+                      steps: Number.isFinite(prevSteps) && prevSteps > 0 && prevSteps !== 8
+                        ? prevSteps : H3.STEPS_DEFAULT,
+                      guidance_phases: Number.isFinite(prevPhases) && prevPhases > 0
+                        ? prevPhases : 1,
+                      sample_solver: String(prev.sample_solver || "euler"),
+                      solver: String(prev.solver || prev.sample_solver || "euler"),
+                      pre_pdd: undefined,
+                    });
+                    s.setToast(`PDD off — back to ${
+                      Number.isFinite(prevSteps) && prevSteps > 0 && prevSteps !== 8
+                        ? prevSteps : H3.STEPS_DEFAULT} steps`);
+                  }
                 }}
               />
               <span className="hint" style={{ flex: 1 }}>

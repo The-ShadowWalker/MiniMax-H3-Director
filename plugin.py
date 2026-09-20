@@ -26,7 +26,7 @@ import gradio as gr
 
 from shared.utils.plugins import WAN2GPPlugin
 
-PLUGIN_VERSION = "1.2.2"
+PLUGIN_VERSION = "1.2.3"
 PLUGIN_ID = "h3_director2"
 PLUGIN_NAME = "H3 Director"
 LOG_PREFIX = "[H3-D]"
@@ -2551,6 +2551,15 @@ class H3Director2Plugin(WAN2GPPlugin):
               % (st.get("model_type"), st.get("video_length"),
                  st.get("video_prompt_type", ""), st.get("audio_prompt_type", ""),
                  st.get("image_prompt_type", ""), len(st.get("image_refs") or [])))
+        # Sampling, spelled out. An 8-step job that should have been 20 was
+        # invisible here, so "it generates as if PDD were still on" could only
+        # be found by reading the UI state rather than the log.
+        _loras = st.get("activated_loras") or st.get("loras") or []
+        trace("  | steps=%s solver=%s guidance=%s phases=%s flow_shift=%s%s"
+              % (st.get("num_inference_steps"), st.get("sample_solver"),
+                 st.get("guidance_scale", st.get("guidance")),
+                 st.get("guidance_phases"), st.get("flow_shift"),
+                 ("  loras=%s mult=%r" % (len(_loras), st.get("loras_multipliers", ""))) if _loras else "  loras=none"))
         if st.get("video_source"):
             src = st["video_source"]
             trace("  | video_source=%s (%.2fs) keep_frames_video_source=%r frames_positions=%r"

@@ -354,6 +354,61 @@ if (toggle) {
   }
 }
 
+// --- PDD off must really turn PDD off --------------------------------------
+// Unchecking used to set only `pdd: false` and leave steps at 8, so the job
+// still ran as an 8-step PDD generation with nothing on screen to say so.
+{
+  await page.evaluate(() => {
+    const rail = [...document.querySelectorAll("button, [role=button], .rail-item, li, div")]
+      .find((b) => (b.textContent || "").trim().startsWith("Generation"));
+    if (rail) rail.click();
+  });
+  await page.waitForTimeout(400);
+  await page.evaluate(() => {
+    const tab = [...document.querySelectorAll("button")]
+      .find((b) => /^general$/i.test((b.textContent || "").trim()));
+    if (tab) tab.click();
+  });
+  await page.waitForTimeout(300);
+
+  const stepsVal = () => page.evaluate(() => {
+    const row = [...document.querySelectorAll(".row")].find((r) => {
+      const l = r.querySelector("label");
+      return l && /number of inference steps/i.test(l.textContent || "");
+    });
+    if (!row) return null;
+    const rng = row.querySelector("input[type=range]");
+    return rng ? Number(rng.value) : null;
+  });
+  const pddBox = () => page.evaluateHandle(() => {
+    const row = [...document.querySelectorAll(".row")].find((r) => {
+      const l = r.querySelector("label");
+      return l && /pdd/i.test(l.textContent || "");
+    });
+    return row ? row.querySelector("input[type=checkbox]") : null;
+  });
+
+  const before = await stepsVal();
+  const boxH = await pddBox();
+  const box = boxH.asElement();
+  check("the PDD toggle and steps slider were found", !!box && before != null,
+    "steps=" + before);
+
+  if (box && before != null) {
+    await box.click();                      // PDD on
+    await page.waitForTimeout(350);
+    const on = await stepsVal();
+    check("PDD on sets 8 steps", on === 8, "steps became " + on);
+
+    await box.click();                      // PDD off
+    await page.waitForTimeout(350);
+    const off = await stepsVal();
+    check("PDD off restores the normal step count", off !== 8 && off === before,
+      "steps stayed at " + off + " (was " + before + " before PDD)");
+    console.log("       steps " + before + " -> PDD on " + on + " -> PDD off " + off);
+  }
+}
+
 check("no uncaught errors during the run", pageErrors.length === 0, pageErrors[0]);
 
 await browser.close();
