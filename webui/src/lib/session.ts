@@ -125,6 +125,13 @@ export function buildGenerationPlan(p: SessionPayload) {
     // equal ones.
     manual_windows: manual,
     window_frames: manual ? (p.timeline.windowFrames as number[]) : undefined,
+    // Saved reference mods: which ones, how strongly, in apply order. The
+    // relay turns this into the custom_settings payload the RefMods plugin
+    // reads; it is dropped entirely when nothing is picked.
+    refmods: (p.refs.refmods || [])
+      .filter((m) => m && m.name && m.strength > 0)
+      .map((m) => ({ name: m.name, strength: m.strength })),
+    refmod_retention: p.refs.refmodRetention ?? 1,
     reference_mode: p.pipeline !== "FL2VA",
   };
 }

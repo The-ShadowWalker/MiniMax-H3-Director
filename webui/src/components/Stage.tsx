@@ -15,6 +15,7 @@ import {
   TEXT_ENCODER_CHOICES,
   VIDEO_VAE_CHOICES,
   type AdvTab,
+  type RefMod,
 } from "../lib/types";
 import { assembleWanSettings, downloadJson } from "../lib/session";
 import { H3, LIMITS } from "../lib/h3";
@@ -562,6 +563,185 @@ function RefsPane() {
         />
         <div className="note">Voice samples only shape audio the model generates. With a guidance track supplied, they have no effect.</div>
       </div>
+      <RefModsGroup />
+    </div>
+  );
+}
+
+/** Saved reference mods (RefMods).
+ *
+ *  A RefMod is a reference image or video that has already been VAE-encoded
+ *  and saved to a small file, so it can be reused without keeping the original
+ *  picture around. They are made and stored by a separate Wan2GP plugin --
+ *  "MiniMax H3 RefMods" -- and some people prefer working that way to
+ *  attaching the reference images themselves. Both can be used at once.
+ *
+ *  Picks stack in order, each with its own strength, the same way the LoRA
+ *  list works, because the order they apply in is something you want to
+ *  control. Nothing is shown here that the library does not really hold: with
+ *  the plugin absent, this says so rather than offering an empty picker.
+ */
+type RefModInfo = {
+  name: string;
+  kind: string;
+  mode: string;
+  tokens: number;
+  description: string;
+  size_mb: number;
+};
+type RefModList = { available: boolean; why: string; mods: RefModInfo[] };
+
+const refmodCache: { list: RefModList | null } = { list: null };
+
+function useRefMods() {
+  const [list, setList] = useState<RefModList | null>(refmodCache.list);
+  const [busy, setBusy] = useState(false);
+  const reload = async () => {
+    setBusy(true);
+    try {
+      const r = await request<RefModList>("list_refmods", {}, 30000);
+      refmodCache.list = r;
+      setList(r);
+    } catch (e) {
+      const bad: RefModList = { available: false, why: String(e), mods: [] };
+      refmodCache.list = bad;
+      setList(bad);
+    } finally { setBusy(false); }
+  };
+  useEffect(() => {
+    if (refmodCache.list) { setList(refmodCache.list); return; }
+    void reload();
+    /* eslint-disable-next-line react-hooks/exhaustive-deps */
+  }, []);
+  return { list, busy, reload };
+}
+
+/** A copy of `rows` with the entry at `i` moved one place in `dir`. Not
+ *  generic: a bare `<T>` reads as a JSX element to the build guard's scanner,
+ *  and this list only ever holds one kind of row. */
+function moved(rows: RefMod[], i: number, dir: number): RefMod[] {
+  const out = [...rows];
+  const j = i + dir;
+  if (j < 0 || j >= out.length) return out;
+  [out[i], out[j]] = [out[j], out[i]];
+  return out;
+}
+
+function RefModsGroup() {
+  const s = useDirector();
+  const { list, busy, reload } = useRefMods();
+  const picked = s.refs.refmods || [];
+  const library = list?.mods || [];
+  const byName = new Map(library.map((m) => [m.name, m]));
+  const unused = library.filter((m) => !picked.some((p) => p.name === m.name));
+
+  const set = (rows: typeof picked) => s.patchRefs({ refmods: rows });
+
+  return (
+    <div className="grp">
+      <div className="gl">
+        <h3>Saved reference mods</h3>
+        <em>pre-encoded references · applied in order</em>
+      </div>
+
+      {list && !list.available && (
+        <div className="note">
+          {list.why}. Mods are made and saved by the <b>MiniMax H3 RefMods</b> plugin;
+          install and enable it in Wan2GP and they appear here.
+          <button className="btn sm" type="button" style={{ marginLeft: 8 }}
+            disabled={busy} onClick={() => void reload()}>
+            {busy ? "Looking…" : "Look again"}
+          </button>
+        </div>
+      )}
+
+      {list && list.available && (
+        <>
+          <div className="lora-stack">
+            {picked.map((row, i) => {
+              const info = byName.get(row.name);
+              return (
+                <div className="lora on" key={row.name + i}>
+                  <div className="lora-head">
+                    <span className="lora-ord" title="Apply order">{i + 1}</span>
+                    <span className="lora-name" title={info?.description || row.name}>{row.name}</span>
+                    <span className="pill" title={info
+                      ? `${info.kind} mod${info.mode ? ", " + info.mode + " mode" : ""}, ${info.tokens} tokens`
+                      : "This mod is no longer in the library — it will be skipped"}>
+                      {info ? info.kind : "missing"}
+                    </span>
+                    <button className="btn sm" type="button" disabled={i === 0}
+                      title="Apply this mod earlier"
+                      onClick={() => set(moved(picked, i, -1))}>&uarr;</button>
+                    <button className="btn sm" type="button" disabled={i === picked.length - 1}
+                      title="Apply this mod later"
+                      onClick={() => set(moved(picked, i, 1))}>&darr;</button>
+                    <button className="btn sm warn" type="button" title="Remove this mod"
+                      onClick={() => set(picked.filter((_, j) => j !== i))}>&times;</button>
+                  </div>
+                  <div className="lora-w">
+                    <Row label="Strength" value={row.strength.toFixed(2)}>
+                      <input
+                        type="range" min={0} max={2} step={0.05} value={row.strength}
+                        title="How strongly this mod is applied. 1.00 is the strength it was saved at."
+                        onChange={(e) => set(picked.map((r, j) =>
+                          j === i ? { ...r, strength: Number(e.target.value) } : r))}
+                      />
+                    </Row>
+                  </div>
+                </div>
+              );
+            })}
+            {picked.length === 0 && (
+              <div className="note">
+                {library.length === 0
+                  ? "The RefMods plugin is installed but you have not saved any mods yet."
+                  : "No mods picked — the reference images above are used on their own."}
+              </div>
+            )}
+          </div>
+
+          {unused.length > 0 && (
+            <div className="row" style={{ marginTop: 9 }}>
+              <label>Add a mod</label>
+              <select
+                value=""
+                title="Each mod you pick is added below the last. The order here is the order they are applied in."
+                onChange={(e) => {
+                  const name = e.target.value;
+                  if (name) set([...picked, { name, strength: 1 }]);
+                }}
+              >
+                <option value="">Pick a saved mod…</option>
+                {unused.map((m) => (
+                  <option key={m.name} value={m.name}>
+                    {m.name} — {m.kind}{m.mode ? ` · ${m.mode}` : ""}
+                  </option>
+                ))}
+              </select>
+            </div>
+          )}
+
+          {picked.length > 0 && (
+            <Row label="Overall strength"
+                 value={(s.refs.refmodRetention ?? 1).toFixed(2)}>
+              <input
+                type="range" min={0} max={2} step={0.05}
+                value={s.refs.refmodRetention ?? 1}
+                title="One multiplier over every mod's own strength. Useful for easing the whole set back without touching each slider."
+                onChange={(e) => s.patchRefs({ refmodRetention: Number(e.target.value) })}
+              />
+            </Row>
+          )}
+
+          <div className="note">
+            Only the <b>first sliding window</b> receives these. Later windows continue from the
+            previous window's own frames, so a mod re-applied at every boundary would show up as a
+            visible jump — the RefMods plugin injects on window 1 only, and H3 Director keeps that
+            behaviour.
+          </div>
+        </>
+      )}
     </div>
   );
 }

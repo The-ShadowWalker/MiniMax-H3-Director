@@ -53,9 +53,15 @@ check("every value the UI sends is read by plugin.py", not dead,
 print("       %d payload keys checked, %d carried for the record"
       % (len(keys), len(INFORMATIONAL)))
 
-# The four that were removed, by the text a user would have seen.
+# The controls that were removed, by the text a user would have seen.
+#
+# "RefMod" itself is NOT banned any more: saved reference mods became a real,
+# wired feature, so the word now appears on a panel that does something. What
+# stays banned is the cosmetic flag the old badge hung off -- `isRefMod`, a
+# field set on one demo reference and read by nothing. The rule below is the
+# honest one: the word may appear only while the wiring behind it exists.
 GONE = [
-    ("RefMod", "the RefMod badge on reference images"),
+    ("isRefMod", "the cosmetic RefMod flag on reference images"),
     ("How to use them", "the image-reference mode dropdown"),
     ("Audio source", "the audio source dropdown"),
     ("Control-video audio", "the control-video audio dropdown"),
@@ -71,6 +77,18 @@ if os.path.exists(BUNDLE):
               "assets/index.html still contains %r" % needle)
 else:
     print("       (bundle not built -- source checked only)")
+
+# Saved reference mods are the opposite case: a label that must stay backed by
+# real wiring. If the panel is on screen, the command it reads from and the
+# value it sends both have to exist, or it is the RefMod badge all over again.
+if "RefMod" in stage:
+    check("the RefMods panel has a command to list the library",
+          '"list_refmods"' in plugin, "plugin.py has no list_refmods command")
+    check("and the selection is sent to the generator",
+          'plan.get("refmods")' in plugin, "plugin.py never reads the selection")
+    check("and the relay puts it where the RefMods plugin reads it",
+          "SETTING_GENERATE" in plugin and "custom_settings" in plugin,
+          "nothing writes custom_settings[h3_refmod_state]")
 
 print()
 if fails:

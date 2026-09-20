@@ -447,6 +447,25 @@ class family_handler:
             "prompt_infos": _stock.REF2VA_PROMPT_INFOS,
             "infos": _stock.REF2VA_INFOS + _stock.H3_RUNTIME_INFOS + (_stock.PRUNED_INFOS if "pruned" in effective else ""),
         })
+
+        # Saved reference mods (RefMods), when that plugin is installed. Its
+        # selection travels in custom_settings, and Wan2GP drops any entry the
+        # target model does not declare -- silently, so an undeclared id looks
+        # exactly like a normal render that ignored the mods. The RefMods
+        # plugin declares these on the stock handler, which the call above
+        # goes through, so they usually arrive already; declaring them here as
+        # well makes it independent of which plugin loaded first.
+        try:
+            from .. import refmods as _refmods
+            extra = _refmods.custom_setting_defs()
+        except Exception:
+            extra = []
+        if extra:
+            existing = result.get("custom_settings")
+            existing = list(existing) if isinstance(existing, list) else []
+            have = {e.get("id") for e in existing if isinstance(e, dict)}
+            result["custom_settings"] = existing + [s for s in extra if s["id"] not in have]
+
         return result
 
     @staticmethod

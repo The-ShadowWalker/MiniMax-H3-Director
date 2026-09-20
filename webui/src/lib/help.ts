@@ -13,6 +13,10 @@
  */
 
 const HELP: Record<string, string> = {
+  // ---- saved reference mods ----
+  "strength": "How strongly this saved reference mod is applied. 1.00 is the strength it was saved at; above that exaggerates it, below eases it off.",
+  "overall strength": "One multiplier over every mod's own strength, for easing the whole set back without touching each slider.",
+  "add a mod": "Each mod you pick is added below the last. The order in the list is the order they are applied in.",
   // ---- model / generation ----
   "model": "Which MiniMax H3 checkpoint generates the video. Hybrid models accept both reference images and a soundtrack.",
   "checkpoint": "The exact model file Wan2GP loads. Finetunes you have built appear here alongside the stock models.",

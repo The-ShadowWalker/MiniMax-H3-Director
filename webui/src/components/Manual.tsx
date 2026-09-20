@@ -113,6 +113,25 @@ const SECTIONS: Section[] = [
           If a reference is not asserting itself, raise <b>Reference sheet size</b> before you
           rewrite the prompt. It usually matters more than the wording.
         </p>
+        <h4>Saved reference mods (RefMods)</h4>
+        <p>
+          A RefMod is a reference that has already been encoded and saved to a small file, so it
+          can be reused without keeping the original picture or clip around. Some people prefer
+          working that way to attaching the reference images themselves — you can use both in the
+          same generation.
+        </p>
+        <p>
+          Mods are made and stored by a separate plugin, <b>MiniMax H3 RefMods</b>. With it
+          installed, everything you have saved appears at the bottom of the References pane: pick
+          them in the order they should apply, give each one its own strength, and use{" "}
+          <b>Overall strength</b> to ease the whole set back at once. Without that plugin the
+          panel says so rather than offering a picker it cannot fill.
+        </p>
+        <p>
+          Only the <b>first sliding window</b> receives them. Later windows continue from the
+          previous window's own frames, so a mod re-applied at every boundary would show up as a
+          visible jump at each one.
+        </p>
       </>
     ),
   },

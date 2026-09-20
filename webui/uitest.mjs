@@ -556,6 +556,35 @@ if (toggle) {
   }
 }
 
+// --- saved reference mods -------------------------------------------------
+// Standalone, there is no Wan2GP behind the page, so the library lookup fails.
+// The panel has to say why rather than render an empty picker -- the whole
+// point of the feature is not claiming references the model will not get.
+{
+  await page.evaluate(() => {
+    const rail = [...document.querySelectorAll("button, [role=button], .rail-item, li, div")]
+      .find((b) => (b.textContent || "").trim().startsWith("References"));
+    if (rail) rail.click();
+  });
+  await page.waitForTimeout(600);
+  const grp = await page.evaluate(() => {
+    const h = [...document.querySelectorAll(".gl h3")]
+      .find((x) => /saved reference mods/i.test(x.textContent || ""));
+    if (!h) return null;
+    const box = h.closest(".grp");
+    return { text: (box.textContent || "").trim(), selects: box.querySelectorAll("select").length };
+  });
+  check("the saved reference mods panel is on the References pane", !!grp,
+    "no 'Saved reference mods' group found");
+  if (grp) {
+    check("with no RefMods plugin reachable it explains itself",
+      /RefMods/i.test(grp.text) && /install|not installed|would not load|Look again/i.test(grp.text),
+      grp.text.slice(0, 160));
+    check("and offers no picker it cannot fill", grp.selects === 0,
+      grp.selects + " select(s) rendered with an unreachable library");
+  }
+}
+
 check("no uncaught errors during the run", pageErrors.length === 0, pageErrors[0]);
 
 await browser.close();

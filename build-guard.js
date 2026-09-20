@@ -46,6 +46,10 @@ for (const f of fs.readdirSync("src/components").filter((x) => x.endsWith(".tsx"
   // Only real JSX: "<Name" preceded by ( { > or whitespace at a JSX position,
   // never generics like useRef<HTMLDivElement>(null).
   const stripped = src
+    // Comments are prose, not code. Writing "a bare <T>" in one used to be
+    // reported as an undefined component.
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .replace(/(^|[^:])\/\/[^\n]*/g, "$1")
     .replace(/useRef<[^>]*>/g, "useRef")
     .replace(/useState<[^>]*>/g, "useState")
     .replace(/\bas\s+[A-Za-z0-9_.<>[\]| ]+/g, "")

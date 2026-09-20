@@ -26,7 +26,12 @@ import gradio as gr
 
 from shared.utils.plugins import WAN2GPPlugin
 
-PLUGIN_VERSION = "1.3.3"
+try:
+    from . import refmods
+except ImportError:  # loaded flat (tests, and older plugin loaders)
+    import refmods
+
+PLUGIN_VERSION = "1.4.0"
 PLUGIN_ID = "h3_director2"
 PLUGIN_NAME = "H3 Director"
 LOG_PREFIX = "[H3-D]"
@@ -806,6 +811,9 @@ class H3Director2Plugin(WAN2GPPlugin):
                     ref_first = [m for m in models if m["reference"]]
                     asked = (ref_first or models or [{"model_type": ""}])[0]["model_type"]
                 out = {"models": models, "probed": asked, "limits": self._ref_limits(asked)}
+            elif cmd == "list_refmods":
+                ok, why = refmods.available()
+                out = {"available": ok, "why": why, "mods": refmods.list_mods()}
             elif cmd == "new_project":
                 out = self._new_project(data)
             elif cmd == "prune_media":
@@ -2383,6 +2391,28 @@ class H3Director2Plugin(WAN2GPPlugin):
         if loras:
             st["activated_loras"] = loras
             st["loras_multipliers"] = self._lora_multipliers(plan)
+
+        # ---- saved reference mods (RefMods) ----
+        # A mod is a reference that was VAE-encoded once and saved; the RefMods
+        # plugin owns the file format and the injection. All that travels from
+        # here is the selection, in the custom_settings channel it reads.
+        refmod_rows = plan.get("refmods") or []
+        if refmod_rows:
+            state = refmods.build_state(refmod_rows, plan.get("refmod_retention", 1.0))
+            ok, why = refmods.available()
+            if state and ok:
+                custom = dict(st.get("custom_settings") or {})
+                custom[refmods.SETTING_GENERATE] = state
+                st["custom_settings"] = custom
+                trace("refmods: %d selected (%s)"
+                      % (len(refmod_rows),
+                         ", ".join("%s@%.2f" % (r.get("name"), float(r.get("strength", 1)))
+                                   for r in refmod_rows if isinstance(r, dict))))
+                trace("refmods: only the FIRST sliding window receives them - "
+                      "later windows continue from the previous window's frames")
+            elif state:
+                trace("refmods: %d selected but %s; generating without them"
+                      % (len(refmod_rows), why))
 
         ref_images = paths(media.get("ref_images"))
         start_img = path(media.get("image_start"))

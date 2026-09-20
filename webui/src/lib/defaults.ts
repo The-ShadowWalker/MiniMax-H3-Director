@@ -158,6 +158,8 @@ export function demoSession(): SessionPayload {
       imageMode: "I",
       imageDetail: 100,
       removeBg: false,
+      refmods: [],
+      refmodRetention: 1,
     },
     audio: {
       source: "A",

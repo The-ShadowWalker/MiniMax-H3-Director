@@ -172,6 +172,31 @@ def transform_generate_source(source: str):
     return source, how
 
 
+def _refmods_module():
+    """H3 Director's own refmods bridge, or None.
+
+    Imported lazily and by several names because this module is loaded as part
+    of the plugin package (whose name is whatever folder the user cloned into)
+    and, in the test harness, on its own.
+    """
+    global _REFMODS
+    if _REFMODS is not False:
+        return _REFMODS
+    _REFMODS = None
+    pkg = (__package__ or "").rsplit(".", 1)[0]
+    for name in ([pkg + ".refmods"] if pkg else []) + ["refmods"]:
+        try:
+            import importlib
+            _REFMODS = importlib.import_module(name)
+            break
+        except Exception:
+            continue
+    return _REFMODS
+
+
+_REFMODS = False  # False = not looked yet, None = not found
+
+
 def _build_generate(base_generate):
     """Rebuild `generate` with the two conditions delegated to methods."""
     original = inspect.unwrap(base_generate)
@@ -182,8 +207,27 @@ def _build_generate(base_generate):
     namespace["__builtins__"] = __builtins__
     exec(compile(source, "<MiniMaxH3HybridPipeline.generate>", "exec"), namespace)
     fn = namespace[original.__name__]
-    fn._hybrid_transforms = how
-    return fn
+
+    # ---- saved reference mods (RefMods) ---------------------------------
+    # The RefMods plugin injects by wrapping MiniMaxH3Pipeline.generate with
+    # functools.wraps. `inspect.unwrap` above walks __wrapped__ straight back
+    # past that wrapper to the original function, so on the Hybrid the wrapper
+    # never runs: a selection would be accepted, carried all the way to
+    # generate(), and then quietly ignored. Doing the injection here puts the
+    # Hybrid back on the same footing as the stock model. The work itself is
+    # still theirs -- refmods.apply_to_kwargs only calls their _inject_refmods,
+    # which is also where the "first window only" rule lives.
+    def generate_with_refmods(self, *args, **kwargs):
+        refmods = _refmods_module()
+        if refmods is None:
+            return fn(self, *args, **kwargs)
+        refmods.refresh_pipeline_globals(namespace)
+        return fn(self, *args, **refmods.apply_to_kwargs(self, kwargs))
+
+    generate_with_refmods.__name__ = original.__name__
+    generate_with_refmods._hybrid_transforms = how
+    generate_with_refmods._hybrid_rebuilt = fn
+    return generate_with_refmods
 
 
 _CLASS = None

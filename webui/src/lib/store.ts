@@ -803,6 +803,12 @@ export const useDirector = create<DirectorState>()((set, get) => ({
       loadSession: (p) => {
         set({
           ...p,
+          // A project saved before saved reference mods existed has no
+          // refmods list at all. Fill it in here rather than guarding every
+          // read of it downstream.
+          refs: { ...p.refs,
+                  refmods: p.refs?.refmods || [],
+                  refmodRetention: p.refs?.refmodRetention ?? 1 },
           pane: get().pane,
           mode: get().mode,
           advTab: get().advTab,

@@ -48,6 +48,13 @@ export interface RefImage {
   url?: string;
 }
 
+/** A pick from the RefMods library: which mod, and how strongly. */
+export interface RefMod {
+  /** Folder-relative name, exactly as the RefMods plugin lists it. */
+  name: string;
+  strength: number;
+}
+
 export interface RefClip {
   mediaId?: string;
   id: string;
@@ -105,6 +112,10 @@ export interface SessionPayload {
     imageMode: string;
     imageDetail: number;
     removeBg: boolean;
+    /** Saved reference mods, in the order they should apply. */
+    refmods: RefMod[];
+    /** One multiplier over every mod's own strength. */
+    refmodRetention: number;
   };
   audio: {
     source: string;
