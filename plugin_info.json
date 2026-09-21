@@ -1,7 +1,7 @@
 {
   "name": "H3 Director",
   "author": "The-ShadowWalker",
-  "version": "1.4.3",
+  "version": "1.4.4",
   "description": "Timeline director for MiniMax H3 with a React UI, including the Hybrid AV model backend.",
   "type": [
     "app",

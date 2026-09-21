@@ -663,11 +663,10 @@ if (toggle) {
       "first option reads " + JSON.stringify(picker.options[0]));
     check("with modes to override it", picker.options.length > 1,
       "only " + picker.options.length + " option(s)");
-    // The old hardcoded list offered "K", which the model does not declare at
-    // all. Check the option VALUES, not their labels.
-    check("and no mode the model never declared",
-      !picker.values.includes("K"),
-      "values: " + JSON.stringify(picker.values));
+    check("and the three options are the plugin's own, in its own words",
+      picker.options.slice(1).join(" | ") ===
+        "Soundtrack drives generation | Generate audio from prompt | Soundtrack + reference voice",
+      "options: " + JSON.stringify(picker.options));
   }
 
   // The rail icon lights when the mode is satisfied. The demo project has a

@@ -174,11 +174,11 @@ check("no selection at all sends nothing",
 # The audio source picker: on screen, so it has to reach the generator.
 if "Audio source" in stage:
     print()
-    check("the audio modes are read from the model definition",
-          "_audio_modes" in plugin and "audio_prompt_type_sources" in plugin,
-          "the UI would be carrying a hardcoded list again")
-    check("and handed to the UI with the model list",
-          '"audio_modes"' in plugin)
+    check("the three options are the plugin's own labels",
+          "Soundtrack drives generation" in stage
+          and "Generate audio from prompt" in stage
+          and "Soundtrack + reference voice" in stage,
+          "the control was rebuilt with Wan2GP's internal labels instead")
     check("a hand-picked mode is sent",
           "audio_prompt_type_set" in session,
           "session.ts never sends the override")
