@@ -33,7 +33,9 @@ import types
 HERE = os.path.dirname(os.path.abspath(__file__))
 HANDLER = os.path.join(HERE, "models", "minimax_h3_hybrid_handler.py")
 
-WGP = os.environ.get("WGP") or "/home/claude/wgpsrc/Wan2GP-main"
+# Point WGP at the Wan2GP you are running against; the default is just the
+# newest tree this was last developed on.
+WGP = os.environ.get("WGP") or "/home/claude/wgpnew2/Wan2GP-main"
 STOCK = os.path.join(WGP, "models", "minimax_h3", "minimax_h3_handler.py")
 
 FAILURES: list[str] = []
@@ -238,6 +240,85 @@ else:
                 )
 
 # --------------------------------------------------------------------------
+
+# --------------------------------------------------------------------------
+# A method the STOCK handler has gained.
+#
+# The checks above compare the methods the Hybrid already defines. They cannot
+# see a method upstream ADDED, which is the more dangerous shape: wgp.py calls
+# most handler methods through getattr(..., None), so a Hybrid missing one is
+# not an error -- the behaviour simply never happens, with nothing in the log.
+# That is how the 2026-09-20 "Auto" Video VAE would have quietly fallen back to
+# the original VAE on the Hybrid only.
+print("\nmethods the stock handler has:")
+
+
+def class_methods(path, cls):
+    tree = ast.parse(open(path, encoding="utf-8").read())
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ClassDef) and node.name == cls:
+            return {m.name for m in node.body if isinstance(m, ast.FunctionDef)}
+    return set()
+
+
+stock_methods = class_methods(STOCK, "family_handler")
+hybrid_methods = class_methods(HANDLER, "family_handler")
+# Private helpers are upstream's business; the Hybrid only has to keep up with
+# the public contract wgp.py actually reaches for.
+missing = sorted(m for m in stock_methods - hybrid_methods if not m.startswith("_"))
+check("the Hybrid handles every method the stock handler offers", not missing,
+      "stock has, Hybrid does not: " + ", ".join(missing) +
+      " -- forward it, or add it to KNOWN_NOT_FORWARDED with the reason")
+print("       %d stock methods, %d on the Hybrid" % (len(stock_methods), len(hybrid_methods)))
+
+# --------------------------------------------------------------------------
+# The model's own option groups must NOT be typed out in the UI.
+#
+# The Text Encoder / Video VAE / DiT priority dropdowns were once three
+# hardcoded lists. They went stale the moment upstream added the INT8 ConvRot
+# VAE and renamed the default to "Auto", and they were built on a fixed
+# slot->meaning assumption that is not true: in this very file system_configs2
+# is the Video VAE in one branch and the DiT priority in another. They are now
+# read from the model at runtime. This makes sure they stay that way.
+print("\nmodel option groups:")
+ui_src = open(os.path.join(HERE, "webui", "src", "lib", "types.ts"), encoding="utf-8").read()
+stage_src = open(os.path.join(HERE, "webui", "src", "components", "Stage.tsx"), encoding="utf-8").read()
+plugin_src = open(os.path.join(HERE, "plugin.py"), encoding="utf-8").read()
+session_src = open(os.path.join(HERE, "webui", "src", "lib", "session.ts"), encoding="utf-8").read()
+
+for gone in ("TEXT_ENCODER_CHOICES", "VIDEO_VAE_CHOICES", "PRIORITY_CHOICES"):
+    check("%s is not typed out in the UI any more" % gone,
+          gone not in ui_src and gone not in stage_src,
+          "a hardcoded list goes stale the next time upstream adds an option")
+
+check("the relay reads the groups from the model definition",
+      "_config_groups" in plugin_src and "CONFIG_GROUP_KEYS" in plugin_src)
+check("and hands them to the UI with the model list",
+      '"config_groups"' in plugin_src)
+check("the UI sends the choice back keyed by group",
+      "model_configs" in session_src,
+      "sending by slot POSITION would land options in the wrong group")
+check("and the relay turns it into Wan2GP's own `config` string",
+      '_config_selection' in plugin_src and 'st["config"]' in plugin_src)
+
+# Wan2GP's own slot order has to match what the relay assumes.
+groups_py = os.path.join(WGP, "shared", "config_groups.py")
+if os.path.exists(groups_py):
+    src = open(groups_py, encoding="utf-8").read()
+    sys_keys = re.search(r"SYSTEM_CONFIG_KEYS\s*=\s*\(([^)]*)\)", src)
+    user_key = re.search(r'USER_CONFIG_KEY\s*=\s*"([^"]+)"', src)
+    if sys_keys and user_key:
+        upstream = tuple(re.findall(r'"([^"]+)"', sys_keys.group(1))) + (user_key.group(1),)
+        ours = re.search(r"CONFIG_GROUP_KEYS\s*=\s*\(([^)]*)\)", plugin_src)
+        mine = tuple(re.findall(r'"([^"]+)"', ours.group(1))) if ours else ()
+        check("the relay's slot order matches Wan2GP's", mine == upstream,
+              "Wan2GP: %s   relay: %s" % (str(upstream), str(mine)))
+        print("       slots: " + ", ".join(upstream))
+    else:
+        check("Wan2GP's config slot order could be read", False,
+              "shared/config_groups.py changed shape")
+else:
+    print("       (shared/config_groups.py not present -- older Wan2GP)")
 
 print()
 if FAILURES:

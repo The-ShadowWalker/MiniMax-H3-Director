@@ -90,6 +90,81 @@ if "RefMod" in stage:
           "SETTING_GENERATE" in plugin and "custom_settings" in plugin,
           "nothing writes custom_settings[h3_refmod_state]")
 
+
+
+# --------------------------------------------------------------------------
+# Model option groups: the choice must land in the slot THIS model uses.
+#
+# Wan2GP splits the `config` string by position across
+# (system_configs, system_configs2, system_configs3, configs) and silently
+# blanks any id not present in that slot's group. The slot meaning is not
+# fixed: in the stock H3 handler, system_configs2 is the DiT Denoising
+# Priority on one branch and the Video VAE on another. Sending by position
+# would therefore drop the choice on one of them, with no error.
+print()
+import types as _types  # noqa: E402
+
+
+class _Relay:
+    """Just the two methods under test, with a model definition supplied."""
+    CONFIG_GROUP_KEYS = ("system_configs", "system_configs2", "system_configs3", "configs")
+
+    def __init__(self, mdef):
+        self._mdef = mdef
+
+    def _model_def_for(self, _model_type):
+        return self._mdef
+
+
+import importlib.util as _ilu  # noqa: E402
+_spec = _ilu.spec_from_loader("h3d_plugin_src", loader=None)
+_src = open(PLUGIN, encoding="utf-8").read()
+for _name in ("_config_groups", "_config_selection"):
+    _m = re.search(r"\n    def %s\(self.*?(?=\n    def )" % _name, _src, re.S)
+    assert _m, _name
+    _body = "\n".join(l[4:] if l.startswith("    ") else l for l in _m.group(0).split("\n"))
+    exec(compile("class _Add:\n" + "\n".join("    " + l for l in _body.split("\n")),
+                 "<relay>", "exec"), globals())
+    setattr(_Relay, _name, getattr(globals()["_Add"], _name))
+
+trace = lambda *a, **k: None  # noqa: E731  (the relay logs; the test does not)
+
+REF2VA = {  # the shape the Hybrid inherits: VAE in slot 2, priority in slot 3
+    "system_configs": {"_name": "Text Encoder", "int8": {"name": "INT8"}},
+    "system_configs2": {"_name": "Video VAE", "_default_label": "Auto",
+                        "bf16": {"name": "BF16"}, "int8_convrot": {"name": "INT8 ConvRot"}},
+    "system_configs3": {"_name": "DiT Denoising Priority", "lower_ram": {"name": "Lower RAM"}},
+}
+OTHER = {  # the other branch: priority in slot 2, no VAE group at all
+    "system_configs": {"_name": "Text Encoder", "int8": {"name": "INT8"}},
+    "system_configs2": {"_name": "DiT Denoising Priority", "lower_ram": {"name": "Lower RAM"}},
+}
+
+r = _Relay(REF2VA)
+names = [g["name"] for g in r._config_groups("x")]
+check("the groups are read from the model, in its own order",
+      names == ["Text Encoder", "Video VAE", "DiT Denoising Priority"], str(names))
+
+sel = r._config_selection({"model_configs": {"system_configs": "int8",
+                                             "system_configs2": "int8_convrot",
+                                             "system_configs3": "lower_ram"}})
+check("each choice lands in its own slot", sel == "int8,int8_convrot,lower_ram", sel)
+
+sel = r._config_selection({"model_configs": {"system_configs2": "int8_convrot"}})
+check("an unset group leaves its slot empty", sel == ",int8_convrot", repr(sel))
+
+# The same VAE choice against the branch that has no VAE group must be dropped,
+# not written into slot 2 where it would mean the DiT priority.
+r2 = _Relay(OTHER)
+sel = r2._config_selection({"model_configs": {"system_configs2": "int8_convrot"}})
+check("a choice this model does not offer is dropped, not misfiled",
+      sel == "", repr(sel))
+sel = r2._config_selection({"model_configs": {"system_configs2": "lower_ram"}})
+check("and the option it DOES offer in that slot still goes through",
+      sel == ",lower_ram", repr(sel))
+check("no selection at all sends nothing",
+      r._config_selection({}) == "" and r._config_selection({"model_configs": {}}) == "")
+
 print()
 if fails:
     print("%d DEAD-CONTROL CHECK(S) FAILED" % len(fails))

@@ -351,6 +351,27 @@ class family_handler:
             return os.path.join(lora_root or "loras", str(key_or_path))
 
     @staticmethod
+    def resolve_runtime_model_def(model_def, runtime_context):
+        """Resolve the model def once the runtime settings are known.
+
+        Added upstream 2026-09-20 with the "Auto" Video VAE choice: Auto
+        carries no file of its own, and this is what turns it into the BF16,
+        FP8 or INT8 VAE that matches the transformer quantization. wgp.py
+        calls it through getattr(..., None), so a handler without it is not an
+        error -- Auto simply never resolves and the model quietly falls back
+        to the original VAE, which is the kind of silent drift this plugin has
+        been bitten by before. Forwarded rather than reimplemented so the
+        Hybrid follows whatever upstream decides Auto means.
+        """
+        stock = getattr(_stock.family_handler, "resolve_runtime_model_def", None)
+        if stock is None:
+            return model_def
+        try:
+            return stock(model_def, runtime_context)
+        except Exception:
+            return model_def
+
+    @staticmethod
     def set_cache_parameters(cache_type, base_model_type, model_def, inputs, skip_steps_cache):
         return _stock.family_handler.set_cache_parameters(cache_type, _hybrid_base(base_model_type), model_def, inputs, skip_steps_cache)
 

@@ -77,6 +77,9 @@ export function buildGenerationPlan(p: SessionPayload) {
     skip_steps_multiplier: p.advanced.cache_mult,
     skip_steps_start_step_perc: p.advanced.cache_start,
     override_attention: p.advanced.override_attention,
+    // What the model itself offers (text encoder, video VAE, DiT priority),
+    // keyed by the group so Python can put each one in the right slot.
+    model_configs: (p.advanced.model_configs || {}) as Record<string, string>,
     resolution: String(p.advanced.resolution).replace("\u00d7", "x"),
     activated_loras: p.advanced.loras,
     lora_weights: p.advanced.lora_weights,

@@ -31,7 +31,7 @@ try:
 except ImportError:  # loaded flat (tests, and older plugin loaders)
     import refmods
 
-PLUGIN_VERSION = "1.4.0"
+PLUGIN_VERSION = "1.4.1"
 PLUGIN_ID = "h3_director2"
 PLUGIN_NAME = "H3 Director"
 LOG_PREFIX = "[H3-D]"
@@ -810,7 +810,8 @@ class H3Director2Plugin(WAN2GPPlugin):
                     # wrongly caps the reference gallery.
                     ref_first = [m for m in models if m["reference"]]
                     asked = (ref_first or models or [{"model_type": ""}])[0]["model_type"]
-                out = {"models": models, "probed": asked, "limits": self._ref_limits(asked)}
+                out = {"models": models, "probed": asked, "limits": self._ref_limits(asked),
+                       "config_groups": self._config_groups(asked)}
             elif cmd == "list_refmods":
                 ok, why = refmods.available()
                 out = {"available": ok, "why": why, "mods": refmods.list_mods()}
@@ -1079,6 +1080,65 @@ class H3Director2Plugin(WAN2GPPlugin):
         except Exception as exc:
             trace("get_model_def(%s): %s" % (model_type, exc))
         return {}
+
+    # Wan2GP's own slot order for the model-config groups. The MEANING of a
+    # slot is not fixed: on one H3 branch system_configs2 is the Video VAE, on
+    # another it is the DiT priority. So the groups are read from the model
+    # itself and matched by their _name, never by position.
+    CONFIG_GROUP_KEYS = ("system_configs", "system_configs2", "system_configs3", "configs")
+
+    def _config_groups(self, model_type):
+        """The model's own option groups: [{key, name, default_label, options}].
+
+        These used to be three dropdowns typed out in the UI -- Text Encoder,
+        Video VAE, DiT priority -- built from a snapshot of one H3 variant and
+        never sent anywhere. Reading them live means a new option upstream (the
+        INT8 ConvRot VAE, say) appears on its own instead of going stale, and
+        the option lands in the slot THIS model puts it in.
+        """
+        mdef = self._model_def_for(model_type)
+        groups = []
+        for key in self.CONFIG_GROUP_KEYS:
+            block = mdef.get(key)
+            if not isinstance(block, dict):
+                continue
+            options = [{"id": cid, "name": (cdef or {}).get("name", cid)}
+                       for cid, cdef in block.items()
+                       if cid not in ("_name", "_default_label") and isinstance(cdef, dict)]
+            if not options:
+                continue
+            groups.append({
+                "key": key,
+                "name": block.get("_name") or key,
+                "default_label": block.get("_default_label", "Default"),
+                "options": options,
+            })
+        return groups
+
+    def _config_selection(self, plan):
+        """Turn {group key: option id} into the comma-joined `config` string.
+
+        Wan2GP splits this by position across CONFIG_GROUP_KEYS and blanks any
+        id that is not in that slot's group, so an id sent against the wrong
+        slot is discarded without a word -- which is why the keys travel from
+        the UI rather than the positions.
+        """
+        chosen = plan.get("model_configs")
+        if not isinstance(chosen, dict) or not chosen:
+            return ""
+        valid = {g["key"]: {o["id"] for o in g["options"]}
+                 for g in self._config_groups(plan.get("model_type") or plan.get("checkpoint"))}
+        parts, dropped = [], []
+        for key in self.CONFIG_GROUP_KEYS:
+            want = str(chosen.get(key) or "")
+            if want and want not in valid.get(key, set()):
+                dropped.append("%s=%s" % (key, want))
+                want = ""
+            parts.append(want)
+        if dropped:
+            trace("model config: dropping %s - this model does not offer it"
+                  % ", ".join(dropped))
+        return ",".join(parts).rstrip(",")
 
     def _pipeline_caps(self):
         """Read the reference caps WanGP actually ENFORCES.
@@ -2391,6 +2451,13 @@ class H3Director2Plugin(WAN2GPPlugin):
         if loras:
             st["activated_loras"] = loras
             st["loras_multipliers"] = self._lora_multipliers(plan)
+
+        # ---- the model's own option groups (text encoder, VAE, priority) ----
+        # One comma-joined string, one slot per group, in Wan2GP's own order.
+        config_sel = self._config_selection(plan)
+        if config_sel:
+            st["config"] = config_sel
+            trace("model config: %s" % config_sel)
 
         # ---- saved reference mods (RefMods) ----
         # A mod is a reference that was VAE-encoded once and saved; the RefMods

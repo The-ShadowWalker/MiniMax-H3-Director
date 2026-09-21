@@ -5,6 +5,7 @@ import { startBridge, on, request } from "./lib/bridge";
 import { installFlushBoundaries } from "./lib/persist";
 import { applyH3Grid, applyRefLimits } from "./lib/h3";
 import { useDirector } from "./lib/store";
+import type { ConfigGroup } from "./lib/types";
 import "./styles.css";
 
 startBridge();
@@ -37,10 +38,15 @@ on("toast", (d) => useDirector.getState().setToast(String((d as { message?: stri
  *  backoff until models come back. */
 async function loadModels(attempt = 0): Promise<void> {
   try {
-    const r = await request<{ models: { model_type: string; name: string }[]; limits: Record<string, number> }>(
-      "list_models", { model_type: useDirector.getState().advanced?.checkpoint || "" }, 30000,
-    );
+    const r = await request<{
+      models: { model_type: string; name: string }[];
+      limits: Record<string, number>;
+      config_groups?: ConfigGroup[];
+    }>("list_models", { model_type: useDirector.getState().advanced?.checkpoint || "" }, 30000);
     if (r?.limits) applyRefLimits(r.limits as never);
+    // The model's own option groups (text encoder, VAE, DiT priority). Read
+    // live so a new option upstream appears without a UI change.
+    if (r?.config_groups) useDirector.setState({ configGroups: r.config_groups });
     if (r?.models?.length) {
       useDirector.setState({ installedModels: r.models });
       console.log(`[H3-D] ${r.models.length} H3 model(s) installed`);

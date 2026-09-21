@@ -48,6 +48,16 @@ export interface RefImage {
   url?: string;
 }
 
+/** One option group a model declares for itself -- the Text Encoder, the
+ *  Video VAE, the DiT priority. Which slot holds which group varies between
+ *  H3 variants, so the group's own key travels with it. */
+export interface ConfigGroup {
+  key: string;
+  name: string;
+  default_label: string;
+  options: { id: string; name: string }[];
+}
+
 /** A pick from the RefMods library: which mod, and how strongly. */
 export interface RefMod {
   /** Folder-relative name, exactly as the RefMods plugin lists it. */
@@ -215,23 +225,6 @@ export const ATTENTION_CHOICES = [
   { value: "", label: "Default Attention Mode" },
   { value: "sol", label: "sol — sparse attention (BF16, Triton 3.6+, RTX 40/50)" },
 ] as const;
-export const TEXT_ENCODER_CHOICES = [
-  { value: "", label: "Default (Qwen3-VL BF16)" },
-  { value: "bf16", label: "Qwen3-VL BF16" },
-  { value: "int8", label: "Qwen3-VL Quanto INT8" },
-  { value: "nvfp4_awq", label: "Qwen3-VL NVFP4 AWQ" },
-  { value: "gguf_q4_k_m", label: "Qwen3-VL GGUF Q4_K_M" },
-  { value: "gguf_q2_k", label: "Qwen3-VL GGUF Q2_K" },
-] as const;
-export const VIDEO_VAE_CHOICES = [
-  { value: "", label: "Original VAE (default)" },
-  { value: "fp8mix", label: "FP8 Mixed Precision" },
-] as const;
-export const PRIORITY_CHOICES = [
-  { value: "", label: "Lower VRAM (default)" },
-  { value: "lower_ram", label: "Lower RAM" },
-] as const;
-
 export const FL2VA_GUIDE = [
   { value: "auto", label: "Auto — decide from the timeline" },
   { value: "GV", label: "Use Control Video" },

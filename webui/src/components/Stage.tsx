@@ -8,12 +8,9 @@ import {
   FBC_STRENGTHS,
   FL2VA_GUIDE,
   PIPELINE_CHOICES,
-  PRIORITY_CHOICES,
   RESOLUTIONS,
   SAMPLE_SOLVERS,
   SIZE_CHOICES,
-  TEXT_ENCODER_CHOICES,
-  VIDEO_VAE_CHOICES,
   type AdvTab,
   type RefMod,
 } from "../lib/types";
@@ -625,6 +622,50 @@ function moved(rows: RefMod[], i: number, dir: number): RefMod[] {
   if (j < 0 || j >= out.length) return out;
   [out[i], out[j]] = [out[j], out[i]];
   return out;
+}
+
+/** The option groups the MODEL declares -- Text Encoder, Video VAE, DiT
+ *  priority, and whatever upstream adds next.
+ *
+ *  These were three dropdowns typed out in the UI, built from a snapshot of
+ *  one H3 variant and never sent anywhere: the value moved and nothing read
+ *  it. They are now read from the model itself, so a new option (the INT8
+ *  ConvRot VAE that arrived on 2026-09-20, say) shows up without a change
+ *  here, and each choice lands in the slot THIS model puts it in -- the slots
+ *  are not fixed, one H3 branch uses slot 2 for the VAE and another for the
+ *  DiT priority.
+ */
+function ModelConfigRows() {
+  const s = useDirector();
+  const groups = s.configGroups || [];
+  if (!groups.length) {
+    return (
+      <div className="note">
+        Wan2GP has not reported this model's own options yet (text encoder, video VAE,
+        denoising priority). Press <b>Rescan</b> above.
+      </div>
+    );
+  }
+  const chosen = (s.advanced.model_configs || {}) as Record<string, string>;
+  return (
+    <>
+      {groups.map((g) => (
+        <Row key={g.key} label={g.name}>
+          <select
+            value={chosen[g.key] || ""}
+            title={`Read from this model's own definition. "${g.default_label}" leaves the choice to Wan2GP.`}
+            onChange={(e) =>
+              s.patchAdvanced({ model_configs: { ...chosen, [g.key]: e.target.value } })}
+          >
+            <option value="">{g.default_label}</option>
+            {g.options.map((o) => (
+              <option key={o.id} value={o.id}>{o.name}</option>
+            ))}
+          </select>
+        </Row>
+      ))}
+    </>
+  );
 }
 
 function RefModsGroup() {
@@ -1455,33 +1496,7 @@ function GenPane() {
                 ))}
               </select>
             </Row>
-            <Row label="Text encoder">
-              <select value={String(s.advanced.text_encoder)} onChange={(e) => s.patchAdvanced({ text_encoder: e.target.value })}>
-                {TEXT_ENCODER_CHOICES.map((o) => (
-                  <option key={o.value} value={o.value}>
-                    {o.label}
-                  </option>
-                ))}
-              </select>
-            </Row>
-            <Row label="Video VAE">
-              <select value={String(s.advanced.video_vae)} onChange={(e) => s.patchAdvanced({ video_vae: e.target.value })}>
-                {VIDEO_VAE_CHOICES.map((o) => (
-                  <option key={o.value} value={o.value}>
-                    {o.label}
-                  </option>
-                ))}
-              </select>
-            </Row>
-            <Row label="DiT priority">
-              <select value={String(s.advanced.priority)} onChange={(e) => s.patchAdvanced({ priority: e.target.value })}>
-                {PRIORITY_CHOICES.map((o) => (
-                  <option key={o.value} value={o.value}>
-                    {o.label}
-                  </option>
-                ))}
-              </select>
-            </Row>
+            <ModelConfigRows />
           </div>
         </div>
       )}
