@@ -629,6 +629,62 @@ if (toggle) {
   }
 }
 
+// --- the audio source picker, and the rail icon it drives ------------------
+// Removing this dropdown as a "dead control" was wrong: the relay never read
+// it, but the UI did. The stored mode froze at "A", so the Audio rail icon
+// stopped lighting for anyone generating audio from the prompt.
+{
+  await page.evaluate(() => {
+    const rail = [...document.querySelectorAll("button, [role=button], .rail-item, li, div")]
+      .find((b) => (b.textContent || "").trim().startsWith("Audio"));
+    if (rail) rail.click();
+  });
+  await page.waitForTimeout(500);
+
+  const picker = await page.evaluate(() => {
+    const row = [...document.querySelectorAll(".row")]
+      .find((r) => r.querySelector("label") &&
+                   r.querySelector("label").textContent.trim() === "Audio source");
+    if (!row) return null;
+    const sel = row.querySelector("select");
+    return {
+      options: [...sel.options].map((o) => o.textContent.trim()),
+      values: [...sel.options].map((o) => o.value),
+      value: sel.value,
+    };
+  });
+  check("the audio source picker is back", !!picker,
+    "no 'Audio source' row in the Audio pane");
+  if (picker) {
+    check("it defaults to Auto", picker.value === "",
+      "opens on " + JSON.stringify(picker.value));
+    check("and Auto says which mode that actually is",
+      /^Auto — .+/.test(picker.options[0]),
+      "first option reads " + JSON.stringify(picker.options[0]));
+    check("with modes to override it", picker.options.length > 1,
+      "only " + picker.options.length + " option(s)");
+    // The old hardcoded list offered "K", which the model does not declare at
+    // all. Check the option VALUES, not their labels.
+    check("and no mode the model never declared",
+      !picker.values.includes("K"),
+      "values: " + JSON.stringify(picker.values));
+  }
+
+  // The rail icon lights when the mode is satisfied. The demo project has a
+  // soundtrack on the timeline, so Auto resolves to "A" and it must be lit.
+  const lit = await page.evaluate(() => {
+    const btn = [...document.querySelectorAll(".rail .st")]
+      .find((b) => (b.textContent || "").includes("Audio"));
+    if (!btn) return null;
+    const g = btn.querySelector(".g");
+    return { ok: g ? g.classList.contains("ok") : null,
+             sub: (btn.querySelector("small") || {}).textContent };
+  });
+  check("the Audio rail icon is lit when the mode is satisfied", lit && lit.ok === true,
+    "icon state " + JSON.stringify(lit));
+  if (lit) console.log("       rail says: " + JSON.stringify(lit.sub));
+}
+
 check("no uncaught errors during the run", pageErrors.length === 0, pageErrors[0]);
 
 await browser.close();

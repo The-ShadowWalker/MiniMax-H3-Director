@@ -641,3 +641,42 @@ export function estimateMinutes(windows: number, steps: number): number {
   // Empirical-ish: ~1.2 min per window-step-unit at 20 steps / Hybrid 33B.
   return Math.max(1, Math.round(windows * (steps / 20) * 24));
 }
+
+// ---------------------------------------------------------------------------
+// Audio source
+// ---------------------------------------------------------------------------
+
+/** The stored value meaning "explicitly no audio input", since "" is Auto. */
+export const AUDIO_MODE_NONE = "none";
+
+/** The mode to send, or null when Auto should decide. */
+export function chosenAudioMode(stored: string): string | null {
+  if (!stored) return null;                       // Auto
+  return stored === AUDIO_MODE_NONE ? "" : stored;
+}
+
+/** What the relay will send as `audio_prompt_type`, given what is attached.
+ *
+ *  Mirrors plugin.py's own derivation: a soundtrack (or clip audio) on the
+ *  timeline gives "A", a voice reference gives "B", both give "AB", nothing
+ *  gives "" and the model generates the audio from the prompt. The rail icon
+ *  and the Audio-source picker both read this, so they cannot disagree.
+ */
+export function deriveAudioMode(hasTrack: boolean, hasVoiceRef: boolean): string {
+  return (hasTrack ? "A" : "") + (hasVoiceRef ? "B" : "");
+}
+
+/** Is `mode` satisfied by what is attached? "" needs nothing at all. */
+export function audioModeReady(mode: string, hasTrack: boolean, hasVoiceRef: boolean): boolean {
+  if (!mode) return true;
+  if (mode.includes("A") && !hasTrack) return false;
+  if (mode.includes("B") && !hasVoiceRef) return false;
+  return true;
+}
+
+/** What is missing for `mode`, in words, or "" when it is ready. */
+export function audioModeGap(mode: string, hasTrack: boolean, hasVoiceRef: boolean): string {
+  if (mode.includes("A") && !hasTrack) return "needs an audio track";
+  if (mode.includes("B") && !hasVoiceRef) return "needs a voice reference";
+  return "";
+}

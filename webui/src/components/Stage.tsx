@@ -15,7 +15,7 @@ import {
   type RefMod,
 } from "../lib/types";
 import { assembleWanSettings, downloadJson } from "../lib/session";
-import { H3, LIMITS } from "../lib/h3";
+import { AUDIO_MODE_NONE, H3, LIMITS, audioModeGap, deriveAudioMode } from "../lib/h3";
 import { registerMedia, getMedia, acceptAttr, fmtDuration, kindOf, servedUrl } from "../lib/media";
 import { request, send } from "../lib/bridge";
 import { PromptBox } from "./PromptBox";
@@ -668,6 +668,58 @@ function ModelConfigRows() {
   );
 }
 
+/** What is on the timeline, for working out the audio mode. */
+function useAudioAttachments() {
+  return useDirector((st) => ({
+    hasTrack: st.timeline.segments.some(
+      (x) => (x.track === "audio" || x.track === "clipaudio") && !x.muted && (x.mediaId || x.mediaUrl)),
+    hasVoiceRef: st.refs.audio.length > 0,
+  }));
+}
+
+/** Where the audio comes from.
+ *
+ *  Auto is the default and follows what is actually attached -- a soundtrack
+ *  on the timeline, a voice reference, or neither, in which case the model
+ *  generates the audio from the prompt. The choices come from the model's own
+ *  definition rather than a list typed out here; the previous hardcoded list
+ *  had drifted and offered a mode ("K") the model does not declare.
+ */
+function AudioSourceRow() {
+  const s = useDirector();
+  const { hasTrack, hasVoiceRef } = useAudioAttachments();
+  const modes = s.audioModes;
+  const auto = deriveAudioMode(hasTrack, hasVoiceRef);
+  const chosen = String(s.audio.source || "");
+  const effective = chosen === AUDIO_MODE_NONE ? "" : (chosen || auto);
+  const label = (m: string) => modes.labels[m] || (m === "" ? "Generated from the prompt" : m);
+  const gap = audioModeGap(effective, hasTrack, hasVoiceRef);
+
+  return (
+    <>
+      <Row label="Audio source">
+        <select
+          value={chosen}
+          title="Auto follows whatever is attached. Pick a mode to override it — useful for ignoring a voice reference, or making the model generate the audio even with a track on the timeline."
+          onChange={(e) => s.patchAudio({ source: e.target.value })}
+        >
+          <option value="">Auto — {label(auto)}</option>
+          {(modes.selection.length ? modes.selection : ["", "A", "B", "AB"]).map((m) => (
+            // "" is already taken by Auto, so an explicit "no audio input"
+            // travels as AUDIO_MODE_NONE and the relay maps it back.
+            <option key={m || AUDIO_MODE_NONE} value={m || AUDIO_MODE_NONE}>{label(m)}</option>
+          ))}
+        </select>
+      </Row>
+      {gap && (
+        <div className="note w">
+          This mode {gap}. Generate will still run, but the missing part is dropped.
+        </div>
+      )}
+    </>
+  );
+}
+
 function RefModsGroup() {
   const s = useDirector();
   const { list, busy, reload } = useRefMods();
@@ -823,6 +875,7 @@ function AudioPane() {
 
       <div className="card">
         <h4>Guidance</h4>
+        <AudioSourceRow />
         <div className="note">
           Both audio lanes mix to one guidance track before generation. Longest wins, so a short clip can't truncate the song.
         </div>

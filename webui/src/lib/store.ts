@@ -11,7 +11,7 @@ import type {
   TrackId,
 } from "./types";
 import { AUDIO_COLOR, CLIP_AUDIO_COLOR, CONTROL_COLOR, VIDEO_COLORS } from "./types";
-import type { ConfigGroup } from "./types";
+import type { AudioModes, ConfigGroup } from "./types";
 import { demoSession, uid } from "./defaults";
 import {
   estimateMinutes,
@@ -115,6 +115,8 @@ export interface DirectorState extends SessionPayload {
   /** The option groups THIS model declares (text encoder, VAE, DiT priority,
    *  and whatever upstream adds next), read live rather than typed out here. */
   configGroups: ConfigGroup[];
+  /** Audio source modes this model offers, read from its own definition. */
+  audioModes: AudioModes;
   askDuration: { seconds: number; name: string } | null;
   setAskDuration: (a: { seconds: number; name: string } | null) => void;
   setWin: (n: number) => void;
@@ -419,6 +421,7 @@ export const useDirector = create<DirectorState>()((set, get) => ({
       finalPromptNote: "",
       installedModels: [],
       configGroups: [],
+      audioModes: { selection: [], labels: {}, default: "" },
       askDuration: null,
       setAskDuration: (a) => set({ askDuration: a }),
       statusOpen: false,

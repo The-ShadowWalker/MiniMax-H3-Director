@@ -1,5 +1,5 @@
 import { buildPromptRelay } from "./prompt";
-import { realWindows, spansFromFrames } from "./h3";
+import { chosenAudioMode, realWindows, spansFromFrames } from "./h3";
 import type { SessionPayload } from "./types";
 
 export function downloadJson(payload: SessionPayload) {
@@ -135,6 +135,12 @@ export function buildGenerationPlan(p: SessionPayload) {
       .filter((m) => m && m.name && m.strength > 0)
       .map((m) => ({ name: m.name, strength: m.strength })),
     refmod_retention: p.refs.refmodRetention ?? 1,
+    // Audio source. Sent ONLY when it was chosen by hand; on Auto the relay
+    // derives it from what is attached, which is what it has always done.
+    ...(chosenAudioMode(p.audio.source) !== null
+      ? { audio_prompt_type: chosenAudioMode(p.audio.source) as string,
+          audio_prompt_type_set: true }
+      : {}),
     reference_mode: p.pipeline !== "FL2VA",
   };
 }

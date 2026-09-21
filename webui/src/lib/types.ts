@@ -51,6 +51,13 @@ export interface RefImage {
 /** One option group a model declares for itself -- the Text Encoder, the
  *  Video VAE, the DiT priority. Which slot holds which group varies between
  *  H3 variants, so the group's own key travels with it. */
+/** The audio source modes a model declares for itself. */
+export interface AudioModes {
+  selection: string[];
+  labels: Record<string, string>;
+  default: string;
+}
+
 export interface ConfigGroup {
   key: string;
   name: string;
@@ -128,6 +135,8 @@ export interface SessionPayload {
     refmodRetention: number;
   };
   audio: {
+    /** "" = follow what is attached; otherwise an explicit audio_prompt_type
+     *  ("A", "B", "AB") that overrides it. */
     source: string;
     controlVideoAudio: string;
   };

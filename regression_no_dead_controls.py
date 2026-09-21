@@ -60,10 +60,16 @@ print("       %d payload keys checked, %d carried for the record"
 # stays banned is the cosmetic flag the old badge hung off -- `isRefMod`, a
 # field set on one demo reference and read by nothing. The rule below is the
 # honest one: the word may appear only while the wiring behind it exists.
+# "Audio source" came back, and that was the right call: removing it was too
+# blunt. The relay never read it, but the UI did -- the Audio rail icon's lit
+# state and caption were both driven by it, so deleting the control froze the
+# stored mode at "A" and the icon stopped lighting up for anyone generating
+# audio from the prompt. It is now Auto by default, overridable, and its
+# choices come from the model. So like RefMod, the rule is not "must be gone"
+# but "must be backed by wiring" -- checked below.
 GONE = [
     ("isRefMod", "the cosmetic RefMod flag on reference images"),
     ("How to use them", "the image-reference mode dropdown"),
-    ("Audio source", "the audio source dropdown"),
     ("Control-video audio", "the control-video audio dropdown"),
 ]
 for needle, what in GONE:
@@ -164,6 +170,24 @@ check("and the option it DOES offer in that slot still goes through",
       sel == ",lower_ram", repr(sel))
 check("no selection at all sends nothing",
       r._config_selection({}) == "" and r._config_selection({"model_configs": {}}) == "")
+
+# The audio source picker: on screen, so it has to reach the generator.
+if "Audio source" in stage:
+    print()
+    check("the audio modes are read from the model definition",
+          "_audio_modes" in plugin and "audio_prompt_type_sources" in plugin,
+          "the UI would be carrying a hardcoded list again")
+    check("and handed to the UI with the model list",
+          '"audio_modes"' in plugin)
+    check("a hand-picked mode is sent",
+          "audio_prompt_type_set" in session,
+          "session.ts never sends the override")
+    check("and the relay honours it over what it derived",
+          'plan.get("audio_prompt_type")' in plugin and "audio_prompt_type_set" in plugin,
+          "plugin.py derives the mode and ignores the choice")
+    check("Auto sends nothing, so the relay keeps deriving",
+          "chosenAudioMode" in session,
+          "the override would be sent even on Auto")
 
 print()
 if fails:

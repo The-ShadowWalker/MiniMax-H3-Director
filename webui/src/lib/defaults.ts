@@ -162,7 +162,11 @@ export function demoSession(): SessionPayload {
       refmodRetention: 1,
     },
     audio: {
-      source: "A",
+      // "" means follow what is on the timeline. It used to default to "A",
+      // which is why the Audio rail icon stayed unlit for anyone generating
+      // audio from the prompt: the mode said a soundtrack was required and
+      // there was no longer a control to change it.
+      source: "",
       controlVideoAudio: "mute",
     },
     sfx: {

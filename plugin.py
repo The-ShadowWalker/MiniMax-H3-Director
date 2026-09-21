@@ -31,7 +31,7 @@ try:
 except ImportError:  # loaded flat (tests, and older plugin loaders)
     import refmods
 
-PLUGIN_VERSION = "1.4.2"
+PLUGIN_VERSION = "1.4.3"
 PLUGIN_ID = "h3_director2"
 PLUGIN_NAME = "H3 Director"
 LOG_PREFIX = "[H3-D]"
@@ -811,7 +811,8 @@ class H3Director2Plugin(WAN2GPPlugin):
                     ref_first = [m for m in models if m["reference"]]
                     asked = (ref_first or models or [{"model_type": ""}])[0]["model_type"]
                 out = {"models": models, "probed": asked, "limits": self._ref_limits(asked),
-                       "config_groups": self._config_groups(asked)}
+                       "config_groups": self._config_groups(asked),
+                       "audio_modes": self._audio_modes(asked)}
             elif cmd == "list_refmods":
                 ok, why = refmods.available()
                 out = {"available": ok, "why": why, "mods": refmods.list_mods()}
@@ -1086,6 +1087,24 @@ class H3Director2Plugin(WAN2GPPlugin):
     # another it is the DiT priority. So the groups are read from the model
     # itself and matched by their _name, never by position.
     CONFIG_GROUP_KEYS = ("system_configs", "system_configs2", "system_configs3", "configs")
+
+    def _audio_modes(self, model_type):
+        """The audio source modes THIS model declares, and its default.
+
+        The UI used to carry its own hardcoded list, which had drifted: it
+        offered "K", which is not in the model's selection at all. Read live,
+        like the other option groups.
+        """
+        mdef = self._model_def_for(model_type)
+        src = mdef.get("audio_prompt_type_sources")
+        if not isinstance(src, dict):
+            return {"selection": [], "labels": {}, "default": ""}
+        labels = src.get("labels") if isinstance(src.get("labels"), dict) else {}
+        return {
+            "selection": [str(x) for x in (src.get("selection") or [])],
+            "labels": {str(k): str(v) for k, v in labels.items()},
+            "default": str(src.get("default") or ""),
+        }
 
     def _config_groups(self, model_type):
         """The model's own option groups: [{key, name, default_label, options}].
@@ -2560,6 +2579,16 @@ class H3Director2Plugin(WAN2GPPlugin):
         if ref_audio:
             st["audio_guide2"] = ref_audio[0]
             apt += "B"
+        # The audio mode is DERIVED from what is actually attached. An explicit
+        # choice from the UI overrides it -- someone may want a voice reference
+        # ignored, or the model to generate the audio even with a track on the
+        # timeline. Letters whose media is missing are stripped further down by
+        # _strip_unsatisfied, so an override can never promise what is not there.
+        want_apt = plan.get("audio_prompt_type")
+        if isinstance(want_apt, str) and want_apt != apt and plan.get("audio_prompt_type_set"):
+            trace("audio source: %r chosen by hand (attached media suggests %r)"
+                  % (want_apt, apt))
+            apt = want_apt
         if apt:
             st["audio_prompt_type"] = apt
 

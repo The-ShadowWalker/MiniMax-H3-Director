@@ -1,5 +1,6 @@
 import { FolderOpen, Images, Music, Sparkles, Waves, Download, Blocks, Stethoscope } from "lucide-react";
 import { useDirector, useWindowStats } from "../lib/store";
+import { audioModeGap, audioModeReady, chosenAudioMode, deriveAudioMode } from "../lib/h3";
 import type { PaneId } from "../lib/types";
 
 /** Every rail button is the same height and every icon the same box, so the
@@ -15,18 +16,20 @@ export function Rail() {
   const hasTrack = s.timeline.segments.some(
     (x) => (x.track === "audio" || x.track === "clipaudio") && !x.muted && (x.mediaId || x.mediaUrl));
   const hasVoiceRef = s.refs.audio.length > 0;
-  const src = String(s.audio?.source ?? "");
-  const audioReady =
-    src === ""  ? true                      // generated from the prompt
-    : src === "A" ? hasTrack                // soundtrack drives generation
-    : src === "K" ? hasTrack && hasVoiceRef // soundtrack + reference voice
-    : hasTrack || hasVoiceRef;
-  const audioSub =
-    src === ""  ? "generated from the prompt"
-    : src === "A" ? (hasTrack ? "soundtrack on the timeline" : "needs an audio track")
-    : src === "K" ? (hasTrack && hasVoiceRef ? "soundtrack + voice reference"
-        : !hasTrack ? "needs an audio track" : "needs a voice reference")
-    : (hasTrack ? "audio track loaded" : "no audio");
+  // On Auto the mode follows what is attached; a hand-picked mode overrides it.
+  // This used to read a stored value that defaulted to "A" and had no control
+  // left to change it, so the icon stayed unlit for anyone generating the audio
+  // from the prompt -- the mode insisted on a soundtrack that was never coming.
+  const picked = chosenAudioMode(String(s.audio?.source ?? ""));
+  const mode = picked ?? deriveAudioMode(hasTrack, hasVoiceRef);
+  const audioReady = audioModeReady(mode, hasTrack, hasVoiceRef);
+  const gap = audioModeGap(mode, hasTrack, hasVoiceRef);
+  const audioSub = gap
+    ? gap
+    : mode === "" ? "generated from the prompt"
+    : mode === "A" ? "soundtrack on the timeline"
+    : mode === "B" ? "voice reference"
+    : "soundtrack + voice reference";
   const done = {
     project: !!s.project_name && s.project_name !== "untitled",
     refs: s.refs.images.length + s.refs.videos.length + s.refs.audio.length > 0,
