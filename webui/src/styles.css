@@ -33,6 +33,9 @@ display:flex;flex-direction:column;overflow:hidden}
 border-radius:4px;padding:2px 5px;font:inherit;font-size:11px}
 .chk{display:inline-flex;align-items:center;gap:3px;font-size:11px;color:var(--ink2);cursor:pointer}
 .wininfo{color:#5a80b0;font-size:11px}
+/* Window length in seconds, next to the frame count: the model works in
+   frames on a 17-frame grid, people think in seconds. */
+.winsec{color:#5a80b0;font-size:11px;opacity:.85;margin-left:-2px}
 .tc{margin-left:auto;font-size:11px;color:var(--ink)}
 .cvwrap{flex:1;position:relative;overflow:hidden;background:#0f1114}
 .zoom{height:16px;background:#131619;border-top:1px solid var(--ln);position:relative}

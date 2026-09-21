@@ -31,7 +31,7 @@ try:
 except ImportError:  # loaded flat (tests, and older plugin loaders)
     import refmods
 
-PLUGIN_VERSION = "1.4.1"
+PLUGIN_VERSION = "1.4.2"
 PLUGIN_ID = "h3_director2"
 PLUGIN_NAME = "H3 Director"
 LOG_PREFIX = "[H3-D]"
@@ -3507,6 +3507,30 @@ class H3Director2Plugin(WAN2GPPlugin):
         trace("background drain started (survives a dropped connection)")
         return t
 
+    def _vram_note(self):
+        """GPU memory, in words, or "" when there is no GPU to ask.
+
+        Logged at every window boundary. A late-window CUDA OOM is impossible
+        to tell apart from an over-large setting after the fact: both end with
+        the same traceback. With a reading per window you can see whether the
+        headroom is creeping down run-to-run (something is being retained) or
+        is steady right up to a single spike (the window itself is too big for
+        what is left). `cached` is memory PyTorch is holding but not using --
+        when that grows while free memory does not, the pool is fragmenting.
+        """
+        try:
+            import torch
+            if not torch.cuda.is_available():
+                return ""
+            free, total = torch.cuda.mem_get_info()
+            alloc = torch.cuda.memory_allocated()
+            reserved = torch.cuda.memory_reserved()
+            g = float(1024 ** 3)
+            return ("VRAM free %.2f / %.2f GiB | in use %.2f | cached %.2f"
+                    % (free / g, total / g, alloc / g, (reserved - alloc) / g))
+        except Exception:
+            return ""
+
     def _absorb_event(self, ev):
         st = getattr(self, "_jobstate", None) or self._reset_job_state()
         kind = str(getattr(ev, "kind", "") or "")
@@ -3526,6 +3550,17 @@ class H3Director2Plugin(WAN2GPPlugin):
             m = re.search(r"[Ww]indow\s+(\d+)", st["detail"])
             if m:
                 st["window"] = max(0, int(m.group(1)) - 1)
+                # Tracked separately from st["window"], which starts at 0 and
+                # so would never look like a change on window 1 -- the first
+                # window is the baseline every later reading is compared to.
+                was = st.get("vram_at")
+                if st["window"] != was:
+                    st["vram_at"] = st["window"]
+                    note = self._vram_note()
+                    if note:
+                        line = "window %d: %s" % (st["window"] + 1, note)
+                        st.setdefault("log", []).append({"level": "info", "msg": line})
+                        trace(line)
         elif kind in ("status", "stream") and d is not None:
             txt = str(getattr(d, "text", d) or "").strip()
             if txt:

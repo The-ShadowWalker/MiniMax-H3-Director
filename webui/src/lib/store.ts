@@ -476,18 +476,30 @@ export const useDirector = create<DirectorState>()((set, get) => ({
           };
         });
       },
+      // The model generates on a 17-frame grid, so a typed window size lands on
+      // the nearest value it can actually do. Say so when the number moves --
+      // silently changing what someone typed reads as the box refusing them.
       setWin: (n) => {
-        const [ws, ov] = snapWindowPair(n, get().timeline.slidingWindowOverlap);
+        const asked = Math.round(n);
+        const [ws, ov] = snapWindowPair(asked, get().timeline.slidingWindowOverlap);
+        const fps = get().fps || 24;
         set((s) => ({
           timeline: { ...s.timeline, slidingWindowSize: ws, slidingWindowOverlap: ov },
           dirty: (markDirty(), true),
+          ...(ws !== asked
+            ? { toast: `${asked} is not on the model's ${H3.WINDOW_STEP}-frame grid — using ${ws} (${(ws / fps).toFixed(2)}s), the nearest it can generate` }
+            : {}),
         }));
       },
       setOvl: (n) => {
-        const [ws, ov] = snapWindowPair(get().timeline.slidingWindowSize, n);
+        const asked = Math.round(n);
+        const [ws, ov] = snapWindowPair(get().timeline.slidingWindowSize, asked);
         set((s) => ({
           timeline: { ...s.timeline, slidingWindowSize: ws, slidingWindowOverlap: ov },
           dirty: (markDirty(), true),
+          ...(ov !== asked
+            ? { toast: `Overlap ${asked} is not on the model's ${H3.OVERLAP_STEP}-frame grid — using ${ov}` }
+            : {}),
         }));
       },
       select: (id) => set({ selectedId: id, pane: id ? get().pane : get().pane }),

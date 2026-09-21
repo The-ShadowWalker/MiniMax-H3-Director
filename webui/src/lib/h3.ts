@@ -49,13 +49,41 @@ export function applyH3Grid(g: Partial<Record<keyof typeof H3, number>>) {
   }
 }
 
+/**
+ * The nearest value on the model's own grid.
+ *
+ * The model can only generate window sizes on a `offset + step*k` grid, so a
+ * typed number has to land on one. This used to floor, which is why typing
+ * 240 (wanting 10s) dropped to 226 = 9.42s even though 243 = 10.13s was three
+ * frames away: the box looked like it was refusing the number rather than
+ * rounding it. Wan2GP's own normalize_output_frame_count rounds to nearest
+ * too, so nearest is also the behaviour that matches the backend.
+ */
 export function snapGrid(v: number, offset: number, step: number, lo: number, hi?: number) {
-  let n = Math.floor(Number.isFinite(v) ? v : lo);
+  let n = Math.round(Number.isFinite(v) ? v : lo);
   if (hi != null) n = Math.min(hi, n);
-  let s = Math.floor((n - offset) / step) * step + offset;
+  let s = Math.round((n - offset) / step) * step + offset;
   if (s < lo) s = lo;
   if (hi != null && s > hi) s -= step;
   return s;
+}
+
+/** The grid values either side of `v`, for telling someone what they can have. */
+export function windowGridNeighbours(v: number): { below: number; above: number } {
+  const { WINDOW_OFFSET: o, WINDOW_STEP: st, WINDOW_MIN: lo, WINDOW_MAX: hi } = H3;
+  const clamp = (x: number) => Math.max(lo, Math.min(hi, x));
+  const k = Math.floor((v - o) / st);
+  return { below: clamp(k * st + o), above: clamp((k + 1) * st + o) };
+}
+
+/** Every window size the model actually offers, with its length in seconds. */
+export function windowGridChoices(fps: number): { frames: number; sec: number }[] {
+  const out: { frames: number; sec: number }[] = [];
+  const f = Math.max(1, fps || 24);
+  for (let v = H3.WINDOW_MIN; v <= H3.WINDOW_MAX; v += H3.WINDOW_STEP) {
+    out.push({ frames: v, sec: v / f });
+  }
+  return out;
 }
 
 export function snapH3Window(v: number) {

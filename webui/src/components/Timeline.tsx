@@ -57,9 +57,14 @@ function Wave({ seg }: { seg: Segment }) {
  *  keeps your keystrokes until you commit with Enter or by leaving the field. */
 function NumField({
   value, onCommit, className = "nin num", title, step = 0.01, min, max,
+  disabled, arrow,
 }: {
   value: number; onCommit: (n: number) => void; className?: string;
   title?: string; step?: number; min?: number; max?: number;
+  disabled?: boolean;
+  /** Up/Down handler for a field whose values sit on a grid rather than a
+   *  fixed increment. */
+  arrow?: (dir: 1 | -1) => void;
 }) {
   const [text, setText] = useState(String(value));
   const [editing, setEditing] = useState(false);
@@ -79,6 +84,7 @@ function NumField({
       className={className}
       title={title}
       value={text}
+      disabled={disabled}
       inputMode="decimal"
       onFocus={() => setEditing(true)}
       onChange={(e) => { setEditing(true); setText(e.target.value); }}
@@ -88,6 +94,7 @@ function NumField({
         else if (e.key === "Escape") { setEditing(false); setText(String(value)); (e.target as HTMLInputElement).blur(); }
         else if (e.key === "ArrowUp" || e.key === "ArrowDown") {
           e.preventDefault();
+          if (arrow) { setEditing(false); arrow(e.key === "ArrowUp" ? 1 : -1); return; }
           const cur = parseFloat(text.replace(",", ".")) || 0;
           const next = cur + (e.key === "ArrowUp" ? step : -step);
           setText(String(Number(next.toFixed(4))));
@@ -464,50 +471,32 @@ export function Timeline() {
           </button>
         )}
         <span className="lbl">Win</span>
-        <input
-          className="nin num"
+        {/* Commit on blur/Enter, never per keystroke. These were plain
+            controlled inputs calling setWin on every onChange, and setWin
+            snaps to the model's grid -- so typing "240" became 124 on the
+            first digit and there was no way to finish the number. */}
+        <NumField
           value={s.timeline.slidingWindowSize}
           disabled={!!s.timeline.manualWindows}
           title={s.timeline.manualWindows
             ? "Not used while window lengths are set by hand — drag the boundaries instead."
-            : "Frames generated per window, about 15s at 24fps."}
-          onKeyDown={(e) => {
-            if (e.key === "ArrowUp" || e.key === "ArrowDown") {
-              e.preventDefault();
-              s.setWin(
-                stepGrid(
-                  s.timeline.slidingWindowSize,
-                  e.key === "ArrowUp" ? 1 : -1,
-                  H3.WINDOW_OFFSET,
-                  H3.WINDOW_STEP,
-                  H3.WINDOW_MIN,
-                  H3.WINDOW_MAX * 4,
-                ),
-              );
-            }
-          }}
-          onChange={(e) => s.setWin(Number(e.target.value))}
+            : `Frames generated per window. The model only generates on a ${H3.WINDOW_STEP}-frame grid, so this lands on the nearest one — type any number and it will go to the closest the model can do.`}
+          arrow={(dir) => s.setWin(stepGrid(
+            s.timeline.slidingWindowSize, dir,
+            H3.WINDOW_OFFSET, H3.WINDOW_STEP, H3.WINDOW_MIN, H3.WINDOW_MAX * 4))}
+          onCommit={(n) => s.setWin(Math.round(n))}
         />
+        <span className="winsec num" title="Window length in seconds at the current fps.">
+          {(s.timeline.slidingWindowSize / (s.fps || 24)).toFixed(2)}s
+        </span>
         <span className="lbl">Ovl</span>
-        <input
-          className="nin num"
+        <NumField
           value={s.timeline.slidingWindowOverlap}
-          onKeyDown={(e) => {
-            if (e.key === "ArrowUp" || e.key === "ArrowDown") {
-              e.preventDefault();
-              s.setOvl(
-                stepGrid(
-                  s.timeline.slidingWindowOverlap,
-                  e.key === "ArrowUp" ? 1 : -1,
-                  H3.OVERLAP_OFFSET,
-                  H3.OVERLAP_STEP,
-                  H3.OVERLAP_MIN,
-                  H3.OVERLAP_MAX,
-                ),
-              );
-            }
-          }}
-          onChange={(e) => s.setOvl(Number(e.target.value))}
+          title={`Frames each window shares with the one before it. Also on a ${H3.OVERLAP_STEP}-frame grid.`}
+          arrow={(dir) => s.setOvl(stepGrid(
+            s.timeline.slidingWindowOverlap, dir,
+            H3.OVERLAP_OFFSET, H3.OVERLAP_STEP, H3.OVERLAP_MIN, H3.OVERLAP_MAX))}
+          onCommit={(n) => s.setOvl(Math.round(n))}
         />
         <span className="wininfo num">
           {stats.manual

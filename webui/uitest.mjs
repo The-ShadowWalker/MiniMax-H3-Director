@@ -585,6 +585,50 @@ if (toggle) {
   }
 }
 
+// --- the Win box accepts a whole number ------------------------------------
+// It was a controlled input calling setWin on every keystroke, and setWin snaps
+// to the model's 17-frame grid -- so typing "240" became 124 on the first digit
+// and there was no way to finish the number.
+{
+  await page.evaluate(() => {
+    const box = [...document.querySelectorAll("label.chk")]
+      .find((l) => l.textContent.trim().toLowerCase() === "manual")
+      .querySelector("input");
+    if (box.checked) box.click();          // Win is disabled in manual mode
+  });
+  await page.waitForTimeout(400);
+
+  const win = await page.evaluateHandle(() => {
+    const lbl = [...document.querySelectorAll(".tb .lbl")]
+      .find((l) => l.textContent.trim() === "Win");
+    return lbl ? lbl.nextElementSibling : null;
+  });
+  const el = win.asElement();
+  check("the Win box was found", !!el);
+  if (el) {
+    await el.click({ clickCount: 3 });
+    await page.keyboard.press("Control+A");
+    await page.keyboard.type("240");
+    const typed = await el.evaluate((n) => n.value);
+    check("you can type a whole number into it", typed === "240",
+      "after typing 240 the box reads " + JSON.stringify(typed));
+
+    await page.keyboard.press("Enter");
+    await page.waitForTimeout(400);
+    const settled = await el.evaluate((n) => Number(n.value));
+    // 240 is not on the grid; 243 is three frames away and 226 is fourteen.
+    check("and it lands on the NEAREST size the model can generate",
+      settled === 243, "240 settled to " + settled + " (243 is the nearest)");
+
+    const secs = await page.evaluate(() => {
+      const e = document.querySelector(".winsec");
+      return e ? e.textContent.trim() : null;
+    });
+    check("with the length in seconds shown beside it", secs === "10.13s",
+      "reads " + JSON.stringify(secs));
+  }
+}
+
 check("no uncaught errors during the run", pageErrors.length === 0, pageErrors[0]);
 
 await browser.close();

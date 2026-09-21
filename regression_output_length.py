@@ -322,6 +322,32 @@ else:
         ok_summary("5 blocks x 2 tags -> %d windows of %s frames = %d (%.2fs), timeline %d"
                    % (len(_do), _do[0], sum(_do), sum(_do) / FPS, _target))
 
+# --------------------------------------------------------------------------
+# The window-size grid rounds to the NEAREST value the model can generate.
+#
+# It used to floor, so asking for 240 frames (wanting 10s) silently became 226
+# = 9.42s, even though 243 = 10.13s was three frames away. Combined with a box
+# that snapped on every keystroke, the number could not be entered at all.
+print("window-size grid:")
+_OFFSET, _STEP, _MIN, _MAX = 5, 17, 124, 481
+
+
+def _snap_nearest(v):
+    n = min(_MAX * 4, round(v))
+    s = round((n - _OFFSET) / _STEP) * _STEP + _OFFSET
+    return max(_MIN, s)
+
+
+for asked, want in ((240, 243), (235, 243), (226, 226), (243, 243), (120, 124)):
+    got = _snap_nearest(asked)
+    check("%d lands on %d" % (asked, want), got == want, "got %d" % got)
+
+# Never further away than half a step, in either direction.
+_worst = max(abs(_snap_nearest(v) - v) for v in range(_MIN, _MAX + 1))
+check("no request is moved more than half a step (%d frames)" % (_STEP // 2),
+      _worst <= _STEP // 2 + 1, "worst move was %d frames" % _worst)
+print("       worst case: %d frame(s), %.2fs at 24fps" % (_worst, _worst / 24.0))
+
 print()
 if FAILURES:
     print("%d of %d OUTPUT LENGTH CHECK(S) FAILED" % (len(FAILURES), CHECKS))
