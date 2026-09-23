@@ -45,8 +45,17 @@ export function buildPromptRelay(session: SessionPayload, wins: WindowSpan[]) {
     // The global prompt goes in ONCE per window, ahead of the shots. It used
     // to be substituted for every empty segment, so a 15s single window came
     // out repeating it once per gap.
+    //
+    // For a long piece with a long global prompt this is the dominant cost: a
+    // 5,300-character global across 20 windows is 101,000 characters of
+    // identical text, 74% of everything sent, with each window's own 1,400
+    // characters of direction buried underneath it. Every window then reads
+    // nearly the same prompt, which is what makes the scenes repeat. Turning
+    // it off sends the global prompt with the FIRST window only; the reference
+    // images still reach every window either way.
     const global = clean(stripDurationTags(session.global_prompt || ""));
-    if (global) bits.push(global);
+    const everyWindow = session.globalEveryWindow !== false;
+    if (global && (everyWindow || w.i === 0)) bits.push(global);
     const written = covering.filter((seg) => clean(seg.prompt).length > 0);
     if (written.length === 0) {
       // nothing further: the global prompt above is the whole instruction

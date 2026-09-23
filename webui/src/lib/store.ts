@@ -27,8 +27,10 @@ import {
   windowLimitsText,
   windowFloorFrames,
   windowSecondsWarning,
+  planGroups,
 } from "./h3";
 import { buildPromptRelay } from "./prompt";
+import { groupWindowsFor } from "./groups";
 import { assembleWanSettings } from "./session";
 import { configurePersist, flushNow, loadProject, markDirty, missingMedia } from "./persist";
 import { request, hasParent, send, on } from "./bridge";
@@ -1418,9 +1420,18 @@ export function useWindowStats() {
       runtHint = `Generates ${(total / s.fps).toFixed(2)}s to cover a ` +
         `${(maxF / s.fps).toFixed(2)}s timeline (the window grid cannot land exactly).`;
     }
+    // Render groups: which windows are rendered together as one job.
+    const groupSize = groupWindowsFor(s as unknown as SessionPayload);
+    const groups = groupSize > 0
+      ? planGroups(frames, groupSize).map((g) => ({
+          ...g,
+          startFrame: frames.slice(0, g.first).reduce((a, b) => a + b, 0),
+        }))
+      : [];
+
     return {
       maxF, windows, newFrames, exact, warning, minutes, spans, total, runtHint,
-      manual, frames, problems,
+      manual, frames, problems, groups, groupSize,
       floor: windowFloorFrames(),
       ceiling: windowCeilingFrames(ovl),
     };

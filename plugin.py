@@ -31,7 +31,7 @@ try:
 except ImportError:  # loaded flat (tests, and older plugin loaders)
     import refmods
 
-PLUGIN_VERSION = "1.4.4"
+PLUGIN_VERSION = "1.5.5"
 PLUGIN_ID = "h3_director2"
 PLUGIN_NAME = "H3 Director"
 LOG_PREFIX = "[H3-D]"
@@ -40,6 +40,13 @@ PLUGIN_DIR = Path(__file__).resolve().parent
 ASSETS_DIR = PLUGIN_DIR / "assets"
 WORKSPACE = PLUGIN_DIR / "workspace"
 MEDIA_DIR = WORKSPACE / "media"
+# Working files the plugin DERIVES: continuation tails, per-group audio slices,
+# bridge edge frames, mixed guidance audio. They were being written into
+# media/, which meant every one of them was saved into the project zip, came
+# back out of it on open, and piled up run after run -- none of it content the
+# project actually owns. They live here instead: never zipped, wiped with the
+# project, and cleared at the start of every generation.
+DERIVED_DIR = WORKSPACE / "derived"
 PROJECT_JSON = WORKSPACE / "project.json"
 PROJECT_BAK = WORKSPACE / "project.json.bak"
 
@@ -75,13 +82,53 @@ def _rpp_src(path):
 
 
 # --------------------------------------------------------------------------
-# logging — terminal only, never a log file
+# logging — terminal, AND a file that survives a crash
 # --------------------------------------------------------------------------
+# This used to be terminal-only on purpose: no stray log files. That rule cost
+# the one thing worth having when a machine reboots mid-render -- the console
+# goes with it and there is nothing left to read. Every line is flushed as it
+# is written, so the file ends at whatever the plugin was doing in the instant
+# the machine went down. The previous run is kept alongside it.
+LOG_FILE = WORKSPACE / "h3-director.log"
+LOG_FILE_PREV = WORKSPACE / "h3-director.prev.log"
+
+
+class _FlushingFileHandler(logging.FileHandler):
+    """Flush and fsync every record.
+
+    A buffered handler loses the last few KB on a hard reset -- which is
+    exactly the part that says what was happening when it died.
+    """
+
+    def emit(self, record):
+        super().emit(record)
+        try:
+            self.flush()
+            os.fsync(self.stream.fileno())
+        except Exception:
+            pass
+
+
 log = logging.getLogger("h3_director2")
 if not log.handlers:
     _h = logging.StreamHandler(sys.stdout)
     _h.setFormatter(logging.Formatter(LOG_PREFIX + " %(asctime)s %(levelname).1s %(message)s", "%H:%M:%S"))
     log.addHandler(_h)
+    try:
+        WORKSPACE.mkdir(parents=True, exist_ok=True)
+        if LOG_FILE.exists():
+            try:
+                if LOG_FILE_PREV.exists():
+                    LOG_FILE_PREV.unlink()
+                LOG_FILE.replace(LOG_FILE_PREV)
+            except Exception:
+                pass
+        _f = _FlushingFileHandler(str(LOG_FILE), mode="a", encoding="utf-8")
+        _f.setFormatter(logging.Formatter(
+            "%(asctime)s %(levelname).1s %(message)s", "%Y-%m-%d %H:%M:%S"))
+        log.addHandler(_f)
+    except Exception as _exc:          # a read-only workspace must not stop the plugin
+        print(LOG_PREFIX + " could not open the crash log (%s); terminal only" % _exc)
     log.setLevel(logging.INFO)
     log.propagate = False
 
@@ -592,6 +639,7 @@ class H3Director2Plugin(WAN2GPPlugin):
         self._apply_status = ""
         WORKSPACE.mkdir(parents=True, exist_ok=True)
         MEDIA_DIR.mkdir(parents=True, exist_ok=True)
+        DERIVED_DIR.mkdir(parents=True, exist_ok=True)
         try:
             self._sweep_sidecar_strays()
         except Exception as exc:
@@ -614,6 +662,21 @@ class H3Director2Plugin(WAN2GPPlugin):
         self.add_custom_js(_BRIDGE_JS)
         self.add_tab(tab_id=PLUGIN_ID, label=PLUGIN_NAME, component_constructor=self._build_ui)
         trace("setup_ui: tab '%s' registered (v%s)" % (PLUGIN_NAME, PLUGIN_VERSION))
+        # What this machine is, once per run, at the top of the crash log.
+        try:
+            import platform
+            import subprocess
+            trace("machine: %s | python %s" % (platform.platform(), platform.python_version()))
+            gpu = subprocess.run(
+                ["nvidia-smi", "--query-gpu=name,memory.total,driver_version,power.limit",
+                 "--format=csv,noheader"],
+                capture_output=True, text=True, timeout=5)
+            for g in (gpu.stdout or "").strip().splitlines():
+                trace("gpu: %s" % g.strip())
+        except Exception:
+            pass
+        trace("crash log: %s (the previous run is kept as %s)"
+              % (LOG_FILE, LOG_FILE_PREV.name))
 
     def _build_ui(self, api_session):
         """One positional param => Wan2GP builds self._wangp_session and calls
@@ -732,7 +795,7 @@ class H3Director2Plugin(WAN2GPPlugin):
             fn = getattr(_gr, "set_static_paths", None)
             if not callable(fn):
                 return ""
-            fn(paths=[str(ASSETS_DIR), str(MEDIA_DIR)])
+            fn(paths=[str(ASSETS_DIR), str(MEDIA_DIR), str(DERIVED_DIR)])
             return "/gradio_api/file=" + str(path).replace("\\", "/")
         except Exception as exc:
             trace("static asset registration failed: %s" % exc)
@@ -945,11 +1008,12 @@ class H3Director2Plugin(WAN2GPPlugin):
         if not data.get("confirmed"):
             return {"ok": False, "needs_confirm": True}
         freed = 0
-        for f in MEDIA_DIR.glob("*"):
-            if f.is_file():          # media AND its .meta.json sidecar
-                freed += f.stat().st_size
-                f.unlink()
-                trace("cleared %s" % f.name)
+        for d in (MEDIA_DIR, DERIVED_DIR):
+            for f in d.glob("*"):
+                if f.is_file():      # media AND its .meta.json sidecar
+                    freed += f.stat().st_size
+                    f.unlink()
+                    trace("cleared %s" % f.name)
         for p in (PROJECT_JSON, PROJECT_BAK):
             if p.exists():
                 p.unlink()
@@ -1593,6 +1657,69 @@ class H3Director2Plugin(WAN2GPPlugin):
             trace("ffprobe failed for %s: %s" % (os.path.basename(str(path_in)), exc))
             return 0.0
 
+    def _luma_stats(self, path_in, frames=0):
+        """Average brightness and contrast of a clip, 0-255.
+
+        Long continuations drift: every window is generated from the encoded
+        frames of the one before it, and whatever small bias that round trip
+        has is inherited and re-applied by the next window. Over twenty
+        windows it shows as the picture getting steadily brighter and softer.
+
+        Nothing here changes the render. It measures, so the drift is a number
+        in the log instead of a feeling about the finished video.
+        """
+        try:
+            import subprocess
+            args = [self._ffmpeg(), "-v", "error", "-i", str(path_in)]
+            if frames:
+                args += ["-frames:v", str(int(frames))]
+            args += ["-vf", "signalstats,metadata=print:key=lavfi.signalstats.YAVG:file=-",
+                     "-f", "null", "-"]
+            out = subprocess.run(args, capture_output=True, text=True, timeout=600)
+            vals = [float(m) for m in re.findall(
+                r"lavfi\.signalstats\.YAVG=([0-9.]+)", out.stdout or "")]
+            if not vals:
+                return None
+            mean = sum(vals) / len(vals)
+            var = sum((v - mean) ** 2 for v in vals) / len(vals)
+            return {"y": mean, "spread": var ** 0.5, "frames": len(vals)}
+        except Exception as exc:
+            trace("could not measure brightness of %s: %s"
+                  % (os.path.basename(str(path_in)), exc))
+            return None
+
+    def _hold_look(self, tail_path, ref, cap=0.02):
+        """Nudge the carried frames back toward the look the piece opened with.
+
+        The correction is applied to the SEED frames of the next group, not to
+        anything already rendered, so it steers what comes next rather than
+        grading what is done. It is capped per join -- a full correction would
+        snap the picture at the boundary, which reads worse than the drift it
+        is fixing. Across several joins the cap still holds the ramp down.
+        """
+        now = self._luma_stats(tail_path)
+        if not now or not ref or ref.get("y", 0) <= 1:
+            return tail_path, None
+        drift = (now["y"] - ref["y"]) / ref["y"]
+        if abs(drift) < 0.004:
+            return tail_path, drift
+        # ffmpeg's eq brightness is an offset in -1..1 over the full range.
+        want = -drift * ref["y"] / 255.0
+        adj = max(-cap, min(cap, want))
+        src = Path(tail_path)
+        out = DERIVED_DIR / (src.stem + "_held.mp4")
+        try:
+            import subprocess
+            subprocess.run([self._ffmpeg(), "-y", "-i", str(src),
+                            "-vf", "eq=brightness=%.5f" % adj, "-an",
+                            "-c:v", "libx264", "-crf", "0", "-preset", "veryfast",
+                            "-pix_fmt", "yuv420p", str(out)],
+                           check=True, capture_output=True, timeout=1800)
+        except Exception as exc:
+            trace("could not hold the look (%s); carrying the frames as they are" % exc)
+            return tail_path, drift
+        return str(out), drift
+
     def _probe_video(self, data):
         src = self._media_path(data.get("mediaId")) or Path(str(data.get("path") or ""))
         if not src or not Path(src).is_file():
@@ -1612,15 +1739,21 @@ class H3Director2Plugin(WAN2GPPlugin):
         """
         src = Path(src)
         n = max(1, int(frames))
-        out = MEDIA_DIR / ("tail_%s_%d.mp4" % (src.stem, n))
+        DERIVED_DIR.mkdir(parents=True, exist_ok=True)
+        out = DERIVED_DIR / ("tail_%s_%d.mp4" % (src.stem, n))
         if out.exists():
             return str(out)
         total = self._ffprobe_duration(src)
         start = max(0.0, total - (n / float(fps)))
         import subprocess
+        # LOSSLESS. These frames are not output -- they are the context the
+        # next window or group generates from, so they decide its look. A
+        # visually-lossless crf still shifts pixels, and a shift in the seed
+        # frames is a shift in everything that follows them. The clip is a
+        # fraction of a second, so the file size does not matter.
         subprocess.run([self._ffmpeg(), "-y", "-ss", "%.4f" % start, "-i", str(src),
                         "-frames:v", str(n), "-an",
-                        "-c:v", "libx264", "-crf", "14", "-preset", "veryfast",
+                        "-c:v", "libx264", "-crf", "0", "-preset", "veryfast",
                         "-pix_fmt", "yuv420p", "-r", "%g" % fps, str(out)],
                        check=True, capture_output=True, timeout=1800)
         trace("source tail: last %d frame(s) of %s (%.2fs of %.2fs) -> %s"
@@ -1643,7 +1776,7 @@ class H3Director2Plugin(WAN2GPPlugin):
         exe = self._ffmpeg()
         out = {}
         if a is not None:
-            last = MEDIA_DIR / ("bridge_last_%s.png" % a.stem)
+            last = DERIVED_DIR / ("bridge_last_%s.png" % a.stem)
             if not last.exists():
                 subprocess.run([exe, "-y", "-sseof", "-0.2", "-i", str(a),
                                 "-update", "1", "-frames:v", "1", str(last)],
@@ -1653,7 +1786,7 @@ class H3Director2Plugin(WAN2GPPlugin):
             out["fromDuration"] = self._ffprobe_duration(a)
             trace("bridge: last frame of %s -> %s" % (a.name, last.name))
         if b is not None:
-            first = MEDIA_DIR / ("bridge_first_%s.png" % b.stem)
+            first = DERIVED_DIR / ("bridge_first_%s.png" % b.stem)
             if not first.exists():
                 subprocess.run([exe, "-y", "-i", str(b), "-frames:v", "1", str(first)],
                                check=True, capture_output=True, timeout=600)
@@ -2340,9 +2473,10 @@ class H3Director2Plugin(WAN2GPPlugin):
             if app and app != PLUGIN_ID:
                 raise ValueError("that project belongs to '%s', not %s" % (app, PLUGIN_ID))
 
-            for f in MEDIA_DIR.glob("*"):
-                if f.is_file():
-                    f.unlink()
+            for d in (MEDIA_DIR, DERIVED_DIR):
+                for f in d.glob("*"):
+                    if f.is_file():
+                        f.unlink()
             for p2 in (PROJECT_JSON, PROJECT_BAK):
                 if p2.exists():
                     p2.unlink()
@@ -2831,7 +2965,9 @@ class H3Director2Plugin(WAN2GPPlugin):
             return real[0] if real else None
         try:
             exe = self._ffmpeg()
-            out = MEDIA_DIR / ("mix_%s.wav" % hashlib.sha256("|".join(real).encode()).hexdigest()[:12])
+            DERIVED_DIR.mkdir(parents=True, exist_ok=True)
+            out = DERIVED_DIR / ("mix_%s.wav"
+                                 % hashlib.sha256("|".join(real).encode()).hexdigest()[:12])
             if out.exists():
                 return str(out)
             cmd = [exe]
@@ -3228,6 +3364,386 @@ class H3Director2Plugin(WAN2GPPlugin):
             raise RuntimeError("no folder picker on this machine - type the path instead")
 
     # ---------------- generation ----------------
+    # ---------------- long timelines, rendered in groups ----------------
+
+    def _audio_slice(self, src, start_sec, length_sec):
+        """A piece of the soundtrack, for one group.
+
+        Each group is its own Wan2GP job, and a job always starts its audio
+        guide at 0:00. Without slicing, every group would be driven by the
+        opening of the song and the lip sync would reset at each boundary.
+        """
+        src = Path(src)
+        DERIVED_DIR.mkdir(parents=True, exist_ok=True)
+        out = DERIVED_DIR / ("grpaud_%s_%.3f_%.3f%s"
+                           % (src.stem, float(start_sec), float(length_sec), src.suffix or ".wav"))
+        if out.exists():
+            return str(out)
+        import subprocess
+        subprocess.run([self._ffmpeg(), "-y", "-ss", "%.4f" % float(start_sec),
+                        "-t", "%.4f" % float(length_sec), "-i", str(src),
+                        "-vn", "-c:a", "pcm_s16le", str(out)],
+                       check=True, capture_output=True, timeout=1800)
+        return str(out)
+
+    def _release_model(self):
+        """Wan2GP's own "unload everything" -- the Configuration tab button.
+
+        Drops the model, frees the offload object, flushes torch's caches and
+        empties CUDA, and marks the model for reload. Between groups this is
+        what makes each group start from the same clean slate as a fresh run,
+        rather than inheriting whatever the last one left behind. It costs a
+        model reload at the start of the next group.
+        """
+        try:
+            import wgp
+            fn = getattr(wgp, "release_model", None)
+            if not callable(fn):
+                trace("release between groups: this WanGP has no release_model()")
+                return False
+            fn()
+            trace("released the model between groups (%s)" % (self._vram_note() or "no GPU"))
+            return True
+        except Exception as exc:
+            trace("release between groups failed (%s); continuing" % exc)
+            return False
+
+    def _group_plan(self, window_frames, per_group):
+        """Split the windows into groups of at most `per_group` windows.
+
+        Returns [{"windows": [frames...], "frames": n, "start": first_frame}].
+        """
+        groups, cur, start, at = [], [], 0, 0
+        per = max(1, int(per_group))
+        for n in window_frames:
+            cur.append(int(n))
+            at += int(n)
+            if len(cur) >= per:
+                groups.append({"windows": cur, "frames": sum(cur), "start": start})
+                start, cur = at, []
+        if cur:
+            groups.append({"windows": cur, "frames": sum(cur), "start": start})
+        return groups
+
+    def _run_groups(self, data, base, submit, frame, fps, win, ovl, window_frames, per_group):
+        """Render the timeline as several jobs, then join them.
+
+        Each group is one Wan2GP job covering `per_group` sliding windows. The
+        point is that Wan2GP resets between jobs -- the frame accumulator that
+        holds the stitched video and the VRAM baseline both start clean -- so a
+        twenty-clip piece stops being one ever-growing render.
+
+        Groups are NOT independent takes. Every group after the first continues
+        from the last `overlap` frames of the one before it, exactly the way a
+        sliding window continues inside a single job, and every group runs on
+        the SAME seed. The carried frames are regenerated by the new group, so
+        they are trimmed off its front at the join rather than appearing twice.
+        """
+        groups = self._group_plan(window_frames, per_group)
+        n_groups = len(groups)
+        # Work from the PLAN, not from `base`. `base` has already been through
+        # _assemble_settings, which renumbered the prompt's picture numbers for
+        # a run that has the start image, the end image and every injected
+        # frame. A group that does not have the start image needs a different
+        # shift, so slicing the finished prompt would leave every group after
+        # the first pointing at the wrong reference sheets.
+        plan0 = dict(data.get("settings") or {})
+        media0 = dict(plan0.get("media") or {})
+        base_offset = plan0.get("numbering_offset")
+        if base_offset is None:
+            base_offset = int(plan0.get("injected_count") or 0) \
+                + (1 if media0.get("image_start") else 0) \
+                + (1 if media0.get("image_end") else 0)
+        base_offset = int(base_offset or 0)
+        blocks = [b for b in re.split(r"\n\s*\n", (plan0.get("prompt") or "").replace("\r\n", "\n")) if b.strip()]
+        # One prompt block per window is the contract the relay already builds
+        # to. If that does not hold, every group gets the whole prompt rather
+        # than a silently wrong slice of it.
+        # One prompt block per window is what makes a group a slice of the
+        # timeline. Without it there is no honest way to give a group its own
+        # share, and the old fallback -- hand every group the whole prompt --
+        # was far worse than not grouping: each group rendered the ENTIRE
+        # piece, so six groups meant six full renders. Refuse instead.
+        if len(blocks) != len(window_frames):
+            msg = ("Cannot render in groups: the prompt has %d block(s) but the "
+                   "timeline plans %d window(s). Turn groups off, or make the "
+                   "prompt one block per window." % (len(blocks), len(window_frames)))
+            trace("groups REFUSED: " + msg)
+            yield frame("error", error=msg)
+            return
+        per_window_prompts = True
+
+        # One seed for the whole piece. -1 means "pick one", and picking it
+        # here rather than per job is what keeps the groups consistent.
+        seed = int(base.get("seed") or -1)
+        if seed < 0:
+            seed = int(time.time()) % 2147483647
+            trace("groups: seed was random; fixed at %d so every group matches" % seed)
+
+        # Releasing the model BETWEEN groups is off by default, and the reason
+        # is that it buys nothing where it matters: the finished frames are
+        # held in `frames_already_processed`, a local inside Wan2GP's
+        # generate_media, so they are freed when the group's job returns --
+        # not by unloading the model. Releasing between groups only forces a
+        # full model reload before the next one. It stays available for the
+        # case it does help, a VRAM baseline that creeps across groups.
+        release_between = bool((data.get("settings") or {}).get("release_between_groups", False))
+
+        total_windows = len(window_frames)
+        trace("groups: %d group(s) of up to %d window(s) covering %d window(s) / %d frames"
+              % (n_groups, per_group, total_windows, sum(window_frames)))
+        yield frame("running", 0.0, 0, total_windows,
+                    [{"level": "info", "msg": "Rendering in %d group(s) of up to %d window(s)."
+                      % (n_groups, per_group)}])
+
+        # The look the piece opens with, measured off the first group once it
+        # exists, and what every later join is compared against.
+        hold_look = bool((data.get("settings") or {}).get("hold_look_between_groups", False))
+        look_ref = None
+
+        parts, made_files, done_windows = [], [], 0
+        prev_out = None
+        w_at = 0
+
+        for gi, grp in enumerate(groups):
+            n_win = len(grp["windows"])
+            head_trim = 0
+            first_group, last_group = gi == 0, gi == n_groups - 1
+
+            # The start image belongs to the first group and the end image to
+            # the last; a middle group has neither. Each one occupies a
+            # numbered slot ahead of the reference sheets, so dropping one has
+            # to drop the shift with it or the prompt's picture numbers move.
+            pg = dict(plan0)
+            media_g = dict(media0)
+            offset_g = base_offset
+            if not first_group and media_g.pop("image_start", None):
+                offset_g -= 1
+            if not last_group and media_g.pop("image_end", None):
+                offset_g -= 1
+            pg["media"] = media_g
+            pg["numbering_offset"] = max(0, offset_g)
+            if per_window_prompts:
+                pg["prompt"] = "\n\n".join(blocks[w_at:w_at + n_win])
+
+            try:
+                st = self._normalize_audio_guide(self._assemble_settings(pg))
+            except Exception as exc:
+                yield frame("error", error="group %d refused: %s" % (gi + 1, exc))
+                return
+            st["seed"] = seed
+            if offset_g != base_offset:
+                trace("group %d: picture numbers shifted by %d, not %d "
+                      "(this group has no %s image)"
+                      % (gi + 1, offset_g, base_offset,
+                         "start" if not first_group else "end"))
+
+            # A continued group REGENERATES the carried overlap at its front,
+            # exactly as window N regenerates window N-1's tail inside a single
+            # job. So the job has to be overlap frames LONGER than the group's
+            # own share of the timeline, and the audio has to start that much
+            # earlier -- otherwise the group lands short and the song drifts
+            # out of sync with the picture by one overlap at every boundary.
+            carry = int(ovl) if prev_out else 0
+            audio_at = (grp["start"] - carry) / fps
+            audio_len = (grp["frames"] + carry) / fps
+
+            # Its slice of the song, so the words and sounds continue from
+            # where the last group left off instead of restarting at 0:00.
+            song = st.get("audio_guide")
+            if song and os.path.isfile(str(song)):
+                try:
+                    st["audio_guide"] = self._audio_slice(song, max(0.0, audio_at), audio_len)
+                except Exception as exc:
+                    trace("group %d: could not slice the soundtrack (%s); using the whole file"
+                          % (gi + 1, exc))
+
+            if prev_out:
+                # Continue from the previous group's tail, the same way a
+                # sliding window continues inside one job.
+                try:
+                    tail = self._source_tail(prev_out, ovl, fps)
+                    # Measure the drift at every join, and say so. This is the
+                    # "it gets brighter and brighter" report turned into a
+                    # number: if the tail reads the same as the opening, the
+                    # cause is somewhere else and the log rules it out.
+                    if look_ref:
+                        if hold_look:
+                            tail, drift = self._hold_look(tail, look_ref)
+                        else:
+                            now = self._luma_stats(tail)
+                            drift = ((now["y"] - look_ref["y"]) / look_ref["y"]) if now else None
+                        if drift is not None:
+                            note = ("look drift at join %d: the carried frames are %+.1f%% "
+                                    "brighter than the opening%s"
+                                    % (gi, 100 * drift,
+                                       "; nudged back" if hold_look else ""))
+                            trace(note)
+                            yield frame("running", note, gi / float(n_groups), gi + 1, n_groups,
+                                        logs=[{"level": "info", "msg": note}])
+                    st["video_source"] = tail
+                    st["keep_frames_video_source"] = ""
+                    ipt = st.get("image_prompt_type", "") or ""
+                    if "V" not in ipt:
+                        st["image_prompt_type"] = ipt + "V"
+                    # A continuation regenerates the carried frames, so they
+                    # are dropped from the front of this group at the join.
+                    head_trim = carry
+                    st.pop("image_start", None)
+                    trace("group %d: continuing from %d carried frame(s)" % (gi + 1, ovl))
+                except Exception as exc:
+                    trace("group %d: could not carry the tail (%s); starting fresh" % (gi + 1, exc))
+
+            # On the /duration path the TAGS govern the length and
+            # video_length is ignored by Wan2GP; it still matters on the
+            # default-plan path. Setting it either way is correct and costs
+            # nothing, but it is not a promise -- the check after the job is.
+            st["video_length"] = int(grp["frames"]) + carry
+            st = self._strip_unsatisfied(st)
+            want_frames = int(grp["frames"]) + carry
+
+            yield frame("running", done_windows / max(1, total_windows), done_windows, total_windows,
+                        [{"level": "info", "msg": "Group %d of %d: %d window(s), %.2fs"
+                          % (gi + 1, n_groups, n_win, grp["frames"] / fps)}])
+            self._log_prompt("GROUP %d/%d" % (gi + 1, n_groups), st)
+
+            try:
+                job = submit(st)
+            except Exception as exc:
+                yield frame("error", error="group %d submit failed: %s" % (gi + 1, exc))
+                return
+            self._job = job
+            self._reset_job_state(status="running", started=time.time(), windows=n_win)
+            self._stream_owner = id(job)
+            self._start_background_drain(job)
+
+            last = 0.0
+            while not getattr(job, "done", False):
+                stream = getattr(job, "events", None)
+                if stream is not None:
+                    try:
+                        ev = stream.get(timeout=0.25)
+                        while ev is not None:
+                            self._absorb_event(ev)
+                            try:
+                                ev = stream.get_nowait()
+                            except Exception:
+                                ev = None
+                    except Exception:
+                        pass
+                else:
+                    time.sleep(0.25)
+                now = time.time()
+                if now - last >= 1.0:
+                    last = now
+                    js = getattr(self, "_jobstate", {}) or {}
+                    inner = float(js.get("progress") or 0)
+                    # The window number Wan2GP reports is within THIS group's
+                    # job, so it has to be clamped to the group and offset by
+                    # the groups already done -- otherwise window 4 of group 5
+                    # is announced as window 22 of 20.
+                    in_group = max(0, min(int(js.get("window") or 0), n_win - 1))
+                    yield frame("running",
+                                (done_windows + inner * n_win) / max(1, total_windows),
+                                done_windows + in_group, total_windows,
+                                phase=str(js.get("phase") or ""),
+                                detail="Group %d of %d \u00b7 window %d of %d%s"
+                                       % (gi + 1, n_groups, in_group + 1, n_win,
+                                          (" \u00b7 " + str(js.get("detail"))) if js.get("detail") else ""))
+
+            self._stream_owner = None
+            try:
+                result = job.result()
+            except Exception as exc:
+                yield frame("error", error="group %d failed: %s" % (gi + 1, exc))
+                return
+            self._job = None
+            if getattr(result, "cancelled", False):
+                yield frame("cancelled", done_windows / max(1, total_windows), done_windows, total_windows)
+                return
+            if not getattr(result, "success", False):
+                errs = getattr(result, "errors", None) or ["no output"]
+                yield frame("error", error="group %d: %s" % (gi + 1, "; ".join(str(e) for e in errs)))
+                return
+            made = [str(f) for f in (getattr(result, "generated_files", None) or [])]
+            if not made:
+                yield frame("error", error="group %d produced no file" % (gi + 1))
+                return
+
+            prev_out = made[-1]
+            made_files.extend(made)
+            if look_ref is None:
+                # The opening second of the finished first group: the look the
+                # rest of the piece is measured against.
+                look_ref = self._luma_stats(prev_out, frames=int(fps))
+                if look_ref:
+                    trace("look reference: the piece opens at brightness %.1f/255"
+                          % look_ref["y"])
+            # What the group actually produced, against what this slice of the
+            # timeline needed. A continuation carrying an overlap alongside
+            # per-window /duration tags is the one combination that cannot be
+            # checked ahead of time, so it is checked here: a group that comes
+            # back the wrong length would otherwise only show up as a finished
+            # video that drifts out of sync with the song.
+            try:
+                got = int(round(self._ffprobe_duration(prev_out) * fps))
+                if abs(got - want_frames) > 2:
+                    note = ("group %d produced %d frame(s) (%.2fs) for a %d-frame "
+                            "(%.2fs) slice -- the joined video will be %+d frame(s) "
+                            "off here" % (gi + 1, got, got / fps, want_frames,
+                                          want_frames / fps, got - want_frames))
+                    trace("LENGTH WARNING: " + note)
+                    yield frame("running", done_windows / max(1, total_windows),
+                                done_windows, total_windows,
+                                [{"level": "warn", "msg": note}])
+                else:
+                    trace("group %d length OK: %d frame(s) (%.2fs)" % (gi + 1, got, got / fps))
+            except Exception as exc:
+                trace("group %d: could not measure the output (%s)" % (gi + 1, exc))
+            parts.append({"path": prev_out, "trim_start_frames": head_trim, "trim_end_frames": 0})
+            done_windows += n_win
+            w_at += n_win
+            yield frame("running", done_windows / max(1, total_windows), done_windows, total_windows,
+                        [{"level": "ok", "msg": "Group %d done: %s"
+                          % (gi + 1, os.path.basename(prev_out))}])
+
+            if release_between and gi < n_groups - 1:
+                self._release_model()
+            elif gi < n_groups - 1:
+                trace("group %d done; keeping the model loaded for the next group (%s)"
+                      % (gi + 1, self._vram_note() or "no GPU"))
+
+        # ---- everything is rendered: let the model go, then stitch ----
+        # Nothing is joined until every group is finished, and each group's
+        # frames left memory when its job ended -- joining as we went would put
+        # the whole video back in one process and undo the point of grouping.
+        # ffmpeg concatenates the finished files straight off disk with a
+        # stream copy, so the join itself holds nothing either.
+        self._release_model()
+
+        if len(parts) < 2:
+            yield frame("done", 1.0, total_windows, total_windows,
+                        files=[p["path"] for p in parts])
+            return
+        yield frame("running", 0.99, total_windows, total_windows,
+                    [{"level": "info", "msg": "Joining %d group(s)..." % len(parts)}])
+        try:
+            joined = self._join_videos({
+                "parts": parts, "fps": fps,
+                "dir": str(data.get("export_dir") or "").strip() or None,
+                "name": (str(data.get("project_name") or "h3-director") + "-full"),
+            })["path"]
+        except Exception as exc:
+            trace("joining the groups failed: %s" % exc)
+            yield frame("done", 1.0, total_windows, total_windows, files=made_files,
+                        logs=[{"level": "err",
+                               "msg": "Groups rendered but could not be joined (%s). "
+                                      "Each group's own file is listed above." % exc}])
+            return
+        yield frame("done", 1.0, total_windows, total_windows,
+                    files=[joined] + made_files,
+                    logs=[{"level": "ok", "msg": "Joined %d group(s): %s" % (len(parts), joined)}])
+
     def _generate_stream(self, raw, state=None):
         """Gradio generator: submits, then DRAINS job.events while yielding.
 
@@ -3336,6 +3852,39 @@ class H3Director2Plugin(WAN2GPPlugin):
             trace("REFUSING to submit: %s" % why)
             yield frame("error", why)
             return
+        # ---- long timelines: render in groups of windows ----
+        # One Wan2GP job per group instead of one for the whole timeline. Its
+        # frame accumulator and its VRAM baseline both reset when a job ends,
+        # so five groups of four windows behave like five short renders rather
+        # than one very long one. Each group continues from the last one with
+        # the same overlap and the same seed, so it knows where to carry on.
+        group_windows = int((data.get("settings") or {}).get("group_windows") or 0)
+        if group_windows > 0 and target and not bridge_frames:
+            fps_g = float(data.get("fps") or (data.get("settings") or {}).get("fps") or 24) or 24.0
+            plan_in_g = data.get("settings") or {}
+            hand = [int(x) for x in (plan_in_g.get("window_frames") or []) if int(x) > 0] \
+                if plan_in_g.get("manual_windows") else []
+            if hand:
+                plan_wf = hand
+            elif tagged:
+                # The prompt carries /duration tags, so the SCHEDULER decides
+                # the windows -- one per prompt block -- and the default plan
+                # does not apply. Splitting on the default plan gave 22 windows
+                # for a 20-block prompt, the block count stopped matching, and
+                # every group was handed the WHOLE prompt: six groups each
+                # rendering all 20 windows.
+                plan_wf = plan_duration_frames(int(target), win, ovl, self._grid)[1]
+            else:
+                plan_wf = [w["output_frames"] for w in
+                           _real_plan_windows(int(target), win, ovl, self._grid)]
+            if len(plan_wf) > group_windows:
+                yield from self._run_groups(
+                    data, settings, submit, frame, fps_g, win, ovl,
+                    plan_wf, group_windows)
+                return
+            trace("groups: %d window(s) fits in one group of %d - rendering normally"
+                  % (len(plan_wf), group_windows))
+
         self._log_prompt("SUBMIT", settings)
         yield frame("running", 0.0, 0, windows, [{"level": "info", "msg": "Submitting %s, %d frames..." % (settings.get("model_type"), settings.get("video_length", 0))}])
 
@@ -3536,6 +4085,33 @@ class H3Director2Plugin(WAN2GPPlugin):
         trace("background drain started (survives a dropped connection)")
         return t
 
+    def _gpu_health(self):
+        """Power draw, temperature and clocks, via nvidia-smi.
+
+        A machine that reboots mid-render is not failing in Python -- Python
+        cannot restart a PC. It is power, heat or a driver reset. None of that
+        shows up in a traceback, so the numbers are logged as the render goes:
+        with a flushed log, the last line before the reboot says what the card
+        was drawing and how hot it was in the instant it went down.
+        """
+        try:
+            import subprocess
+            out = subprocess.run(
+                ["nvidia-smi",
+                 "--query-gpu=power.draw,power.limit,temperature.gpu,clocks.sm,utilization.gpu",
+                 "--format=csv,noheader,nounits"],
+                capture_output=True, text=True, timeout=5)
+            line = (out.stdout or "").strip().splitlines()
+            if not line:
+                return ""
+            f = [x.strip() for x in line[0].split(",")]
+            if len(f) < 5:
+                return ""
+            return ("GPU %sW of %sW | %s\u00b0C | %s MHz | %s%% busy"
+                    % (f[0], f[1], f[2], f[3], f[4]))
+        except Exception:
+            return ""
+
     def _vram_note(self):
         """GPU memory, in words, or "" when there is no GPU to ask.
 
@@ -3585,9 +4161,9 @@ class H3Director2Plugin(WAN2GPPlugin):
                 was = st.get("vram_at")
                 if st["window"] != was:
                     st["vram_at"] = st["window"]
-                    note = self._vram_note()
-                    if note:
-                        line = "window %d: %s" % (st["window"] + 1, note)
+                    parts = [x for x in (self._vram_note(), self._gpu_health()) if x]
+                    if parts:
+                        line = "window %d: %s" % (st["window"] + 1, "  |  ".join(parts))
                         st.setdefault("log", []).append({"level": "info", "msg": line})
                         trace(line)
         elif kind in ("status", "stream") and d is not None:

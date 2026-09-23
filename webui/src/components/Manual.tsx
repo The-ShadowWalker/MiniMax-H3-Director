@@ -93,6 +93,36 @@ const SECTIONS: Section[] = [
     ),
   },
   {
+    id: "groups",
+    title: "Long pieces: render groups",
+    body: (
+      <>
+        <p>
+          A long timeline rendered as one job gets heavier as it goes — Wan2GP keeps every
+          finished window in memory until the job ends — which is why a twenty-clip piece can
+          die partway through. <b>Grp</b> on the timeline toolbar splits the run into groups of
+          sliding windows, one job each, so memory starts clean at every group.
+        </p>
+        <p>
+          Groups behave like sliding windows one level up, so the piece stays consistent: every
+          group runs on the <b>same seed</b>, each one <b>continues from the last frames</b> of
+          the group before it, and each gets <b>its own slice of the song</b> at the right
+          offset so the words and sounds carry on instead of restarting.
+        </p>
+        <p>
+          The default group size follows your output resolution; type a number in <b>Grp</b> to
+          override it. Nothing is joined until every group is finished, and the model is
+          released once at the end rather than between groups, which would only force a reload.
+        </p>
+        <p className="tip">
+          The log prints VRAM headroom at every window. A baseline that creeps down group to
+          group means something is being retained; a steady one that fails suddenly means that
+          window was simply too big for what was left.
+        </p>
+      </>
+    ),
+  },
+  {
     id: "refs",
     title: "Reference images",
     body: (

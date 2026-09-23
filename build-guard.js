@@ -69,5 +69,37 @@ for (const f of fs.readdirSync("src/components").filter((x) => x.endsWith(".tsx"
   }
 }
 
-console.log(bad ? `\nGUARD FAILED: ${bad} problem(s)` : "guard: symbols present, all JSX components resolved");
+// --- one CSS class, one meaning ------------------------------------------
+// A new `.grp` for the timeline's render-group bands collided with the `.grp`
+// the reference panels already used, so `position:absolute` landed on all of
+// them: the panels stacked on top of each other and swallowed clicks. A class
+// that is positioned or sized absolutely must not also be a plain container
+// somewhere else.
+{
+  const css = fs.readFileSync("src/styles.css", "utf8");
+  const jsx = fs.readdirSync("src/components")
+    .filter((f) => f.endsWith(".tsx"))
+    .map((f) => fs.readFileSync(path.join("src/components", f), "utf8"))
+    .join("\n");
+  // Classes whose rule positions them out of normal flow.
+  const positioned = new Set();
+  for (const m of css.matchAll(/^\.([a-z][\w-]*)\s*\{([^}]*)\}/gim)) {
+    if (/position\s*:\s*absolute/i.test(m[2])) positioned.add(m[1]);
+  }
+  // How each class is used in markup: as a bare className, or interpolated.
+  for (const cls of positioned) {
+    const bare = new RegExp(`className="${cls}"`, "g");
+    const tpl = new RegExp("className=\\{`" + cls + "\\$", "g");
+    const bareN = (jsx.match(bare) || []).length;
+    const tplN = (jsx.match(tpl) || []).length;
+    // Used both as a plain container AND as a positioned element is the
+    // collision; a class used only one way is fine either way.
+    if (bareN > 1 && tplN > 0) {
+      console.error(`  CSS COLLISION  .${cls} is positioned absolutely but used as a plain container in ${bareN} place(s)`);
+      bad++;
+    }
+  }
+}
+
+console.log(bad ? `\nGUARD FAILED: ${bad} problem(s)` : "guard: symbols present, all JSX components resolved, no CSS collisions");
 process.exit(bad ? 1 : 0);

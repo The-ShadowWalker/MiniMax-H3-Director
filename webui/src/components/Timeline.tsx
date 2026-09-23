@@ -503,6 +503,28 @@ export function Timeline() {
             ? `${stats.windows} windows · set by hand`
             : `${stats.windows} windows × ${stats.newFrames} new frames`}
         </span>
+        <label className="chk" title="Render a long timeline as several jobs instead of one. Memory starts clean at each group, and the groups are joined at the end.">
+          <input
+            type="checkbox"
+            checked={!!s.timeline.groupsOn}
+            onChange={(e) => s.patchTimeline({ groupsOn: e.target.checked })}
+          />{" "}
+          groups
+        </label>
+        <span className="lbl" title="Sliding windows rendered per job. A long timeline rendered as one job keeps every finished window in memory; in groups, each group is its own job and memory starts clean each time.">Grp</span>
+        <NumField
+          value={stats.groupSize || stats.windows}
+          disabled={!s.timeline.groupsOn}
+          title={stats.groupSize
+            ? `Windows per render job. ${stats.groups.length} group(s) for this timeline. 0 renders the whole thing in one job, as before.`
+            : "Windows per render job. This timeline is short enough for one job; set a number to split it anyway."}
+          arrow={(dir) => s.patchTimeline({
+            groupWindows: Math.max(0, (stats.groupSize || stats.windows) + dir) })}
+          onCommit={(n) => s.patchTimeline({ groupWindows: Math.max(0, Math.round(n)) })}
+        />
+        {stats.groups.length > 1 && (
+          <span className="wininfo num">{stats.groups.length} groups</span>
+        )}
         <label className="chk">
           <input
             type="checkbox"
@@ -618,6 +640,22 @@ export function Timeline() {
             </span>
           ))}
         </div>
+        {stats.groups.length > 1 && (
+          <div className="grpstrip" title="Each group is rendered as its own job, then they are joined.">
+            {stats.groups.map((g) => (
+              <div
+                key={g.index}
+                className={`gband${g.index % 2 === 0 ? "" : " alt"}`}
+                data-group={g.index + 1}
+                data-windows={g.last - g.first + 1}
+                title={`Group ${g.index + 1} of ${stats.groups.length}: windows ${g.first + 1}–${g.last + 1}, ${(g.frames / (s.fps || 24)).toFixed(2)}s`}
+                style={{ left: xOf(g.startFrame), width: Math.max(2, xOf(g.startFrame + g.frames) - xOf(g.startFrame)) }}
+              >
+                <span className="gblab">G{g.index + 1}</span>
+              </div>
+            ))}
+          </div>
+        )}
         <div className="winstrip">
           {s.timeline.showWindows &&
             stats.spans.map((w, i) => {
@@ -640,6 +678,11 @@ export function Timeline() {
                   data-frames={w.end - w.start}
                   data-sec={((w.end - w.start) / s.fps).toFixed(2)}
                   data-bad={bad ? (bad.blocking ? "block" : "spec") : undefined}
+                  // Which group this window belongs to, so the band carries
+                  // that group's colour along its foot.
+                  data-group-alt={stats.groups.length > 1
+                    ? String((stats.groups.findIndex((g) => i >= g.first && i <= g.last) % 2 + 2) % 2)
+                    : undefined}
                   data-selected={stats.manual && s.selectedWindow === i ? "1" : undefined}
                   onClick={(e) => {
                     if (!stats.manual) return;

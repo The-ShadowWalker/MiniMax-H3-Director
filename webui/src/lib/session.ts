@@ -1,5 +1,6 @@
 import { buildPromptRelay } from "./prompt";
-import { chosenAudioMode, realWindows, spansFromFrames } from "./h3";
+import { chosenAudioMode, defaultGroupWindows, realWindows, spansFromFrames } from "./h3";
+import { groupWindowsFor } from "./groups";
 import type { SessionPayload } from "./types";
 
 export function downloadJson(payload: SessionPayload) {
@@ -135,6 +136,10 @@ export function buildGenerationPlan(p: SessionPayload) {
       .filter((m) => m && m.name && m.strength > 0)
       .map((m) => ({ name: m.name, strength: m.strength })),
     refmod_retention: p.refs.refmodRetention ?? 1,
+    // Render in groups of this many sliding windows, one Wan2GP job each.
+    group_windows: groupWindowsFor(p),
+    release_between_groups: p.timeline.releaseBetweenGroups === true,
+    hold_look_between_groups: p.timeline.holdLookBetweenGroups === true,
     // Audio source. Sent ONLY when it was chosen by hand; on Auto the relay
     // derives it from what is attached, which is what it has always done.
     ...(chosenAudioMode(p.audio.source) !== null

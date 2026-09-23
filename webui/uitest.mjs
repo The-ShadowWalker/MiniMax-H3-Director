@@ -54,7 +54,11 @@ const check = (label, ok, detail) => {
   if (!ok) failures.push(label);
 };
 
-const page = await browser.newPage();
+// A real window. The default 1280x720 leaves the stage about 340px tall, so
+// panes are clipped and clicks land on whatever is painted over the target --
+// which reads as a product bug when it is only the test window being smaller
+// than anything a person would use.
+const page = await browser.newPage({ viewport: { width: 1600, height: 1100 } });
 const pageErrors = [];
 page.on("pageerror", (e) => pageErrors.push(String(e)));
 await page.goto("file://" + PAGE);
@@ -682,6 +686,222 @@ if (toggle) {
   check("the Audio rail icon is lit when the mode is satisfied", lit && lit.ok === true,
     "icon state " + JSON.stringify(lit));
   if (lit) console.log("       rail says: " + JSON.stringify(lit.sub));
+}
+
+// --- render groups ---------------------------------------------------------
+// A long timeline rendered as one job dies partway through; in groups each
+// group is its own job. The timeline has to SHOW which windows go together.
+{
+  const setDur2 = async (secs) => {
+    const h = await page.evaluateHandle(() => {
+      const lbl = [...document.querySelectorAll(".tb .lbl")]
+        .find((l) => l.textContent.trim().startsWith("Duration"));
+      if (!lbl) return null;
+      let n = lbl.nextElementSibling;
+      while (n && n.tagName !== "INPUT") n = n.querySelector ? n.querySelector("input") : null;
+      return n;
+    });
+    const i = h.asElement();
+    if (!i) return false;
+    await i.click({ clickCount: 3 });
+    await page.keyboard.press("Control+A");
+    await page.keyboard.type(String(secs));
+    await page.keyboard.press("Enter");
+    await page.waitForTimeout(600);
+    return true;
+  };
+  await setDur2(200);   // long enough to need several groups
+
+  // Groups are off by default -- a long timeline still renders as one job
+  // unless asked. Turn it on the way a person would.
+  const groupsBox = () => page.evaluate(() => {
+    const l = [...document.querySelectorAll("label.chk")]
+      .find((x) => x.textContent.trim().toLowerCase() === "groups");
+    return l ? { on: l.querySelector("input").checked } : null;
+  });
+  const before = await groupsBox();
+  check("there is a groups on/off toggle beside the setting", !!before,
+    "no 'groups' checkbox on the timeline toolbar");
+  check("and it is off by default", !!before && before.on === false,
+    "groups should not change how an existing project renders");
+  const noBands = (await page.$$(".grpstrip .gband")).length;
+  check("with it off, nothing is grouped", noBands === 0, noBands + " band(s) drawn");
+
+  await page.evaluate(() => {
+    [...document.querySelectorAll("label.chk")]
+      .find((x) => x.textContent.trim().toLowerCase() === "groups")
+      .querySelector("input").click();
+  });
+  await page.waitForTimeout(500);
+
+  const grp = await page.evaluate(() => {
+    const bands = [...document.querySelectorAll(".grpstrip .gband")];
+    const wins = [...document.querySelectorAll(".winstrip .band")];
+    return {
+      groups: bands.length,
+      windows: wins.length,
+      perGroup: bands.map((b) => Number(b.dataset.windows)),
+      labels: bands.map((b) => (b.querySelector(".gblab") || {}).textContent),
+    };
+  });
+  check("a long timeline is split into groups", grp.groups > 1,
+    grp.groups + " group(s) for " + grp.windows + " window(s)");
+  if (grp.groups > 1) {
+    check("every window belongs to a group",
+      grp.perGroup.reduce((a, b) => a + b, 0) === grp.windows,
+      JSON.stringify(grp.perGroup) + " vs " + grp.windows + " windows");
+    check("and the groups are numbered on the timeline",
+      grp.labels.join(",") === grp.labels.map((_, i) => "G" + (i + 1)).join(","),
+      JSON.stringify(grp.labels));
+    console.log("       " + grp.windows + " windows in " +
+      grp.groups + " groups: " + JSON.stringify(grp.perGroup));
+  }
+
+  // The size is adjustable, which is the point.
+  const gbox = await page.evaluateHandle(() => {
+    const lbl = [...document.querySelectorAll(".tb .lbl")]
+      .find((l) => l.textContent.trim() === "Grp");
+    return lbl ? lbl.nextElementSibling : null;
+  });
+  const gb = gbox.asElement();
+  check("the group size can be set by hand", !!gb, "no 'Grp' control on the toolbar");
+  if (gb) {
+    await gb.click({ clickCount: 3 });
+    await page.keyboard.press("Control+A");
+    await page.keyboard.type("2");
+    await page.keyboard.press("Enter");
+    await page.waitForTimeout(500);
+    const after = await page.evaluate(() =>
+      [...document.querySelectorAll(".grpstrip .gband")].map((b) => Number(b.dataset.windows)));
+    check("and two windows per group gives groups of two",
+      after.length > 0 && after.slice(0, -1).every((n) => n === 2),
+      JSON.stringify(after));
+  }
+}
+
+// --- what crosses a group boundary -----------------------------------------
+// Both of these were settings the relay read with nothing on screen to set
+// them. A setting nobody can reach is the same as no setting at all.
+{
+  await page.evaluate(() => {
+    const rail = [...document.querySelectorAll("button, [role=button], .rail-item, li, div")]
+      .find((b) => (b.textContent || "").trim().startsWith("Generation"));
+    if (rail) rail.click();
+  });
+  await page.waitForTimeout(300);
+  await page.evaluate(() => {
+    const tab = [...document.querySelectorAll("button")]
+      .find((b) => /^sliding window$/i.test((b.textContent || "").trim()));
+    if (tab) tab.click();
+  });
+  await page.waitForTimeout(400);
+
+  const boxes = await page.evaluate(() => {
+    const out = {};
+    for (const l of document.querySelectorAll("label.chk")) {
+      const t = l.textContent.trim().toLowerCase();
+      if (/unload the model between groups/.test(t)) out.release = l.querySelector("input").checked;
+      if (/hold the look steady between groups/.test(t)) out.hold = l.querySelector("input").checked;
+    }
+    return out;
+  });
+  check("the unload-between-groups setting has a control",
+    boxes.release !== undefined, "no 'Unload the model between groups' checkbox");
+  check("and it is off, which is the right default",
+    boxes.release === false, "unloading costs a reload per group and frees nothing");
+  check("the look-drift correction has a control",
+    boxes.hold !== undefined, "no 'Hold the look steady between groups' checkbox");
+  check("and it is opt-in", boxes.hold === false,
+    "correcting the carried frames without being asked changes every project");
+}
+
+// --- how much of the prompt is the global prompt, repeated -----------------
+{
+  await page.evaluate(() => {
+    const rail = [...document.querySelectorAll("button, [role=button], .rail-item, li, div")]
+      .find((b) => (b.textContent || "").trim().startsWith("Generation"));
+    if (rail) rail.click();
+  });
+  await page.evaluate(() => {
+    const tab = [...document.querySelectorAll("button")]
+      .find((b) => /^general$/i.test((b.textContent || "").trim()));
+    if (tab) tab.click();
+  });
+  await page.waitForTimeout(500);
+
+  const reachRow = () => page.evaluate(() =>
+    [...document.querySelectorAll(".row")].find((x) => x.querySelector("label") &&
+      /global prompt in every window/i.test(x.querySelector("label").textContent)) ? true : false);
+
+  // With no global prompt there is nothing being repeated, so the control has
+  // nothing to say and must not be in the way.
+  check("it stays out of the way when there is no global prompt", !(await reachRow()));
+
+  // Type one. This is the case it exists for: a long global prompt across many
+  // windows is most of what the model ends up reading.
+  const typed = await page.evaluate(() => {
+    const ta = [...document.querySelectorAll("textarea")]
+      .find((t) => /Applies to every window/i.test(t.placeholder || ""));
+    if (!ta) return false;
+    const setter = Object.getOwnPropertyDescriptor(
+      window.HTMLTextAreaElement.prototype, "value").set;
+    setter.call(ta, "A ".repeat(3000).trim());
+    ta.dispatchEvent(new Event("input", { bubbles: true }));
+    return true;
+  });
+  check("the global prompt box is on the Generation pane", typed,
+    "no textarea with the global-prompt placeholder");
+  await page.waitForTimeout(500);
+
+  const row = await page.evaluate(() => {
+    const r = [...document.querySelectorAll(".row")]
+      .find((x) => x.querySelector("label") &&
+                   /global prompt in every window/i.test(x.querySelector("label").textContent));
+    if (!r) return null;
+    const box = r.querySelector("input[type=checkbox]");
+    return { on: box.checked, hint: (r.querySelector(".hint") || {}).textContent };
+  });
+  check("the global-prompt reach control exists", !!row,
+    "no 'Global prompt in every window' row in the Generation pane");
+  if (row) {
+    check("and it keeps today's behaviour by default", row.on === true,
+      "turning this off silently would change what every existing project sends");
+    check("with the cost shown in characters", /characters sent/.test(row.hint || ""),
+      "hint reads " + JSON.stringify(row.hint));
+    console.log("       " + (row.hint || "").trim());
+
+    // The warning is the whole point: it names the share of the payload that is
+    // the same text over and over, which is what makes the scenes repeat.
+    const warn = await page.evaluate(() => {
+      const n = [...document.querySelectorAll(".note.w")]
+        .find((x) => /of what the model reads is this prompt repeated/i.test(x.textContent));
+      return n ? n.textContent.replace(/\s+/g, " ").trim() : null;
+    });
+    check("a long global prompt over many windows is called out", !!warn,
+      "no duplication warning for 6,000 characters across every window");
+    if (warn) console.log("       " + warn.slice(0, 96) + "...");
+
+    // Turning it off has to actually cut the payload.
+    await page.evaluate(() => {
+      const r = [...document.querySelectorAll(".row")]
+        .find((x) => x.querySelector("label") &&
+                     /global prompt in every window/i.test(x.querySelector("label").textContent));
+      r.querySelector("input[type=checkbox]").click();
+    });
+    await page.waitForTimeout(400);
+    const off = await page.evaluate(() => {
+      const r = [...document.querySelectorAll(".row")]
+        .find((x) => x.querySelector("label") &&
+                     /global prompt in every window/i.test(x.querySelector("label").textContent));
+      return {
+        hint: r.querySelector(".hint").textContent,
+        warned: !!document.querySelector(".note.w"),
+      };
+    });
+    check("turning it off drops the copies", /first window only/.test(off.hint),
+      "hint reads " + JSON.stringify(off.hint));
+    console.log("       " + off.hint.trim());
+  }
 }
 
 check("no uncaught errors during the run", pageErrors.length === 0, pageErrors[0]);

@@ -680,3 +680,57 @@ export function audioModeGap(mode: string, hasTrack: boolean, hasVoiceRef: boole
   if (mode.includes("B") && !hasVoiceRef) return "needs a voice reference";
   return "";
 }
+
+// ---------------------------------------------------------------------------
+// Render groups
+// ---------------------------------------------------------------------------
+// A long timeline rendered as ONE Wan2GP job keeps every finished window in
+// memory and never lets the VRAM baseline reset, which is what makes a twenty
+// clip piece die partway through. Rendered in groups, each group is its own
+// job: Wan2GP's accumulator and its VRAM baseline both start clean each time.
+
+/** Which windows fall in which group. */
+export type WindowGroup = { index: number; first: number; last: number; frames: number };
+
+export function planGroups(windowFrames: number[], perGroup: number): WindowGroup[] {
+  const per = Math.max(1, Math.round(perGroup || 1));
+  const out: WindowGroup[] = [];
+  for (let i = 0; i < windowFrames.length; i += per) {
+    const slice = windowFrames.slice(i, i + per);
+    out.push({
+      index: out.length,
+      first: i,
+      last: i + slice.length - 1,
+      frames: slice.reduce((a, b) => a + b, 0),
+    });
+  }
+  return out;
+}
+
+/** Roughly how much system RAM one group's finished frames occupy.
+ *
+ *  Wan2GP converts each finished window to uint8 before adding it to the list
+ *  it stitches from, so it is one byte per channel: frames x w x h x 3. That
+ *  list is what grows through a render, and it is the reason a long job gets
+ *  heavier as it goes.
+ */
+export function groupRamGiB(frames: number, width: number, height: number): number {
+  return (frames * width * height * 3) / 1024 ** 3;
+}
+
+/** A sensible group size for a given memory budget.
+ *
+ *  Picks the most windows whose finished frames stay under `budgetGiB`, so the
+ *  default follows the resolution rather than being a number someone guessed.
+ *  Always at least one window, and never more windows than exist.
+ */
+export function defaultGroupWindows(
+  windowFrames: number[], width: number, height: number, budgetGiB = 3,
+): number {
+  if (!windowFrames.length) return 1;
+  const avg = windowFrames.reduce((a, b) => a + b, 0) / windowFrames.length;
+  const perWindow = groupRamGiB(avg, width, height);
+  if (!(perWindow > 0)) return Math.min(4, windowFrames.length);
+  const fits = Math.floor(budgetGiB / perWindow);
+  return Math.max(1, Math.min(windowFrames.length, fits || 1));
+}

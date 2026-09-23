@@ -117,6 +117,10 @@ export interface SessionPayload {
   pipeline: Pipeline;
   size: CheckpointSize;
   global_prompt: string;
+  /** Put the global prompt in EVERY window block (the default), or only the
+   *  first. On a long piece with a long global prompt, repeating it is most
+   *  of what the model reads. */
+  globalEveryWindow?: boolean;
   fps: number;
   duration_sec: number;
   hardcuts: string;
@@ -191,6 +195,18 @@ export interface SessionPayload {
     manualWindows?: boolean;
     /** Per-window OUTPUT lengths in frames, used only when manualWindows is on. */
     windowFrames?: number[];
+    /** Render in groups at all. Off means one job for the whole timeline,
+     *  exactly as before groups existed. */
+    groupsOn?: boolean;
+    /** How many sliding windows are rendered per Wan2GP job. 0 or missing
+     *  means "work it out from the resolution"; a number overrides it. Groups
+     *  exist so a long timeline is not one ever-growing render. */
+    groupWindows?: number;
+    /** Unload the model between groups (Wan2GP's own release_model). */
+    releaseBetweenGroups?: boolean;
+    /** Nudge the carried frames back toward the look the piece opened with,
+     *  capped per join, so a long continuation stops climbing brighter. */
+    holdLookBetweenGroups?: boolean;
     segments: Segment[];
   };
 }

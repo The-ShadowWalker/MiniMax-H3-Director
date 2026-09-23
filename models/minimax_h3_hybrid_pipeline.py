@@ -197,10 +197,84 @@ def _refmods_module():
 _REFMODS = False  # False = not looked yet, None = not found
 
 
-def _build_generate(base_generate):
+def _has_anchors(source):
+    """Does this source look like the real generate() at all?
+
+    The transforms need specific lines. Whether those lines have MOVED is a
+    different question from whether we are even looking at the right
+    function, and the two need different answers.
+    """
+    return any(w in source for w in ("reference_mode", "audio_prompt_type", "waveform"))
+
+
+def _source_from_disk(owner, name):
+    """Pull `name`'s source straight out of the class's own .py file.
+
+    `inspect.getsource` reads whatever object is bound right now. Another
+    plugin that replaces MiniMaxH3Pipeline.generate with its own function and
+    does NOT set `__wrapped__` (functools.wraps sets it; a bare assignment
+    does not) makes that object a five-line forwarder, and we would be
+    transforming the forwarder instead of the pipeline -- which fails with
+    every anchor missing and reads, wrongly, as "Wan2GP has changed".
+
+    The file on disk cannot be monkeypatched, so it is the ground truth.
+    Returns None if it cannot be read; the caller then reports what it found.
+    """
+    try:
+        import ast
+        path = inspect.getsourcefile(owner)
+        if not path:
+            return None
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read()
+        tree = ast.parse(text)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ClassDef) and node.name == owner.__name__:
+                for item in node.body:
+                    if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)) \
+                            and item.name == name:
+                        return textwrap.dedent(ast.get_source_segment(text, item) or "") or None
+    except Exception:
+        return None
+    return None
+
+
+def _describe(fn):
+    """Where a function came from, for an error a person can act on."""
+    try:
+        return "%s.%s (%s)" % (getattr(fn, "__module__", "?"),
+                               getattr(fn, "__qualname__", getattr(fn, "__name__", "?")),
+                               inspect.getsourcefile(fn) or "unknown file")
+    except Exception:
+        return getattr(fn, "__name__", "?")
+
+
+def _build_generate(base_generate, owner=None):
     """Rebuild `generate` with the two conditions delegated to methods."""
     original = inspect.unwrap(base_generate)
     source = textwrap.dedent(inspect.getsource(original))
+
+    # Something else owns generate() and hid the real one behind it. Go to the
+    # file instead of guessing, and say so -- their wrapper will not run on the
+    # Hybrid, and that is worth knowing before a render, not after.
+    if not _has_anchors(source) and owner is not None:
+        from_disk = _source_from_disk(owner, "generate")
+        if from_disk and _has_anchors(from_disk):
+            print("[H3 Hybrid] generate() is currently %s, which does not carry "
+                  "__wrapped__, so the real pipeline source was read from %s "
+                  "instead. That plugin's wrapper will NOT run on the Hybrid."
+                  % (_describe(original), inspect.getsourcefile(owner)))
+            source = from_disk
+        else:
+            raise HybridPipelineSourceError(
+                "MiniMaxH3Pipeline.generate has been replaced by %s, which does "
+                "not set __wrapped__, so the real pipeline source cannot be "
+                "reached through it -- and it could not be read from the class's "
+                "own file either.\nThis is NOT a Wan2GP change: another plugin is "
+                "patching the H3 pipeline ahead of H3 Director. Disable that "
+                "plugin, or load it after this one, and try again."
+                % _describe(original))
+
     source, how = transform_generate_source(source)
 
     namespace = dict(vars(inspect.getmodule(original)))
@@ -254,7 +328,8 @@ def get_hybrid_pipeline_class():
 
         hybrid_mode = True
 
-        generate = _build_generate(MiniMaxH3Pipeline.generate)
+        generate = _build_generate(MiniMaxH3Pipeline.generate,
+                                   owner=MiniMaxH3Pipeline)
 
         # ---- conditioning policy -----------------------------------------
         # These two methods ARE the hybrid. Everything else is stock H3.

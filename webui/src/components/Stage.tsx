@@ -727,6 +727,115 @@ function AudioSourceRow() {
   );
 }
 
+/** How much of what the model reads is the global prompt, repeated.
+ *
+ *  The relay puts the global prompt at the top of EVERY window block. That is
+ *  right for a short global prompt, and wrong for a long one: at 5,300
+ *  characters across 20 windows it is 101,000 characters of identical text,
+ *  three quarters of everything sent, with each window's own direction buried
+ *  underneath. Every window then reads nearly the same thing, which is what
+ *  makes the scenes repeat. The numbers are shown rather than a rule applied,
+ *  because whether that trade is worth it depends on the piece.
+ */
+function GlobalPromptReach() {
+  const s = useDirector();
+  const every = s.globalEveryWindow !== false;
+  const stats = useWindowStats();
+  const wins = Math.max(1, stats.windows || 1);
+  const g = (s.global_prompt || "").trim().length;
+  const own = (s.timeline.segments || [])
+    .filter((x) => x.kind === "text")
+    .reduce((a, x) => a + (x.prompt || "").trim().length, 0);
+  if (!g || wins < 2) return null;
+  const sent = every ? g * wins + own : g + own;
+  const dupe = every ? g * (wins - 1) : 0;
+  const pct = Math.round((100 * dupe) / Math.max(1, sent));
+  const heavy = every && pct >= 50;
+  return (
+    <>
+      <Row label="Global prompt in every window">
+        <input
+          type="checkbox"
+          checked={every}
+          onChange={(e) => s.patch({ globalEveryWindow: e.target.checked })}
+        />
+        <span className="hint" style={{ flex: 1 }}>
+          {every
+            ? `${wins} copies · ${sent.toLocaleString()} characters sent`
+            : `first window only · ${sent.toLocaleString()} characters sent`}
+        </span>
+      </Row>
+      {heavy && (
+        <div className="note w">
+          <b>{pct}% of what the model reads is this prompt repeated.</b>{" "}
+          Your {g.toLocaleString()} characters go in {wins} times
+          ({dupe.toLocaleString()} characters of identical text), so every window reads
+          nearly the same instruction and the per-shot direction underneath it carries much
+          less weight — that is what makes scenes repeat. The reference images reach every
+          window either way. Try turning this off for a long piece.
+        </div>
+      )}
+    </>
+  );
+}
+
+/** What happens at a group boundary.
+ *
+ *  Groups are on and sized from the timeline toolbar, where the bands are
+ *  drawn. These two are about what crosses a join, which is a different
+ *  question and belongs where the windows are explained.
+ */
+function GroupsCard() {
+  const s = useDirector();
+  const stats = useWindowStats();
+  const on = !!s.timeline.groupsOn;
+  return (
+    <div className="card">
+      <h4>Render groups</h4>
+      <div className="note">
+        {on
+          ? `${stats.windows} window(s) in ${stats.groups.length} group(s) of up to ${stats.groupSize}. `
+          : "Off — the whole timeline renders as one job. "}
+        Groups are switched on and sized on the timeline toolbar. Each group is its own Wan2GP
+        job, continuing from the last {s.timeline.slidingWindowOverlap} frames of the one before
+        it on the same seed, and they are joined only once every group is finished.
+      </div>
+
+      <label className="chk" title="Wan2GP's own release_model between groups. Slower — the model is reloaded each time — and it does not free the finished frames, which go when each group's job returns.">
+        <input
+          type="checkbox"
+          checked={s.timeline.releaseBetweenGroups === true}
+          onChange={(e) => s.patchTimeline({ releaseBetweenGroups: e.target.checked })}
+        />
+        Unload the model between groups
+      </label>
+      <div className="note">
+        Off by default, and normally the right answer: the finished frames are freed when each
+        group's job returns, not by unloading the model, so this costs a full reload per group
+        and buys nothing. Turn it on if VRAM creeps up group after group.
+      </div>
+
+      <label className="chk" title="Measure the carried frames against the look the piece opened with, and nudge them back before the next group generates from them.">
+        <input
+          type="checkbox"
+          checked={s.timeline.holdLookBetweenGroups === true}
+          onChange={(e) => s.patchTimeline({ holdLookBetweenGroups: e.target.checked })}
+        />
+        Hold the look steady between groups
+      </label>
+      <div className="note">
+        A long continuation drifts: each window is generated from the encoded frames of the one
+        before it, so any small bias in that round trip is inherited and re-applied, and over
+        twenty windows the picture climbs steadily brighter and softer. The drift at every join is
+        measured and written to the log either way. With this on, the carried frames are also
+        nudged back toward the opening — by at most 2% per join, because a full correction would
+        snap the picture at the boundary and read worse than the drift. It only steers what the
+        next group generates; nothing already rendered is altered.
+      </div>
+    </div>
+  );
+}
+
 function RefModsGroup() {
   const s = useDirector();
   const { list, busy, reload } = useRefMods();
@@ -992,6 +1101,7 @@ function GenPane() {
               placeholder="Applies to every window that has no prompt of its own. Style, look, camera language."
               onChange={(v) => s.patch({ global_prompt: v })}
             />
+            <GlobalPromptReach />
             <div className="note">
               Used as the body for any shot with an empty prompt, and prepended to the relay.
               Per-shot prompts on the timeline override it.
@@ -1540,6 +1650,7 @@ function GenPane() {
           )}
         </div>
       )}
+      {s.advTab === "window" && <GroupsCard />}
       {s.advTab === "misc" && (
         <div className="card">
           <h4>Memory and precision</h4>
