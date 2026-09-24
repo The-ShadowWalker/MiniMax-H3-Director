@@ -249,10 +249,86 @@ def _describe(fn):
         return getattr(fn, "__name__", "?")
 
 
+def _deep_unwrap(fn):
+    """Walk back to the real function past wrappers that forgot __wrapped__.
+
+    `inspect.unwrap` follows `__wrapped__`, which `functools.wraps` sets. A
+    plugin that wraps generate() with a bare `def` and a plain assignment sets
+    nothing, so unwrap stops on the wrapper -- but several keep the function
+    they replaced on an attribute of their own (`_h3_image_mode_original` in
+    the H3 image-mode plugin, for one). That attribute is the exact function
+    object, which beats re-reading the file: it carries its own module globals.
+
+    Bounded, and it never steps onto something that is not a function.
+    """
+    seen = set()
+    for _ in range(16):
+        fn = inspect.unwrap(fn)
+        if id(fn) in seen:
+            break
+        seen.add(id(fn))
+        nxt = None
+        for attr in dir(fn):
+            if not (attr.endswith("_original") or attr.endswith("_orig")):
+                continue
+            cand = getattr(fn, attr, None)
+            if inspect.isfunction(cand) and id(cand) not in seen:
+                nxt = cand
+                break
+        if nxt is None:
+            return fn
+        fn = nxt
+    return fn
+
+
+def _sync_module_globals(namespace, module, skip=None):
+    """Re-read the pipeline module's functions into the rebuilt generate().
+
+    The rebuilt generate runs against a COPY of the H3 pipeline module's
+    globals, taken when the Hybrid class was first built. Another plugin that
+    replaces a module-level helper there AFTER that moment -- and plugins do,
+    the RefMods plugin swaps `_as_video` and `_resize_video` -- would be
+    ignored by the Hybrid while working normally on every stock H3 model.
+    Whether that happens would come down to which plugin loaded first.
+
+    Re-reading at call time takes the ordering question off the table. Only
+    functions and classes are followed, so nothing stateful is disturbed, and
+    the cost is a few hundred identity checks against a generation measured in
+    minutes.
+    """
+    if module is None:
+        return
+    try:
+        live = vars(module)
+    except Exception:
+        return
+    for name, value in list(live.items()):
+        if name == skip or name.startswith("__"):
+            continue
+        if not (inspect.isfunction(value) or inspect.isclass(value)):
+            continue
+        if namespace.get(name, None) is not value and name in namespace:
+            namespace[name] = value
+
+
 def _build_generate(base_generate, owner=None):
     """Rebuild `generate` with the two conditions delegated to methods."""
     original = inspect.unwrap(base_generate)
     source = textwrap.dedent(inspect.getsource(original))
+
+    # A wrapper that kept the original on an attribute hands it straight back.
+    if not _has_anchors(source):
+        deeper = _deep_unwrap(base_generate)
+        if deeper is not original:
+            try:
+                deeper_source = textwrap.dedent(inspect.getsource(deeper))
+            except Exception:
+                deeper_source = ""
+            if _has_anchors(deeper_source):
+                print("[H3 Hybrid] generate() is currently %s; the real pipeline "
+                      "function was recovered from it. That plugin's wrapper will "
+                      "NOT run on the Hybrid." % _describe(original))
+                original, source = deeper, deeper_source
 
     # Something else owns generate() and hid the real one behind it. Go to the
     # file instead of guessing, and say so -- their wrapper will not run on the
@@ -291,7 +367,10 @@ def _build_generate(base_generate, owner=None):
     # Hybrid back on the same footing as the stock model. The work itself is
     # still theirs -- refmods.apply_to_kwargs only calls their _inject_refmods,
     # which is also where the "first window only" rule lives.
+    module = inspect.getmodule(original)
+
     def generate_with_refmods(self, *args, **kwargs):
+        _sync_module_globals(namespace, module, skip=original.__name__)
         refmods = _refmods_module()
         if refmods is None:
             return fn(self, *args, **kwargs)

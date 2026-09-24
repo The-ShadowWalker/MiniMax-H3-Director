@@ -83,14 +83,32 @@ else:
 # --- a foreign wrapper in front of generate() -------------------------------
 print("\nanother plugin owning generate():")
 STOCK = os.path.join(HERE, "_regr_stockpipe.py")
-open(STOCK, "w", encoding="utf-8").write(
-    "class MiniMaxH3Pipeline:\n"
-    "    def generate(self, audio_prompt_type=None, waveform=None,\n"
-    "                 input_ref_images=None, refinement_mode=False):\n"
-    "        if not self.reference_mode and any(flag in (audio_prompt_type or \"\")\n"
-    "                                           for flag in \"AK\") and waveform is not None:\n"
-    "            self._add_audio_reference(waveform)\n"
-    "        return \"generated\"\n")
+
+
+def _stub_source():
+    """A file-backed class carrying the REAL generate() body where possible.
+
+    The body is what matters -- it holds the lines the transforms match. Only
+    the signature is simplified, because its defaults reference pipeline
+    constants that cannot be imported without torch. Written to a real file so
+    `inspect.getsource` behaves exactly as it does on a user's machine.
+    """
+    if PIPE:
+        real = _generate_source(PIPE)
+        if real:
+            body = real[real.index("):") + 2:]
+            return ("class MiniMaxH3Pipeline:\n    def generate(self, **kwargs):"
+                    + "\n".join("    " + l for l in body.split("\n")))
+    return ("class MiniMaxH3Pipeline:\n"
+            "    def generate(self, audio_prompt_type=None, waveform=None,\n"
+            "                 input_ref_images=None, refinement_mode=False):\n"
+            "        if not self.reference_mode and any(flag in (audio_prompt_type or \"\")\n"
+            "                                           for flag in \"AK\") and waveform is not None:\n"
+            "            self._add_audio_reference(waveform)\n"
+            "        return \"generated\"\n")
+
+
+open(STOCK, "w", encoding="utf-8").write(_stub_source())
 sys.path.insert(0, HERE)
 try:
     import _regr_stockpipe
@@ -108,6 +126,28 @@ try:
           not hp._has_anchors(bare),
           "if this ever passes, the report's failure mode is gone from Python itself")
 
+    # The H3 image-mode plugin (wan2gp-minimax-h3-image) is exactly this shape:
+    # a bare `def generate`, no functools.wraps, the real function kept on
+    # `_h3_image_mode_original`. That attribute is better than re-reading the
+    # file -- it is the function object itself, with its own module globals.
+    def image_mode(self, *a, **k):
+        return orig(self, *a, **k)
+    image_mode._h3_image_mode_wrapper = True
+    image_mode._h3_image_mode_original = orig
+    Cls.generate = image_mode
+
+    check("a wrapper that kept the original is followed to it",
+          hp._deep_unwrap(Cls.generate) is orig,
+          "inspect.unwrap alone stops on the wrapper")
+    rebuilt = hp._build_generate(Cls.generate, owner=Cls)
+    check("and the Hybrid builds anyway, with both transforms",
+          sorted(getattr(rebuilt, "_hybrid_transforms", [])) ==
+          ["audio_reference_gate", "target_audio_gate"],
+          str(getattr(rebuilt, "_hybrid_transforms", None)))
+    check("the walk back cannot loop forever",
+          hp._deep_unwrap(orig) is orig, "a self-referencing attribute would hang the load")
+
+    Cls.generate = foreign
     back = hp._source_from_disk(Cls, "generate")
     check("the real source is recovered from the class's own file",
           bool(back) and hp._has_anchors(back),
@@ -146,6 +186,44 @@ finally:
             os.remove(os.path.join(HERE, junk))
         except OSError:
             pass
+
+# --- a plugin that patches a helper AFTER the Hybrid was built --------------
+# The rebuilt generate runs against a copy of the pipeline module's globals.
+# Without a refresh, whether another plugin's patch applies to the Hybrid would
+# depend on which plugin loaded first -- while working fine on stock H3.
+print("\na helper patched after the Hybrid was built:")
+import types
+
+mod = types.ModuleType("pipe")
+
+
+def _as_video(v):
+    return "ORIGINAL"
+
+
+mod._as_video = _as_video
+mod.SOME_STATE = 7
+ns = {"_as_video": _as_video, "SOME_STATE": 7, "generate": "the rebuilt fn"}
+
+
+def _patched(v):
+    return "PATCHED"
+
+
+mod._as_video = _patched
+mod.SOME_STATE = 99
+hp._sync_module_globals(ns, mod, skip="generate")
+check("a helper replaced later is picked up", ns["_as_video"] is _patched,
+      "the Hybrid would ignore a patch every stock H3 model honours")
+check("module state is left alone", ns["SOME_STATE"] == 7,
+      "only functions and classes are followed")
+check("the rebuilt generate is not overwritten", ns["generate"] == "the rebuilt fn")
+check("no names are invented", set(ns) == {"_as_video", "SOME_STATE", "generate"})
+try:
+    hp._sync_module_globals(ns, None)
+    check("a module that cannot be read is survivable", True)
+except Exception as exc:
+    check("a module that cannot be read is survivable", False, str(exc))
 
 print()
 if fails:

@@ -31,7 +31,7 @@ try:
 except ImportError:  # loaded flat (tests, and older plugin loaders)
     import refmods
 
-PLUGIN_VERSION = "1.5.5"
+PLUGIN_VERSION = "1.5.7"
 PLUGIN_ID = "h3_director2"
 PLUGIN_NAME = "H3 Director"
 LOG_PREFIX = "[H3-D]"
