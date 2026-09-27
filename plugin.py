@@ -30,8 +30,16 @@ try:
     from . import refmods
 except ImportError:  # loaded flat (tests, and older plugin loaders)
     import refmods
+try:
+    from . import renders
+except ImportError:
+    import renders
+try:
+    from . import compat
+except ImportError:
+    import compat
 
-PLUGIN_VERSION = "1.5.7"
+PLUGIN_VERSION = "1.6.19"
 PLUGIN_ID = "h3_director2"
 PLUGIN_NAME = "H3 Director"
 LOG_PREFIX = "[H3-D]"
@@ -48,6 +56,17 @@ MEDIA_DIR = WORKSPACE / "media"
 # project, and cleared at the start of every generation.
 DERIVED_DIR = WORKSPACE / "derived"
 PROJECT_JSON = WORKSPACE / "project.json"
+# A grouped render's finished groups: each one cut to its slot and stored
+# losslessly, plus the record Continue works from after a crash. They belong
+# to the project -- saved in its zip, cleared with it -- unlike derived/.
+RENDERS_DIR = WORKSPACE / "renders"
+RENDER_JSON = WORKSPACE / "render.json"
+# Earlier copies of project.json. One .bak is one save deep: two bad saves in a
+# row -- the demo written over a project that failed to load, say -- and both
+# copies are gone. These go back hours instead.
+HISTORY_DIR = WORKSPACE / "history"
+HISTORY_KEEP = 30
+HISTORY_EVERY = 300          # seconds between snapshots while editing
 PROJECT_BAK = WORKSPACE / "project.json.bak"
 
 IMAGE_EXTS = [".png", ".jpg", ".jpeg", ".webp", ".bmp", ".avif", ".gif", ".tiff"]
@@ -543,7 +562,54 @@ function h3d2Dispatch(boxId, triggerId, payload, delay) {
   }, delay || 250);
 }
 
-window.H3D2.pump    = function (p) { h3d2Dispatch("h3d2-req",    "h3d2-go",    p, 120); };
+/* Requests share ONE hidden textbox and ONE button. Two requests arriving
+   together both write the textbox before either click lands, so the first is
+   overwritten -- lost -- and whatever asked for it waits for an answer that
+   never comes. So only one write is ever in flight. But one-at-a-time alone is
+   too slow: at startup the UI asks a dozen things at once, and queued single
+   file the project load waited behind all of them long enough to time out.
+   So everything waiting goes together, as ONE batch, in ONE round trip, and
+   Python answers the lot at once. A lone request goes as it always did. A
+   request with no id has no answer anyone waits for, so it only needs its
+   click to land; a minute's cap keeps one lost answer from stalling the rest. */
+window.H3D2.reqQueue = [];
+window.H3D2.reqBusy = null;
+window.H3D2.batchSeq = 0;
+window.H3D2.msgSeq = 0;
+function h3d2Release(id) {
+  const b = window.H3D2.reqBusy;
+  if (!b || (id !== undefined && b.id !== id)) { return; }
+  clearTimeout(b.timer);
+  window.H3D2.reqBusy = null;
+  h3d2PumpNext();
+}
+function h3d2PumpNext() {
+  if (window.H3D2.reqBusy || !window.H3D2.reqQueue.length) { return; }
+  const items = window.H3D2.reqQueue.splice(0);
+  // EVERY click carries an id and waits for its answer -- including messages
+  // the UI does not wait on itself. Gradio ignores a click on this button
+  // while the one before is still being handled, so moving on early loses
+  // whatever is clicked next: that is how the project load went missing.
+  items.forEach(function (it) {
+    if (!it.id) { window.H3D2.msgSeq += 1; it.id = "m" + window.H3D2.msgSeq + "_" + Date.now(); }
+  });
+  let p = items[0];
+  if (items.length > 1) {
+    window.H3D2.batchSeq += 1;
+    p = { cmd: "batch", id: "batch" + window.H3D2.batchSeq + "_" + Date.now(), data: { items: items } };
+  }
+  // How long to wait before giving up on an answer: what the UI itself will
+  // wait (a project zip can take many minutes), plus a margin.
+  const ttl = items.reduce(function (a, it) { return Math.max(a, Number(it.ttl) || 60000); }, 0) + 5000;
+  const busy = { id: p.id };
+  busy.timer = setTimeout(function () {
+    console.warn("[H3-D] no answer to " + p.cmd + " after " + Math.round(ttl / 1000) + "s; moving on");
+    h3d2Release(undefined);
+  }, ttl);
+  window.H3D2.reqBusy = busy;
+  h3d2Dispatch("h3d2-req", "h3d2-go", p, 120);
+}
+window.H3D2.pump = function (p) { window.H3D2.reqQueue.push(p); h3d2PumpNext(); };
 window.H3D2.pumpGen   = function (p) { h3d2Dispatch("h3d2-genreq",   "h3d2-gengo",   p, 300); };
 window.H3D2.pumpApply = function (p) { h3d2Dispatch("h3d2-applyreq", "h3d2-applygo", p, 300); };
 
@@ -565,7 +631,18 @@ function h3d2Watch(elemId, label) {
     const v = box.value || "";
     if (v && v !== last) {
       last = v;
-      try { window.H3D2.toFrame(JSON.parse(v)); } catch (e) { console.error("[H3-D] bad " + label + " frame", e); }
+      let msg = null;
+      try {
+        msg = JSON.parse(v);
+        if (msg && msg.cmd === "batch:ok" && msg.data && msg.data.items) {
+          // A batch comes back as one answer holding each request's own.
+          msg.data.items.forEach(function (it) { window.H3D2.toFrame(it); });
+        } else {
+          window.H3D2.toFrame(msg);
+        }
+      } catch (e) { console.error("[H3-D] bad " + label + " frame", e); }
+      // An answer is back: the next request can go.
+      if (label === "resp" && msg && msg.id) { h3d2Release(msg.id); }
     }
   }, 120);
 }
@@ -615,6 +692,122 @@ setTimeout(function () {
 
 
 # --------------------------------------------------------------------------
+class _AdmissionWatch:
+    """Watches one submitted job until WanGP actually takes it into its queue.
+
+    A job submitted from inside a Generate click is only QUEUED by WanGP once
+    the browser page passes a trigger back to it (load_queue_trigger). For the
+    second and later groups of a grouped render that trigger travels down the
+    same stream as the progress updates. If the page misses it -- stopped
+    processing updates, lost its connection, was hidden -- the job sits there
+    forever and WanGP prints "queue suspended while waiting for Media
+    Generator to get browser focus". The finished groups are safe, but the
+    render never goes on.
+
+    So when WanGP says it is waiting, the trigger is sent again (under a fresh
+    value, since an unchanged value fires nothing), a few times, and the
+    terminal says plainly what is going on and what to do.
+    """
+
+    WAITING = ("queued in wangp", "browser focus")
+    FIRST_POKE = 4.0          # after WanGP says it is waiting
+    # No word from WanGP at all. Long, because WanGP says nothing when it
+    # takes a job (a model load can be silent for a minute or two); a resend
+    # while the job is already running is ignored by the page anyway.
+    FALLBACK = 240.0
+    EVERY = 30.0
+    MAX_POKES = 12
+
+    def __init__(self, owner, job, label, clock=None):
+        self.owner = owner
+        self.job = job
+        self.label = label
+        self.clock = clock or time.time
+        self.t0 = self.clock()
+        self.admitted = False
+        self.waiting_since = None
+        self.pokes = 0
+        self.next_poke = None
+        self.told = False
+
+    def saw(self, ev):
+        if self.admitted:
+            return
+        kind = str(getattr(ev, "kind", "") or "")
+        d = getattr(ev, "data", None)
+        if kind == "progress":
+            self._in()
+            return
+        if kind in ("status", "stream") and d is not None:
+            txt = str(getattr(d, "text", d) or "").strip().lower()
+            if not txt:
+                return
+            if "browser focus" in txt:
+                if self.waiting_since is None:
+                    self.waiting_since = self.clock()
+                    self.next_poke = self.waiting_since + self.FIRST_POKE
+            elif not any(w in txt for w in self.WAITING):
+                self._in()
+        elif kind == "output":
+            self._in()
+
+    def _in(self):
+        if not self.admitted and self.pokes:
+            trace("%s: WanGP took the job after %d nudge(s) - carrying on" % (self.label, self.pokes))
+        self.admitted = True
+
+    def tick(self):
+        """Returns a line for the log when something was done, else ''."""
+        if self.admitted or getattr(self.job, "done", False):
+            return ""
+        now = self.clock()
+        if self.next_poke is None and now - self.t0 >= self.FALLBACK:
+            self.next_poke = now
+        if self.next_poke is None or now < self.next_poke or self.pokes >= self.MAX_POKES:
+            return ""
+        self.pokes += 1
+        self.next_poke = now + self.EVERY
+        ok = self.poke()
+        msg = ("%s is waiting for WanGP to take it: the browser page did not pass it on. "
+               "Sent it again (%d)%s." % (self.label, self.pokes, "" if ok else " - could not, see the terminal"))
+        trace(msg)
+        st = getattr(self.owner, "_jobstate", None)
+        if isinstance(st, dict):
+            # Also where a reloaded page picks the run back up from.
+            st.setdefault("log", []).append({"level": "warn", "msg": msg})
+            st["detail"] = "waiting for WanGP to take %s - click the WanGP page" % self.label.lower()
+        if not self.told:
+            self.told = True
+            trace("%s: if this keeps repeating, click anywhere in the WanGP browser page (keep it "
+                  "visible, not minimized). Finished groups are saved - if the page is frozen, "
+                  "reload it and press Continue in the Director." % self.label)
+        return msg
+
+    def poke(self):
+        """Hand the job's queue trigger to the page again, with a new value."""
+        try:
+            sess = self.owner._wangp_session if hasattr(self.owner, "_wangp_session") else None
+            get = getattr(sess, "_get_wrapped_call", None)
+            call_id = str(getattr(self.job, "webui_owner_call_id", "") or "").strip()
+            state = get(call_id) if callable(get) and call_id else None
+            base = str(getattr(self.job, "webui_load_queue_token", "") or "").strip()
+            if state is None or not base or not hasattr(self.job, "_webui_load_queue_token") \
+                    or not callable(getattr(state, "add_followup_job", None)):
+                trace("%s: cannot resend the queue trigger (WanGP call %s not found)" % (self.label, call_id or "?"))
+                return False
+            # The page only acts on a CHANGED value, and WanGP's load ignores
+            # the value itself, so a suffix is enough.
+            self.job._webui_load_queue_token = "%s.%d" % (base.split(".")[0], self.pokes)
+            enable = getattr(state, "enable_followup_queue_triggers", None)
+            if callable(enable):
+                enable()
+            state.add_followup_job(self.job)
+            return True
+        except Exception as exc:
+            trace("%s: resending the queue trigger failed: %s" % (self.label, exc))
+            return False
+
+
 class H3Director2Plugin(WAN2GPPlugin):
     """React UI in an iframe; Python owns files and generation."""
 
@@ -662,6 +855,10 @@ class H3Director2Plugin(WAN2GPPlugin):
         self.add_custom_js(_BRIDGE_JS)
         self.add_tab(tab_id=PLUGIN_ID, label=PLUGIN_NAME, component_constructor=self._build_ui)
         trace("setup_ui: tab '%s' registered (v%s)" % (PLUGIN_NAME, PLUGIN_VERSION))
+        try:
+            trace(compat.current()[2])
+        except Exception as exc:
+            trace("compatibility check failed: %s" % exc)
         # What this machine is, once per run, at the top of the crash log.
         try:
             import platform
@@ -695,7 +892,15 @@ class H3Director2Plugin(WAN2GPPlugin):
             req = gr.Textbox(label="req", visible=False, elem_id="h3d2-req")
             resp = gr.Textbox(label="resp", visible=False, elem_id="h3d2-resp")
             go = gr.Button("go", visible=False, elem_id="h3d2-go")
-            go.click(fn=self._on_bridge, inputs=[req], outputs=[resp], show_progress="hidden")
+            # trigger_mode="multiple": a click that arrives while the last is
+            # still being handled is queued, not ignored ("once", the default
+            # for clicks, silently dropped it). The bridge also never clicks
+            # before the previous answer is back; this is the second guard.
+            try:
+                go.click(fn=self._on_bridge, inputs=[req], outputs=[resp], show_progress="hidden",
+                         trigger_mode="multiple")
+            except TypeError:
+                go.click(fn=self._on_bridge, inputs=[req], outputs=[resp], show_progress="hidden")
 
             # Generation needs its OWN streaming handler: the wrapper only
             # pumps WanGP's queue while a generator is actively draining
@@ -813,11 +1018,27 @@ class H3Director2Plugin(WAN2GPPlugin):
         data = msg.get("data") or {}
         mid = msg.get("id")
 
+        if cmd == "batch":
+            # Several requests that left the UI together, answered together.
+            # Each keeps its own id and gets its own answer, exactly as if it
+            # had come alone -- one failing does not touch the others.
+            items = data.get("items") if isinstance(data, dict) else None
+            answers = []
+            for item in (items if isinstance(items, list) else []):
+                try:
+                    answers.append(json.loads(self._on_bridge(json.dumps(item))))
+                except Exception as exc:
+                    answers.append({"cmd": "error", "error": str(exc),
+                                    "id": (item or {}).get("id") if isinstance(item, dict) else None})
+            return json.dumps({"cmd": "batch:ok", "data": {"items": answers}, "id": mid})
+
         try:
             if cmd == "ready":
                 out = {"grid": self._grid}
                 self._grid = derive_h3_grid(self._model_def())
-                return json.dumps({"cmd": "h3_grid", "data": self._grid, "id": None})
+                # The id comes back so the bridge knows this click is answered;
+                # the UI still takes it by its cmd, since it asked with send().
+                return json.dumps({"cmd": "h3_grid", "data": self._grid, "id": mid})
             if cmd == "save_project_json":
                 out = self._save_project_json(data.get("payload"))
             elif cmd == "load_project_json":
@@ -885,6 +1106,24 @@ class H3Director2Plugin(WAN2GPPlugin):
                 out = self._prune_media(data)
             elif cmd == "clear_all":
                 out = self._clear_all(data)
+            elif cmd == "render_state":
+                out = self._render_state(data)
+            elif cmd == "render_discard":
+                # Never under a running render: it is writing those clips.
+                if getattr(self, "_groups_active", False) or getattr(self, "_job", None) \
+                        or getattr(self, "_stitching", False):
+                    raise ValueError("a render or stitch is running - cancel it or let it finish first")
+                out = {"ok": True, "removed": self._render_discard()}
+                self._render_rev = getattr(self, "_render_rev", 0) + 1
+                trace("results track cleared: %d file(s) removed" % out["removed"])
+            elif cmd == "render_poster":
+                out = self._render_poster(data)
+            elif cmd == "render_preview":
+                out = self._render_preview(data)
+            elif cmd == "stitch":
+                out = self._stitch(data)
+            elif cmd == "render_split":
+                out = self._render_split(data)
             elif cmd == "diagnose":
                 out = {"report": self._diagnose()}
             elif cmd == "print_env":
@@ -903,9 +1142,39 @@ class H3Director2Plugin(WAN2GPPlugin):
             return json.dumps({"cmd": cmd + ":err", "error": str(exc), "id": mid})
 
     # ---------------- persistence ----------------
+    def _snapshot_project(self):
+        """Keep a dated copy of project.json before it is overwritten.
+
+        The first save after the plugin starts always takes one -- that is the
+        moment a failed load could write something else over the project --
+        and after that at most one every few minutes. The oldest go once there
+        are more than HISTORY_KEEP."""
+        if not PROJECT_JSON.is_file():
+            return
+        now = time.time()
+        first = not getattr(self, "_snapshotted", False)
+        if not first and now - getattr(self, "_snapshot_at", 0) < HISTORY_EVERY:
+            return
+        try:
+            HISTORY_DIR.mkdir(parents=True, exist_ok=True)
+            data = PROJECT_JSON.read_bytes()
+            newest = sorted(HISTORY_DIR.glob("project-*.json"))
+            if newest and newest[-1].read_bytes() == data:
+                self._snapshotted, self._snapshot_at = True, now
+                return
+            dest = HISTORY_DIR / ("project-%s.json" % time.strftime("%Y%m%d-%H%M%S"))
+            dest.write_bytes(data)
+            self._snapshotted, self._snapshot_at = True, now
+            for old in sorted(HISTORY_DIR.glob("project-*.json"))[:-HISTORY_KEEP]:
+                old.unlink()
+            trace("project history: kept %s" % dest.name)
+        except Exception as exc:
+            trace("project history snapshot failed: %s" % exc)
+
     def _save_project_json(self, payload):
         if not isinstance(payload, dict):
             raise ValueError("payload must be an object")
+        self._snapshot_project()
         payload = dict(payload)
         payload["app"] = PLUGIN_ID            # refuse to open in the other plugin
         payload["plugin_version"] = PLUGIN_VERSION
@@ -992,29 +1261,51 @@ class H3Director2Plugin(WAN2GPPlugin):
         out = Path(target) / ("%s.zip" % safe)
         if out.exists():
             out = Path(target) / ("%s-%s.zip" % (safe, time.strftime("%Y%m%d-%H%M%S")))
+        # Written under a temporary name and renamed when complete: with
+        # gigabytes of rendered clips inside, a crash mid-save must not leave
+        # a truncated zip under the project's own name.
+        partial = out.with_name(out.name + ".partial")
 
-        with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zf:
+        clips = 0
+        rec = renders.load_record(RENDER_JSON, PLUGIN_ID)
+        listed = {str(g.get("master")) for g in ((rec or {}).get("groups") or [])}
+        with zipfile.ZipFile(partial, "w", zipfile.ZIP_DEFLATED, allowZip64=True) as zf:
             zf.writestr("project.json", json.dumps(payload, ensure_ascii=False))
             for f in sorted(MEDIA_DIR.glob("*")):
                 if f.is_file():
                     zf.write(f, "media/" + f.name)
+            # The rendered clips and their record. They are the finished work,
+            # already compressed losslessly, so they are STORED rather than
+            # deflated -- deflating gigabytes of FFV1 saves almost nothing and
+            # takes minutes.
+            if rec:
+                zf.writestr("render.json", json.dumps(rec, ensure_ascii=False, indent=1))
+                for f in sorted(RENDERS_DIR.glob("*.mkv")):
+                    if f.is_file() and f.name in listed:
+                        zf.write(f, "renders/" + f.name, compress_type=zipfile.ZIP_STORED)
+                        clips += 1
+        renders.fsync_file(partial)
+        renders.replace_retry(partial, out)
         if missing:
             trace("SAVE INCOMPLETE — missing media: %s" % ", ".join(missing))
             return {"ok": False, "path": str(out), "incomplete": missing}
-        trace("saved %s" % out)
-        return {"ok": True, "path": str(out)}
+        trace("saved %s%s" % (out, (" with %d rendered clip(s)" % clips) if clips else ""))
+        return {"ok": True, "path": str(out), "clips": clips}
 
     def _clear_all(self, data):
         if not data.get("confirmed"):
             return {"ok": False, "needs_confirm": True}
+        if getattr(self, "_groups_active", False) or getattr(self, "_job", None) \
+                or getattr(self, "_stitching", False):
+            raise ValueError("a render or stitch is running - cancel it or let it finish first")
         freed = 0
-        for d in (MEDIA_DIR, DERIVED_DIR):
+        for d in (MEDIA_DIR, DERIVED_DIR, RENDERS_DIR, HISTORY_DIR):
             for f in d.glob("*"):
                 if f.is_file():      # media AND its .meta.json sidecar
                     freed += f.stat().st_size
                     f.unlink()
                     trace("cleared %s" % f.name)
-        for p in (PROJECT_JSON, PROJECT_BAK):
+        for p in (PROJECT_JSON, PROJECT_BAK, RENDER_JSON):
             if p.exists():
                 p.unlink()
         trace("Clear All: reclaimed %.1f MB" % (freed / 1048576.0))
@@ -1223,6 +1514,9 @@ class H3Director2Plugin(WAN2GPPlugin):
                   % ", ".join(dropped))
         return ",".join(parts).rstrip(",")
 
+    SENT_REF_VIDEOS = 2
+    SENT_REF_AUDIO = 2
+
     def _pipeline_caps(self):
         """Read the reference caps WanGP actually ENFORCES.
 
@@ -1320,6 +1614,15 @@ class H3Director2Plugin(WAN2GPPlugin):
                 auds = caps["audio"]
             cap_src = "pipeline.py"
 
+        # What this plugin actually SENDS: video_guide + video_guide2, and one
+        # voice reference beside the song. WanGP 13.14 raised its own caps to
+        # three of each, which would light up slots whose files were then
+        # never passed on. Capped here until those are wired through.
+        if vids > self.SENT_REF_VIDEOS or auds > self.SENT_REF_AUDIO:
+            trace("ref limits: WanGP allows videos=%s audio=%s; this plugin sends up to %s/%s"
+                  % (vids, auds, self.SENT_REF_VIDEOS, self.SENT_REF_AUDIO))
+        vids = min(vids, self.SENT_REF_VIDEOS)
+        auds = min(auds, self.SENT_REF_AUDIO)
         limits = {"videos": vids, "audio": auds,
                   "max_ref_seconds": float(mdef.get("reference_video_max_frames", 15 * 24)) / 24.0,
                   "images": 1 if mdef.get("one_image_ref_only") else (caps or {}).get("images", 9),
@@ -1711,9 +2014,10 @@ class H3Director2Plugin(WAN2GPPlugin):
         try:
             import subprocess
             subprocess.run([self._ffmpeg(), "-y", "-i", str(src),
-                            "-vf", "eq=brightness=%.5f" % adj, "-an",
+                            "-map", "0:v:0", "-map", "0:a:0?",
+                            "-vf", "eq=brightness=%.5f" % adj,
                             "-c:v", "libx264", "-crf", "0", "-preset", "veryfast",
-                            "-pix_fmt", "yuv420p", str(out)],
+                            "-pix_fmt", "yuv420p", "-c:a", "copy", str(out)],
                            check=True, capture_output=True, timeout=1800)
         except Exception as exc:
             trace("could not hold the look (%s); carrying the frames as they are" % exc)
@@ -1740,9 +2044,21 @@ class H3Director2Plugin(WAN2GPPlugin):
         src = Path(src)
         n = max(1, int(frames))
         DERIVED_DIR.mkdir(parents=True, exist_ok=True)
-        out = DERIVED_DIR / ("tail_%s_%d.mp4" % (src.stem, n))
+        # "tail_a_": the carried frames bring their SOUND with them now (see
+        # renders._carry_cut); a tail cached by an older version has none.
+        out = DERIVED_DIR / ("tail_a_%s_%d.mp4" % (src.stem, n))
         if out.exists():
             return str(out)
+        # LOSSLESS picture, cut by frame index. These frames are not output --
+        # they are the context the next window or group generates from, so
+        # they decide its look, and their audio is what the model hears for
+        # them, so it decides how the sound carries on.
+        total = renders.count_frames(self._ffprobe(), src)
+        n = min(n, total)
+        renders._carry_cut(self._ffmpeg(), self._ffprobe(), src, total - n, total, fps, out)
+        trace("source tail: last %d frame(s) of %s (%d frame(s)), with its sound -> %s"
+              % (n, src.name, total, out.name))
+        return str(out)
         total = self._ffprobe_duration(src)
         start = max(0.0, total - (n / float(fps)))
         import subprocess
@@ -1832,40 +2148,71 @@ class H3Director2Plugin(WAN2GPPlugin):
         if out.exists():
             out = outdir / ("%s-%s.mp4" % (name, time.strftime("%Y%m%d-%H%M%S")))
 
-        import subprocess, tempfile
-        exe = self._ffmpeg()
-        staged = []
-        tmpdir = Path(tempfile.mkdtemp(prefix="h3d2join_"))
+        import subprocess
+        exe, probe = self._ffmpeg(), self._ffprobe()
+        # ONE pass, by frame and by sample. Each part used to be encoded to its
+        # own MP4 and the files glued with the concat demuxer; every AAC file
+        # starts with ~21 ms of encoder priming that the demuxer keeps, so the
+        # sound slid a little later at every join (three joins: ~65 ms, a
+        # frame and a half out of lip sync) and the file ran long. Here each
+        # part is cut by frame index, its audio cut to exactly the same span
+        # (padded with silence if it is short, or if it has none), and the
+        # pieces are joined as decoded picture and sound, then encoded once.
+        inputs, chains, labels = [], [], []
+        size = None
+        for i, part in enumerate(parts):
+            src, head, tail = part["path"], part["head"], part["tail"]
+            try:
+                total_f = renders.count_frames(probe, src)
+            except Exception:
+                total_f = int(round(self._ffprobe_duration(src) * fps))
+            keep_f = total_f - head - tail
+            if keep_f < 1:
+                trace("join: %s would be empty after trimming %d/%d frames - kept whole"
+                      % (os.path.basename(src), head, tail))
+                head, tail, keep_f = 0, 0, total_f
+            elif head or tail:
+                trace("join: %s trim head=%df tail=%df -> %d of %d frame(s)"
+                      % (os.path.basename(src), head, tail, keep_f, total_f))
+            try:
+                streams = renders.probe_streams(probe, src)
+            except Exception:
+                streams = []
+            vid = next((x for x in streams if x.get("codec_type") == "video"), {})
+            if size is None and vid.get("width") and vid.get("height"):
+                size = (int(vid["width"]), int(vid["height"]))
+            has_a = any(x.get("codec_type") == "audio" for x in streams)
+            inputs += ["-i", src]
+            span = keep_f / fps
+            v = ("[%d:v:0]trim=start_frame=%d:end_frame=%d,setpts=PTS-STARTPTS%s,setsar=1,"
+                 "format=yuv420p[v%d]" % (i, head, head + keep_f,
+                                         (",scale=%d:%d" % size) if size else "", i))
+            if has_a:
+                a_ = ("[%d:a:0]aresample=48000,aformat=channel_layouts=stereo,"
+                      "atrim=start=%.6f,asetpts=PTS-STARTPTS,apad,atrim=end=%.6f,"
+                      "asetpts=PTS-STARTPTS[a%d]" % (i, head / fps, span, i))
+            else:
+                a_ = ("anullsrc=r=48000:cl=stereo,atrim=end=%.6f,asetpts=PTS-STARTPTS[a%d]"
+                      % (span, i))
+            chains += [v, a_]
+            labels.append("[v%d][a%d]" % (i, i))
+        graph = ";".join(chains) + ";" + "".join(labels) + \
+            "concat=n=%d:v=1:a=1[vout][aout]" % len(parts)
+        tmp = out.with_name(out.stem + ".partial.mp4")
         try:
-            for i, part in enumerate(parts):
-                src, head, tail = part["path"], part["head"], part["tail"]
-                dur = self._ffprobe_duration(src)
-                start = head / fps
-                keep = dur - start - (tail / fps)
-                if keep <= 1.0 / fps:
-                    trace("join: %s would be empty after trimming %d/%d frames - kept whole"
-                          % (os.path.basename(src), head, tail))
-                    start, keep = 0.0, dur
-                elif head or tail:
-                    trace("join: %s trim head=%df tail=%df -> %.3fs of %.3fs"
-                          % (os.path.basename(src), head, tail, keep, dur))
-                dst = tmpdir / ("p%02d.mp4" % i)
-                cmd = [exe, "-y"]
-                if start > 0:
-                    cmd += ["-ss", "%.4f" % start]
-                cmd += ["-i", src, "-t", "%.4f" % keep,
-                        "-c:v", "libx264", "-crf", "16", "-preset", "veryfast",
-                        "-pix_fmt", "yuv420p", "-r", "%g" % fps,
-                        "-c:a", "aac", "-b:a", "192k", str(dst)]
-                subprocess.run(cmd, check=True, capture_output=True, timeout=3600)
-                staged.append(dst)
-
-            listing = tmpdir / "list.txt"
-            listing.write_text("".join("file '%s'\n" % p2.as_posix() for p2 in staged), encoding="utf-8")
-            subprocess.run([exe, "-y", "-f", "concat", "-safe", "0", "-i", str(listing),
-                            "-c", "copy", str(out)], check=True, capture_output=True, timeout=3600)
+            subprocess.run([exe, "-y", "-v", "error", *inputs, "-filter_complex", graph,
+                            "-map", "[vout]", "-map", "[aout]", "-r", "%g" % fps,
+                            "-c:v", "libx264", "-crf", "16", "-preset", "veryfast",
+                            "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k",
+                            "-movflags", "+faststart", str(tmp)],
+                           check=True, capture_output=True, timeout=7200)
+            renders.replace_retry(tmp, out)
         finally:
-            shutil.rmtree(tmpdir, ignore_errors=True)
+            if tmp.exists():
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
 
         total = self._ffprobe_duration(out)
         trace("joined %d part(s) -> %s (%.2fs)" % (len(parts), out.name, total))
@@ -2473,23 +2820,38 @@ class H3Director2Plugin(WAN2GPPlugin):
             if app and app != PLUGIN_ID:
                 raise ValueError("that project belongs to '%s', not %s" % (app, PLUGIN_ID))
 
-            for d in (MEDIA_DIR, DERIVED_DIR):
+            for d in (MEDIA_DIR, DERIVED_DIR, RENDERS_DIR, HISTORY_DIR):
                 for f in d.glob("*"):
                     if f.is_file():
                         f.unlink()
-            for p2 in (PROJECT_JSON, PROJECT_BAK):
+            for p2 in (PROJECT_JSON, PROJECT_BAK, RENDER_JSON):
                 if p2.exists():
                     p2.unlink()
             MEDIA_DIR.mkdir(parents=True, exist_ok=True)
 
-            restored = 0
+            restored = clips = 0
             for n in names:
-                if n.startswith("media/") and not n.endswith("/"):
+                if n.endswith("/"):
+                    continue
+                if n.startswith("media/"):
                     dest = MEDIA_DIR / Path(n).name
-                    dest.write_bytes(zf.read(n))
+                elif n.startswith("renders/"):
+                    # The finished groups come back too, so a project opened
+                    # on another machine can still be continued.
+                    RENDERS_DIR.mkdir(parents=True, exist_ok=True)
+                    dest = RENDERS_DIR / Path(n).name
+                    clips += 1
+                elif n == "render.json":
+                    dest = RENDER_JSON
+                else:
+                    continue
+                with zf.open(n) as fin, open(dest, "wb") as fout:
+                    shutil.copyfileobj(fin, fout, 1 << 20)   # clips are large: stream, never slurp
+                if n.startswith("media/"):
                     restored += 1
             _atomic_write_json(PROJECT_JSON, payload)
-        trace("opened %s: %d media file(s) restored" % (src.name, restored))
+        trace("opened %s: %d media file(s)%s restored"
+              % (src.name, restored, (", %d rendered clip(s)" % clips) if clips else ""))
         media, missing = self._media_manifest(payload)
         return {"ok": True, "payload": payload, "media": media, "missing": missing,
                 "fileBase": self._file_base(), "restored": restored, "name": src.stem}
@@ -2932,8 +3294,12 @@ class H3Director2Plugin(WAN2GPPlugin):
         if not st.get("image_refs"):
             vpt = vpt.replace("I", "")
         if not st.get("video_guide"):
-            for token in ("V+-U", "V-U", "GV", "DV", "V"):   # longest first
+            # longest first; V+*-U and V1-U are WanGP 13.14's three-video and
+            # excerpt modes
+            for token in ("V+*-U", "V1-U", "V+-U", "V-U", "GV", "DV", "V"):
                 vpt = vpt.replace(token, "")
+        elif not st.get("video_guide3"):
+            vpt = vpt.replace("V+*-U", "V+-U" if st.get("video_guide2") else "V-U")
         st["video_prompt_type"] = vpt
 
         apt = st.get("audio_prompt_type", "") or ""
@@ -2941,10 +3307,16 @@ class H3Director2Plugin(WAN2GPPlugin):
             apt = apt.replace("A", "").replace("K", "")
         if not st.get("audio_guide2"):
             apt = apt.replace("B", "")
+        if not st.get("audio_guide3"):
+            apt = apt.replace("D", "")
+        if "A" not in apt and "K" not in apt:
+            # "S" (keep as soundtrack) and "1" (excerpts) only qualify A or K
+            apt = apt.replace("S", "").replace("1", "")
         st["audio_prompt_type"] = apt
         if not apt:
             st.pop("audio_guide", None)
             st.pop("audio_guide2", None)
+            st.pop("audio_guide3", None)
             trace("no audio source: audio_prompt_type='' (the model will GENERATE the audio)")
 
         ipt = st.get("image_prompt_type", "") or ""
@@ -2992,6 +3364,23 @@ class H3Director2Plugin(WAN2GPPlugin):
         except Exception:
             pass
         return shutil.which("ffmpeg") or "ffmpeg"
+
+    def _ffprobe(self):
+        """ffprobe, found the way ffmpeg is: Wan2GP's own copy first, then
+        PATH, then one sitting next to the ffmpeg that was found."""
+        try:
+            from shared.utils.video_decode import resolve_media_binary
+            found = resolve_media_binary("ffprobe")
+            if found:
+                return found
+        except Exception:
+            pass
+        found = shutil.which("ffprobe")
+        if found:
+            return found
+        ff = Path(self._ffmpeg())
+        side = ff.with_name(ff.name.replace("ffmpeg", "ffprobe"))
+        return str(side) if side.is_file() else "ffprobe"
 
     # ---------------- apply to Wan2GP's generator ----------------
     def _push_settings_to_wangp(self, settings, state):
@@ -3205,7 +3594,8 @@ class H3Director2Plugin(WAN2GPPlugin):
             import gradio as _gr
             fn = getattr(_gr, "set_static_paths", None)
             if callable(fn):
-                fn(paths=[str(MEDIA_DIR)])
+                # derived/ as well: the results viewer plays previews from it.
+                fn(paths=[str(MEDIA_DIR), str(DERIVED_DIR)])
                 self._served = "/gradio_api/file="
                 trace("media served via %s%s" % (self._served, MEDIA_DIR))
         except Exception as exc:
@@ -3375,15 +3765,25 @@ class H3Director2Plugin(WAN2GPPlugin):
         """
         src = Path(src)
         DERIVED_DIR.mkdir(parents=True, exist_ok=True)
-        out = DERIVED_DIR / ("grpaud_%s_%.3f_%.3f%s"
-                           % (src.stem, float(start_sec), float(length_sec), src.suffix or ".wav"))
+        # Always WAV: the slice is PCM, and naming it after the song's own
+        # extension (.mp3, .m4a) made ffmpeg refuse the file -- the group then
+        # fell back to the whole song and the lip sync reset at every join.
+        out = DERIVED_DIR / ("grpaud_%s_%.3f_%.3f.wav"
+                             % (src.stem, float(start_sec), float(length_sec)))
         if out.exists():
             return str(out)
+        # A slice that starts before 0:00 (a regen of the first clip starting a
+        # few frames early) is padded with silence at the front, so the song
+        # still lines up with the picture.
+        pad = max(0.0, -float(start_sec))
+        start = max(0.0, float(start_sec))
+        length = max(0.01, float(length_sec) - pad)
         import subprocess
-        subprocess.run([self._ffmpeg(), "-y", "-ss", "%.4f" % float(start_sec),
-                        "-t", "%.4f" % float(length_sec), "-i", str(src),
-                        "-vn", "-c:a", "pcm_s16le", str(out)],
-                       check=True, capture_output=True, timeout=1800)
+        cmd = [self._ffmpeg(), "-y", "-ss", "%.4f" % start, "-t", "%.4f" % length, "-i", str(src), "-vn"]
+        if pad:
+            cmd += ["-af", "adelay=%d:all=1,apad" % int(round(pad * 1000)), "-t", "%.4f" % float(length_sec)]
+        cmd += ["-c:a", "pcm_s16le", str(out)]
+        subprocess.run(cmd, check=True, capture_output=True, timeout=1800)
         return str(out)
 
     def _release_model(self):
@@ -3425,7 +3825,976 @@ class H3Director2Plugin(WAN2GPPlugin):
             groups.append({"windows": cur, "frames": sum(cur), "start": start})
         return groups
 
-    def _run_groups(self, data, base, submit, frame, fps, win, ovl, window_frames, per_group):
+    # ---------------- what a grouped render has finished ----------------
+    def _group_base(self, data):
+        """What every group is cut from: the PLAN, its media, the picture-number
+        shift a single job would use, and one prompt block per window.
+
+        Work from the plan, not from assembled settings. Assembly renumbers the
+        prompt's picture numbers for a run that has the start image, the end
+        image and every injected frame. A group that does not have the start
+        image needs a different shift, so slicing the finished prompt would
+        leave every group after the first pointing at the wrong reference
+        sheets.
+        """
+        plan0 = dict(data.get("settings") or {})
+        media0 = dict(plan0.get("media") or {})
+        base_offset = plan0.get("numbering_offset")
+        if base_offset is None:
+            base_offset = int(plan0.get("injected_count") or 0) \
+                + (1 if media0.get("image_start") else 0) \
+                + (1 if media0.get("image_end") else 0)
+        base_offset = int(base_offset or 0)
+        blocks = [b for b in re.split(r"\n\s*\n", (plan0.get("prompt") or "").replace("\r\n", "\n")) if b.strip()]
+        return plan0, media0, base_offset, blocks
+
+    def _group_inputs(self, plan0, media0, base_offset, blocks, w_at, n_win, total_windows):
+        """The plan for the group covering windows [w_at, w_at + n_win).
+
+        The start image belongs to the first group and the end image to the
+        last; a middle group has neither. Each one occupies a numbered slot
+        ahead of the reference sheets, so dropping one has to drop the shift
+        with it or the prompt's picture numbers move. First and last are
+        decided by WHICH WINDOWS the group covers, so a group is the same
+        group whether it is rendered now or checked again after a crash.
+        """
+        first_group = w_at == 0
+        last_group = w_at + n_win >= total_windows
+        pg = dict(plan0)
+        media_g = dict(media0)
+        offset_g = base_offset
+        if not first_group and media_g.pop("image_start", None):
+            offset_g -= 1
+        if not last_group and media_g.pop("image_end", None):
+            offset_g -= 1
+        pg["media"] = media_g
+        pg["numbering_offset"] = max(0, offset_g)
+        pg["prompt"] = "\n\n".join(blocks[w_at:w_at + n_win])
+        return pg, offset_g
+
+    def _render_check(self, rec, data, window_frames, ovl, fps):
+        """How much of the recorded render the CURRENT plan can keep."""
+        plan0, media0, base_offset, blocks = self._group_base(data)
+        total = len(window_frames)
+
+        def hash_for(w0, n, _gi):
+            if len(blocks) != total:
+                return None           # the prompt no longer lines up with the windows
+            pg, _ = self._group_inputs(plan0, media0, base_offset, blocks, w0, n, total)
+            return renders.group_hash(pg)
+
+        cur = {"window_frames": window_frames, "overlap": ovl, "fps": fps,
+               # The run reads the seed as int(seed or -1): 0 and blank mean
+               # random there, so they must mean random here too.
+               "seed": int(plan0.get("seed") or -1),
+               "shared": renders.shared_hashes(plan0)}
+        return renders.check(rec, cur, self._frames_cached, hash_for, RENDERS_DIR)
+
+    def _frames_cached(self, path):
+        """Frame count of a master, remembered while the file is unchanged.
+        The resume card re-checks after every autosave, and counting a long
+        lossless clip means reading all of it."""
+        st = os.stat(path)
+        key = (str(path), st.st_size, st.st_mtime_ns)
+        cache = self.__dict__.setdefault("_frame_cache", {})
+        if key not in cache:
+            cache[key] = renders.count_frames(self._ffprobe(), path)
+        return cache[key]
+
+    def _render_discard(self, keep=()):
+        """Remove the render record and every master it does not keep."""
+        keep = set(keep)
+        removed = 0
+        if RENDERS_DIR.is_dir():
+            for f in RENDERS_DIR.glob("*"):
+                if f.is_file() and f.name not in keep:
+                    try:
+                        f.unlink()
+                        removed += 1
+                    except OSError as exc:
+                        trace("could not remove %s: %s" % (f.name, exc))
+        if not keep:
+            for p in (RENDER_JSON, RENDER_JSON.with_name(RENDER_JSON.name + ".tmp")):
+                if p.exists():
+                    p.unlink()
+            # and what was made from the clips for the track and the viewer
+            if DERIVED_DIR.is_dir():
+                for pat in ("preview_*", "poster_*", "tail_*"):
+                    for f in DERIVED_DIR.glob(pat):
+                        try:
+                            f.unlink()
+                        except OSError:
+                            pass
+        return removed
+
+    def _render_state(self, data):
+        """_render_state_now, with one console line whenever the answer changes
+        -- so "the results track shows nothing" can be checked against what the
+        UI was actually told."""
+        out = self._render_state_now(data)
+        summary = (out.get("has_record"), len(out.get("clips") or []), out.get("kept_groups"),
+                   out.get("resumable"), out.get("complete"), out.get("reason"),
+                   (out.get("active") or {}).get("group"))
+        if summary != getattr(self, "_render_said", None):
+            self._render_said = summary
+            if not out.get("has_record"):
+                trace("results track: no render record yet (nothing rendered in groups)")
+            else:
+                trace("results track: %d clip(s), %s kept%s%s%s"
+                      % (summary[1], summary[2], ", can be continued" if out.get("resumable") else "",
+                         ", render complete" if out.get("complete") else "",
+                         (" -- " + str(out["reason"])) if out.get("reason") else ""))
+        return out
+
+    def _render_state_now(self, data):
+        """What Continue would do right now, for the resume card.
+
+        The same check the run itself makes before it keeps anything, so what
+        the card promises is what Continue does.
+        """
+        rec = renders.load_record(RENDER_JSON, PLUGIN_ID)
+        running = bool(getattr(self, "_job", None)) or bool(getattr(self, "_groups_active", False)) or \
+            bool(getattr(self, "_stitching", False)) or \
+            (getattr(self, "_jobstate", {}) or {}).get("status") == "running"
+        out = {"has_record": bool(rec), "running": running, "resumable": False,
+               "complete": bool(rec and rec.get("status") == "complete"), "clips": [],
+               # The group being rendered right now, so the results track can
+               # show where the run has got to.
+               "active": dict(self._render_active) if running and getattr(self, "_render_active", None) else None}
+        if not rec:
+            return out
+        fps = float(data.get("fps") or (data.get("settings") or {}).get("fps") or rec.get("fps") or 24)
+        layout = self._group_layout(data)
+        rec_total = len(rec.get("window_frames") or [])
+        out.update({"recorded_groups": len(rec.get("groups") or []), "seed": rec.get("seed"),
+                    "recorded_windows": rec_total, "group_size": rec.get("group_size")})
+        out.update(self._stitch_status(rec))
+        if layout is None:
+            out["reason"] = "there is no timeline to continue"
+            out["clips"] = self._result_clips(rec, 0, {"reason": out["reason"]})
+            return out
+        wf, ovl = layout["window_frames"], layout["overlap"]
+        try:
+            res = self._render_check(rec, data, wf, ovl, fps)
+        except Exception as exc:
+            res = {"kept": [], "reason": "could not check the finished groups (%s)" % exc,
+                   "notes": [], "error": str(exc)}
+        kept = res["kept"]
+        kept_w = (kept[-1]["first_window"] + kept[-1]["n_windows"]) if kept else 0
+        out["clips"] = self._result_clips(rec, len(kept), res)
+        # Which clips' OWN inputs changed, each judged on its own -- the check
+        # above stops at the first, since for Continue everything after a
+        # change goes too; a regen only needs the ones that changed.
+        try:
+            plan0, media0, base_offset, blocks = self._group_base(data)
+            if len(blocks) == len(wf):
+                for c, g in zip(out["clips"], rec.get("groups") or []):
+                    pk, _ = self._group_inputs(plan0, media0, base_offset, blocks,
+                                               int(g["first_window"]), int(g["n_windows"]), len(wf))
+                    c["changed"] = renders.group_hash(pk) != g.get("hash")
+        except Exception as exc:
+            trace("results track: could not compare the clips one by one (%s)" % exc)
+        if kept and kept_w >= len(wf) and not res.get("error"):
+            # Every window is rendered and matches: the render is finished,
+            # even if its final join never ran (a failed join, or a reboot
+            # during it). Stitch makes the video; nothing needs rendering.
+            out["complete"] = True
+        out.update({
+            "kept_groups": len(kept), "kept_windows": kept_w, "total_windows": len(wf),
+            "kept_seconds": round(sum(wf[:kept_w]) / fps, 2),
+            "total_seconds": round(sum(wf) / fps, 2),
+            "reason": res["reason"], "notes": res["notes"], "check_error": res.get("error"),
+            "resumable": bool(kept) and kept_w < len(wf) and not out["complete"] and not running,
+        })
+        return out
+
+    def _stitch_status(self, rec):
+        """Whether the full video is out of date: never stitched, gone from
+        disk, or older than a clip on the results track (a regen replaced
+        one). The UI then says so on the Stitch button, so after a regen the
+        way to bring the full video up to date is right there."""
+        groups = (rec or {}).get("groups") or []
+        joined = str((rec or {}).get("joined") or "")
+        if not groups:
+            return {"joined": joined or None, "stitch_stale": False, "stitch_why": ""}
+        jp = Path(joined) if joined else None
+        if jp is None or not jp.is_file():
+            why = "the clips have not been stitched yet" if not joined else "the stitched video is no longer on disk"
+            return {"joined": joined or None, "stitch_stale": True, "stitch_why": why}
+        was = rec.get("joined_masters")
+        if isinstance(was, list):
+            # A regen gives a clip a new file name (its take number), so the
+            # names say exactly which clips the stitched video does not have.
+            newer = [i + 1 for i, g in enumerate(groups)
+                     if i >= len(was) or was[i] != g.get("master")]
+            if len(was) > len(groups):
+                newer = newer or [len(groups)]
+        else:
+            # A record from before this was kept: go by the files' times.
+            try:
+                jt = jp.stat().st_mtime
+                newer = [i + 1 for i, g in enumerate(groups)
+                         if (RENDERS_DIR / str(g.get("master") or "")).is_file()
+                         and (RENDERS_DIR / str(g["master"])).stat().st_mtime > jt + 1]
+            except OSError:
+                newer = []
+        if newer:
+            return {"joined": joined, "stitch_stale": True,
+                    "stitch_why": "clip%s %s changed after the last stitch"
+                                  % ("s" if len(newer) > 1 else "", ", ".join("G%d" % n for n in newer))}
+        return {"joined": joined, "stitch_stale": False, "stitch_why": ""}
+
+    def _result_clips(self, rec, n_kept, res):
+        """Every recorded group as the results track draws it.
+
+        A clip is "done" while it still matches the timeline. The first one
+        that does not is "redo", carrying the reason; the ones after it are
+        "after", because each group continues from the one before it and so
+        they would be rendered again too. When the clips could not be checked
+        at all nothing is judged: they are "unchecked".
+        """
+        clips = []
+        for i, g in enumerate(rec.get("groups") or []):
+            if res.get("error"):
+                status, why = "unchecked", res["error"]
+            elif i < n_kept:
+                status, why = "done", ""
+            elif i == n_kept:
+                status, why = "redo", res.get("reason") or ""
+            else:
+                status, why = "after", "renders again after group %d" % (n_kept + 1)
+            clips.append({
+                "group": i + 1, "first_window": g.get("first_window"),
+                "n_windows": g.get("n_windows"), "start": g.get("start"),
+                "frames": g.get("frames"), "frames_got": g.get("frames_got"),
+                "master": g.get("master"), "bytes": g.get("bytes"),
+                "seed": g.get("seed", rec.get("seed")), "finished": g.get("finished"),
+                "take": int(g.get("take") or 1), "status": status, "why": why,
+                # the windows inside it, so the track can show where it splits
+                "windows": [int(x) for x in g.get("windows") or []],
+            })
+        return clips
+
+    def _render_split(self, data):
+        """Cut one finished clip into one clip per window, losslessly.
+
+        A group of four windows that is good except for one can then have
+        just that one rendered again. Every piece is the exact frames and
+        sound it already had (FFV1 and PCM, cut by frame index), so the
+        results track, the stitched video and Continue are all unchanged by
+        it -- there are simply more, smaller clips.
+
+        Only a clip that still matches the timeline can be split: each
+        piece's check against the timeline is worked out from the timeline
+        as it is now, which is only true of every piece if it is true of the
+        whole clip. Split first, then change the part you want to redo.
+        """
+        if getattr(self, "_groups_active", False) or getattr(self, "_job", None) \
+                or getattr(self, "_stitching", False):
+            raise ValueError("a render or stitch is running - split once it has finished")
+        rec = renders.load_record(RENDER_JSON, PLUGIN_ID)
+        groups = (rec or {}).get("groups") or []
+        gi = int(data.get("group") or 0) - 1
+        if not (0 <= gi < len(groups)):
+            raise ValueError("there is no clip G%s" % data.get("group"))
+        g = groups[gi]
+        n = int(g.get("n_windows") or 0)
+        if n < 2:
+            raise ValueError("G%d is already a single window" % (gi + 1))
+        layout = self._group_layout(data)
+        if layout is None:
+            raise ValueError("there is no timeline to split against")
+        wf = [int(x) for x in layout["window_frames"]]
+        w0 = int(g["first_window"])
+        if wf[w0:w0 + n] != [int(x) for x in g.get("windows") or []]:
+            raise ValueError("the windows under G%d were changed on the timeline since it was "
+                             "rendered, so where its parts begin and end is no longer known" % (gi + 1))
+        plan0, media0, base_offset, blocks = self._group_base(data)
+        if len(blocks) != len(wf):
+            raise ValueError("the prompt no longer lines up with the windows")
+
+        def hash_for(k, m):
+            pg, _ = self._group_inputs(plan0, media0, base_offset, blocks, k, m, len(wf))
+            return renders.group_hash(pg)
+
+        if hash_for(w0, n) != g.get("hash"):
+            raise ValueError("G%d's prompt or media changed since it was rendered. Split it before "
+                             "changing the part you want to redo (undo the change, split, then "
+                             "change it again)" % (gi + 1))
+        src = RENDERS_DIR / str(g["master"])
+        if not src.is_file():
+            raise ValueError("G%d's clip is missing from the workspace" % (gi + 1))
+        fps = float(rec.get("fps") or data.get("fps") or 24)
+        start, got = int(g["start"]), int(g["frames_got"])
+        # where each window begins on the timeline, as frames into this clip
+        cuts = [sum(wf[:k]) - start for k in range(w0 + 1, w0 + n)]
+        edges = [0] + cuts + [got]
+        if any(b <= a for a, b in zip(edges, edges[1:])):
+            raise ValueError("G%d's windows do not fall inside its clip (%s)" % (gi + 1, edges))
+        ff, fp = self._ffmpeg(), self._ffprobe()
+        take = int(g.get("take") or 1)
+        pieces, made = [], []
+        try:
+            for j in range(n):
+                k = w0 + j
+                name = "group_w%03d-%03d_t%d.mkv" % (k + 1, k + 1, take)
+                while (RENDERS_DIR / name).exists():
+                    name = name[:-4] + "s.mkv"
+                dst = RENDERS_DIR / name
+                count = edges[j + 1] - edges[j]
+                wrote = renders.make_master(ff, fp, src, dst, edges[j], count, fps)
+                made.append(dst)
+                if wrote != count:
+                    raise ValueError("part %d of G%d came out %d frame(s), not %d" % (j + 1, gi + 1, wrote, count))
+                piece = dict(g)
+                piece.update({
+                    "first_window": k, "n_windows": 1, "windows": [wf[k]],
+                    "start": start + edges[j], "frames": wf[k], "frames_got": count,
+                    "master": name, "bytes": dst.stat().st_size, "sha256": renders.file_sha256(dst),
+                    "hash": hash_for(k, 1), "split_from": g["master"],
+                })
+                pieces.append(piece)
+        except Exception:
+            for f in made:
+                try:
+                    f.unlink()
+                except OSError:
+                    pass
+            raise
+        fresh = renders.load_record(RENDER_JSON, PLUGIN_ID) or rec
+        fg = fresh.get("groups") or []
+        if gi >= len(fg) or fg[gi].get("master") != g["master"]:
+            for f in made:
+                try:
+                    f.unlink()
+                except OSError:
+                    pass
+            raise ValueError("the results track changed while splitting; try again")
+        fg[gi:gi + 1] = pieces
+        # The stitched video is the same frames: it stays up to date.
+        was = fresh.get("joined_masters")
+        if isinstance(was, list) and g["master"] in was:
+            i = was.index(g["master"])
+            was[i:i + 1] = [pc["master"] for pc in pieces]
+        renders.write_record(RENDER_JSON, fresh)
+        try:
+            src.unlink()
+        except OSError as exc:
+            trace("split: could not remove %s (%s)" % (src.name, exc))
+        for pat in ("preview_%s_*" % src.stem, "poster_%s_*" % src.stem):
+            for f in DERIVED_DIR.glob(pat):
+                try:
+                    f.unlink()
+                except OSError:
+                    pass
+        self._render_rev = getattr(self, "_render_rev", 0) + 1
+        trace("split G%d (%s) into %d clip(s): %s" % (gi + 1, g["master"], n,
+                                                     ", ".join(pc["master"] for pc in pieces)))
+        return {"ok": True, "group": gi + 1, "pieces": n,
+                "masters": [pc["master"] for pc in pieces]}
+
+    def _render_poster(self, data):
+        """A small filmstrip -- first, middle and last frame -- of one finished
+        group, for its block on the results track. Cached beside the other
+        working files and handed back inline: the UI runs in a sandboxed frame
+        that cannot count on reaching the workspace by URL."""
+        name = Path(str(data.get("master") or "")).name
+        master = RENDERS_DIR / name
+        if not name or not master.is_file():
+            raise ValueError("no such rendered clip: %s" % name)
+        size = master.stat().st_size
+        DERIVED_DIR.mkdir(parents=True, exist_ok=True)
+        out = DERIVED_DIR / ("poster_%s_%d.jpg" % (master.stem, size))
+        if not out.is_file():
+            import subprocess
+            n = max(1, self._frames_cached(master))
+            pick = sorted({0, n // 2, n - 1})
+            sel = "+".join("eq(n\\,%d)" % k for k in pick)
+            subprocess.run([self._ffmpeg(), "-y", "-v", "error", "-i", str(master),
+                            "-vf", "select='%s',scale=-2:64,tile=%dx1" % (sel, len(pick)),
+                            "-frames:v", "1", "-q:v", "4", str(out)],
+                           check=True, capture_output=True, timeout=300)
+        return {"master": name, "bytes": size,
+                "data": "data:image/jpeg;base64," + base64.b64encode(out.read_bytes()).decode("ascii")}
+
+    def _make_preview(self, master):
+        """A browser-playable copy of one finished group, for the viewer only.
+
+        The masters are lossless FFV1, which no browser plays. This is ordinary
+        H.264 + AAC, cut from the master so it is exactly the same frames and
+        the same length -- clips play back to back with nothing to trim. It is
+        never used for generation: regens, Continue and the stitch all read the
+        master. Named by the master's size, so a re-rendered group gets a new
+        preview and a stale one is never shown."""
+        master = Path(master)
+        size = master.stat().st_size
+        DERIVED_DIR.mkdir(parents=True, exist_ok=True)
+        out = DERIVED_DIR / ("preview_%s_%d.mp4" % (master.stem, size))
+        if out.is_file() and out.stat().st_size > 0:
+            return out
+        import subprocess
+        tmp = out.with_name(out.stem + ".partial.mp4")
+        streams = renders.probe_streams(self._ffprobe(), master)
+        cmd = [self._ffmpeg(), "-y", "-v", "error", "-i", str(master), "-map", "0:v:0",
+               "-c:v", "libx264", "-crf", "20", "-preset", "veryfast", "-pix_fmt", "yuv420p"]
+        if any(st.get("codec_type") == "audio" for st in streams):
+            cmd += ["-map", "0:a:0", "-c:a", "aac", "-b:a", "192k"]
+        cmd += ["-movflags", "+faststart", str(tmp)]
+        try:
+            subprocess.run(cmd, check=True, capture_output=True, timeout=1800)
+            renders.replace_retry(tmp, out)
+        finally:
+            if tmp.exists():
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
+        return out
+
+    def _stitch(self, data):
+        """Join every finished clip into one video, from the lossless clips.
+
+        The clips are already cut to their slots, so they are joined end to end
+        with nothing trimmed, and encoded once. Written beside the render's
+        earlier joined video (or into the chosen folder), never into the
+        workspace, which a fresh render clears."""
+        if getattr(self, "_groups_active", False) or getattr(self, "_job", None):
+            raise ValueError("a render is running - stitch once it has finished")
+        rec = renders.load_record(RENDER_JSON, PLUGIN_ID)
+        groups = (rec or {}).get("groups") or []
+        if not groups:
+            raise ValueError("there are no rendered clips to stitch")
+        self._stitching = True
+        try:
+            return self._stitch_now(data, rec, groups)
+        finally:
+            self._stitching = False
+
+    def _stitch_now(self, data, rec, groups):
+        missing = [g["master"] for g in groups if not (RENDERS_DIR / g["master"]).is_file()]
+        if missing:
+            raise ValueError("clip(s) missing from the workspace: %s" % ", ".join(missing))
+        fps = float(rec.get("fps") or 24)
+        covered = int(groups[-1]["start"]) + int(groups[-1]["frames_got"])
+        planned = sum(int(x) for x in rec.get("window_frames") or [])
+        out_dir = str(data.get("dir") or "").strip()
+        if not out_dir and rec.get("joined") and Path(str(rec["joined"])).parent.is_dir():
+            out_dir = str(Path(str(rec["joined"])).parent)
+        out_dir = out_dir or str(PLUGIN_DIR / "projects")
+        name = "%s-full-%s" % (str(data.get("name") or "h3-director"), time.strftime("%Y%m%d-%H%M%S"))
+        if len(groups) == 1:
+            import subprocess
+            Path(out_dir).mkdir(parents=True, exist_ok=True)
+            out = Path(out_dir) / (name + ".mp4")
+            subprocess.run([self._ffmpeg(), "-y", "-v", "error", "-i", str(RENDERS_DIR / groups[0]["master"]),
+                            "-c:v", "libx264", "-crf", "16", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+                            "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", str(out)],
+                           check=True, capture_output=True, timeout=7200)
+            path = str(out)
+        else:
+            path = self._join_videos({
+                "parts": [{"path": str(RENDERS_DIR / g["master"]), "trim_start_frames": 0,
+                           "trim_end_frames": 0} for g in groups],
+                "fps": fps, "dir": out_dir, "name": name})["path"]
+        # Read the record again before writing it: it is the only writer here,
+        # but the stitch took minutes, and writing back the copy read at the
+        # start could undo anything recorded meanwhile.
+        fresh = renders.load_record(RENDER_JSON, PLUGIN_ID) or rec
+        fresh["joined"] = path
+        # what was stitched: the results track can then tell when a regen
+        # has made the full video out of date
+        fresh["joined_masters"] = [g["master"] for g in groups]
+        renders.write_record(RENDER_JSON, fresh)
+        self._render_rev = getattr(self, "_render_rev", 0) + 1
+        trace("stitched %d clip(s) -> %s (%d of %d frames covered)" % (len(groups), path, covered, planned))
+        return {"ok": True, "path": path, "clips": len(groups), "frames": covered, "planned": planned,
+                "complete": covered >= planned}
+
+    def _render_preview(self, data):
+        """Where the viewer can play one finished group from."""
+        name = Path(str(data.get("master") or "")).name
+        master = RENDERS_DIR / name
+        if not name or not master.is_file():
+            raise ValueError("no such rendered clip: %s" % name)
+        prev = self._make_preview(master)
+        out = {"master": name, "file": str(prev), "fileBase": self._file_base(),
+               "bytes": prev.stat().st_size, "mime": "video/mp4"}
+        if data.get("b64"):
+            # When the served URL cannot be reached, the bytes come through the
+            # bridge instead. Previews are small; refuse anything that is not.
+            # Never while a render runs: the page that carries these bytes also
+            # carries the render's updates and WanGP's queue trigger.
+            if getattr(self, "_groups_active", False) or getattr(self, "_job", None):
+                raise ValueError("the preview can be sent once the render has finished")
+            if prev.stat().st_size > 48 * 1024 * 1024:
+                raise ValueError("preview of %s is too large to send inline" % name)
+            out["b64"] = base64.b64encode(prev.read_bytes()).decode("ascii")
+        return out
+
+    def _group_layout(self, data):
+        """The windows the timeline renders in, decided exactly as Generate
+        decides them. Returns None when there is no timeline length."""
+        plan = data.get("settings") or {}
+        target = int(data.get("target_frames") or 0)
+        if not target:
+            return None
+        win = int(plan.get("sliding_window_size") or self._grid["WINDOW_DEFAULT"])
+        ovl = int(plan.get("sliding_window_overlap") or self._grid["OVERLAP_DEFAULT"])
+        tagged = bool(self._DURATION_TAG.search(str(plan.get("prompt") or "")))
+        return {"window_frames": self._plan_window_frames(plan, target, win, ovl, tagged),
+                "overlap": ovl, "window": win}
+
+    def _plan_window_frames(self, plan, target, win, ovl, tagged):
+        hand = [int(x) for x in (plan.get("window_frames") or []) if int(x) > 0] \
+            if plan.get("manual_windows") else []
+        if hand:
+            # Exactly the timeline, as the UI draws it: the last window takes
+            # up any difference (dropped only if nothing is left of it). A
+            # shortfall otherwise became an extra window at the end.
+            want = int(target) if target else sum(hand)
+            diff = want - sum(hand)
+            if diff > 0:
+                hand[-1] += diff
+            while diff < 0 and hand:
+                if -diff <= hand[-1] - 1 or len(hand) == 1:
+                    hand[-1] = max(1, hand[-1] + diff)
+                    break
+                diff += hand.pop()
+            return hand
+        if tagged:
+            # The prompt carries /duration tags, so the SCHEDULER decides the
+            # windows -- one per prompt block -- and the default plan does not
+            # apply. Splitting on the default plan gave 22 windows for a
+            # 20-block prompt, the block count stopped matching, and every
+            # group was handed the WHOLE prompt: six groups each rendering all
+            # 20 windows.
+            return plan_duration_frames(int(target), win, ovl, self._grid)[1]
+        return [w["output_frames"] for w in
+                _real_plan_windows(int(target), win, ovl, self._grid)]
+
+    # ---------------- regenerating marked clips ----------------
+    def _regen_request(self, durs, carry, target):
+        """Declared window durations whose REAL output is the smallest amount
+        that is at least `target` new frames, and that amount.
+
+        Wan2GP moves every window onto the model's frame grid, so a stretch
+        asked for exactly its slot comes back a few frames off. Only the last
+        window is lengthened; the prediction is the same arithmetic Wan2GP
+        uses (the mirror the window planner already relies on), and the run
+        checks the real length against it afterwards."""
+        win = int(self._grid.get("WINDOW_MAX", 481))
+        ovl = int(carry) if carry else int(self._grid.get("OVERLAP_DEFAULT", 18))
+        base = [int(d) for d in durs]
+        base[-1] += int(target) - sum(base)
+        base[-1] = max(1, base[-1])
+        for extra in range(0, 80):
+            d = list(base)
+            d[-1] += extra
+            outs = _scheduler_outputs(([ovl] + d) if carry else d, win, ovl, self._grid)
+            outs = outs[1:] if carry else outs
+            if sum(outs) >= target:
+                return d, sum(outs)
+        raise ValueError("no request lands on the frame grid for %d frame(s)" % target)
+
+    def _submit_and_wait(self, submit, st, frame, label, progress_base, total_windows, n_win):
+        """Submit one job and drain it, yielding progress. Returns the files."""
+        try:
+            job = submit(st)
+        except Exception as exc:
+            raise RuntimeError("%s: submit failed: %s" % (label, exc))
+        self._job = job
+        self._reset_job_state(status="running", started=time.time(), windows=n_win)
+        self._stream_owner = id(job)
+        self._start_background_drain(job)
+        watch = _AdmissionWatch(self, job, label)
+        notes = []
+        last = 0.0
+        while not getattr(job, "done", False):
+            stream = getattr(job, "events", None)
+            if stream is not None:
+                try:
+                    ev = stream.get(timeout=0.25)
+                    while ev is not None:
+                        watch.saw(ev)
+                        self._absorb_event(ev)
+                        try:
+                            ev = stream.get_nowait()
+                        except Exception:
+                            ev = None
+                except Exception:
+                    pass
+            else:
+                time.sleep(0.25)
+            note = watch.tick()
+            if note:
+                notes.append({"level": "warn", "msg": note})
+            now = time.time()
+            if now - last >= 1.0:
+                last = now
+                js = getattr(self, "_jobstate", {}) or {}
+                inner = float(js.get("progress") or 0)
+                out, notes[:] = list(notes), []
+                yield frame("running", (progress_base + inner * n_win) / max(1, total_windows),
+                            progress_base, total_windows, out or None,
+                            phase=str(js.get("phase") or ""),
+                            detail="%s%s" % (label, (" · " + str(js.get("detail"))) if js.get("detail") else ""))
+        self._stream_owner = None
+        result = job.result()
+        self._job = None
+        if getattr(result, "cancelled", False):
+            raise KeyboardInterrupt("cancelled")
+        if not getattr(result, "success", False):
+            errs = getattr(result, "errors", None) or ["no output"]
+            raise RuntimeError("%s: %s" % (label, "; ".join(str(e) for e in errs)))
+        made = [str(f) for f in (getattr(result, "generated_files", None) or [])]
+        if not made:
+            raise RuntimeError("%s produced no file" % label)
+        return made
+
+    def _regen_guarded(self, *args, **kwargs):
+        self._groups_active = True
+        try:
+            yield from self._run_regen(*args, **kwargs)
+        finally:
+            self._groups_active = False
+            self._render_active = None
+            self._render_rev = getattr(self, "_render_rev", 0) + 1
+
+    def _run_regen(self, data, submit, frame, fps, window_frames, marked, seed_mode):
+        """Render the marked clips again, in place, joining both neighbours.
+
+        Marked clips next to each other are one STRETCH, rendered as one job.
+        Each stretch continues from the clip before it -- the same carried
+        frames a normal render uses -- and is pinned to land on the first frame
+        of the clip after it, one frame long so that landing frame can be cut
+        off and nothing repeats at the join.
+
+        Wan2GP rounds lengths to the model's frame grid, so the request is
+        worked out first to come back a known number of frames r longer than
+        the stretch. The stretch then starts r frames early and the clip before
+        it is trimmed by r: both joins stay continuous and nothing moves out
+        of sync. If Wan2GP returns anything but the predicted length, the old
+        clips are kept.
+
+        New clips REPLACE the old ones only once they are cut, checked and on
+        disk; a failed stretch leaves its clips exactly as they were.
+        """
+        rec = renders.load_record(RENDER_JSON, PLUGIN_ID)
+        if not rec or not rec.get("groups"):
+            yield frame("error", error="There are no rendered clips to regenerate.")
+            return
+        groups = rec["groups"]
+        ovl = int(rec.get("overlap") or 0)
+        if abs(float(rec.get("fps") or fps) - fps) > 1e-6:
+            yield frame("error", error="The frame rate changed since the clips were rendered; regen needs the same.")
+            return
+        # The windows under every clip must still be where they were: a regen
+        # replaces clips IN PLACE, between neighbours that are not re-rendered.
+        wf = [int(x) for x in window_frames]
+        for gi, g in enumerate(groups):
+            w0, n = int(g["first_window"]), int(g["n_windows"])
+            if wf[w0:w0 + n] != [int(x) for x in g["windows"]]:
+                yield frame("error", error="The windows under group %d were changed on the timeline, so its "
+                                           "clips cannot be replaced in place. Render again instead." % (gi + 1))
+                return
+            if not (RENDERS_DIR / str(g.get("master") or "")).is_file():
+                yield frame("error", error="Group %d's clip is missing from the workspace." % (gi + 1))
+                return
+        # The clips on either side stay as they are, so the regen has to be made
+        # the way they were: a different resolution, model or step count would
+        # not join, and the record would stop matching every other clip.
+        plan_now = dict(data.get("settings") or {})
+        was, now = rec.get("shared") or {}, renders.shared_hashes(plan_now)
+        changed = sorted(k for k in set(was) | set(now) if was.get(k) != now.get(k))
+        if changed:
+            yield frame("error", error="Regen needs the settings the other clips were made with, and these changed: "
+                                       "%s. Put them back to regenerate, or render again." % ", ".join(changed[:8]))
+            return
+        for f in list(DERIVED_DIR.glob("tail_*")) + list(DERIVED_DIR.glob("grpaud_*")):
+            try:
+                f.unlink()
+            except OSError:
+                pass
+        idx = sorted({int(m) - 1 for m in marked if 1 <= int(m) <= len(groups)})
+        if not idx:
+            yield frame("error", error="None of the marked clips exist.")
+            return
+        runs = renders.stretches(idx)
+
+        plan0, media0, base_offset, blocks = self._group_base(data)
+        if len(blocks) != len(wf):
+            yield frame("error", error="The prompt has %d block(s) but the timeline plans %d window(s)."
+                                       % (len(blocks), len(wf)))
+            return
+        # ALWAYS the render's own seed. The clips around the regen were made
+        # on it; a different seed changes the look and motion, and the new
+        # clip stops matching its neighbours. (The continuation already makes
+        # the new take different -- that is what a regen is for.) An explicit
+        # number is honoured only when one is sent on purpose.
+        if isinstance(seed_mode, int) or (isinstance(seed_mode, str) and seed_mode.isdigit()):
+            seed = int(seed_mode)
+        else:
+            seed = int(rec.get("seed") or 0)
+        trace("regen: %d clip(s) in %d stretch(es), seed %d%s"
+              % (len(idx), len(runs), seed, " (the render's own)" if seed == int(rec.get("seed") or 0) else ""))
+        total_windows = sum(int(groups[i]["n_windows"]) for i in idx)
+        done_w = 0
+        replaced, failed = [], []
+        ff, fp = self._ffmpeg(), self._ffprobe()
+        yield frame("running", 0.0, 0, total_windows,
+                    [{"level": "info", "msg": "Regenerating group(s) %s on seed %d"
+                      % (", ".join(str(i + 1) for i in idx), seed)}])
+
+        for run in runs:
+            a, b = run[0], run[-1]
+            label = "group %d" % (a + 1) if a == b else "groups %d-%d" % (a + 1, b + 1)
+            prev = groups[a - 1] if a > 0 else None
+            nxt = groups[b + 1] if b + 1 < len(groups) else None
+            S = int(groups[a]["start"])
+            last = groups[b]
+            # Where the stretch ends: the next clip's start, or -- at the end --
+            # the end of the last clip as it is (it may start a few frames
+            # early to keep a pinned end image).
+            E = int(nxt["start"]) if nxt else int(last["start"]) + int(last["frames_got"])
+            w0 = int(groups[a]["first_window"])
+            n_win = sum(int(groups[k]["n_windows"]) for k in run)
+            carry = ovl if prev else 0
+            pg0, _ = self._group_inputs(plan0, media0, base_offset, blocks, w0, n_win, len(wf))
+            has_start = a == 0 and bool((pg0.get("media") or {}).get("image_start"))
+            has_end = (not nxt) and bool((pg0.get("media") or {}).get("image_end"))
+            target = (E - S) + (1 if nxt else 0)       # + the landing frame
+            try:
+                durs, total = self._regen_request(wf[w0:w0 + n_win], carry, target)
+                r = total - target
+                # Where the r extra frames go. Never off a pinned frame: the
+                # start image is the first frame of the piece, the end image
+                # the last, the landing frame the first of the next clip.
+                shift = shift_next = extend_end = 0
+                if r and prev and (nxt or has_end):
+                    shift = r                  # start early; the clip before gives up r frames
+                elif r and nxt and has_start:
+                    shift_next = r             # land later; the clip after gives up r frames
+                elif r and has_end:
+                    extend_end = r             # nothing either side: the piece ends r frames later
+                # (otherwise the extra frames are at an open end and simply cut)
+                if shift and int(prev["frames_got"]) - shift <= carry:
+                    raise ValueError("the clip before is too short to give up %d frame(s)" % shift)
+                if shift_next and int(nxt["frames_got"]) - shift_next <= ovl:
+                    raise ValueError("the clip after is too short to give up %d frame(s)" % shift_next)
+                trace("regen %s: slot %d..%d (%d frame(s)), carry %d, landing %s, request %s -> %d new "
+                      "frame(s), %d over%s"
+                      % (label, S, E, E - S, carry, "yes" if nxt else "no", durs, total, r,
+                         (", starting %d frame(s) early" % shift) if shift else ""))
+
+                # the plan for the stretch: its own prompt blocks with the
+                # worked-out durations, its media, and the landing frame
+                pg, _off = self._group_inputs(plan0, media0, base_offset, blocks, w0, n_win, len(wf))
+                own = [self._DURATION_TAG.sub("", blocks[w0 + i], count=1).strip() for i in range(n_win)]
+                pg["prompt"] = "\n\n".join("[/duration=%.4fs] %s" % (d / fps, t) for d, t in zip(durs, own))
+                if nxt:
+                    land = renders.first_frame_png(
+                        ff, RENDERS_DIR / nxt["master"],
+                        DERIVED_DIR / ("land_%s_%d.png" % (Path(nxt["master"]).stem, shift_next)),
+                        index=shift_next)
+                    media_g = dict(pg.get("media") or {})
+                    if not media_g.get("image_end"):
+                        pg["numbering_offset"] = int(pg.get("numbering_offset") or 0) + 1
+                    media_g["image_end"] = land
+                    pg["media"] = media_g
+                st = self._normalize_audio_guide(self._assemble_settings(pg))
+                st["seed"] = seed
+
+                # timeline frame of output frame 0, worked back from whatever
+                # is pinned at the end: the landing frame (at E, or r later
+                # when the clip after gives up r), the end image (the piece's
+                # last frame), or -- with nothing pinned -- the carried frames
+                if nxt:
+                    t0 = (E + shift_next) - (carry + total - 1)
+                elif has_end:
+                    t0 = (E - 1 + extend_end) - (carry + total - 1)
+                else:
+                    t0 = S - carry
+                song = st.get("audio_guide")
+                if song and os.path.isfile(str(song)):
+                    st["audio_guide"] = self._audio_slice(song, t0 / fps, (carry + total) / fps)
+                if prev:
+                    tail = renders.master_frames_at(
+                        ff, fp, RENDERS_DIR / prev["master"], carry, shift, fps,
+                        DERIVED_DIR / ("tail_a_regen_%s_%d_%d.mp4" % (Path(prev["master"]).stem, carry, shift)))
+                    st["video_source"] = tail
+                    st["keep_frames_video_source"] = ""
+                    ipt = st.get("image_prompt_type", "") or ""
+                    if "V" not in ipt:
+                        st["image_prompt_type"] = ipt + "V"
+                    st.pop("image_start", None)
+                st["video_length"] = carry + total
+                st = self._strip_unsatisfied(st)
+                self._log_prompt("REGEN %s" % label.upper(), st)
+                self._render_active = {"group": a + 1, "first_window": w0, "n_windows": n_win,
+                                       "start": S - shift, "frames": E - (S - shift)}
+                self._render_rev = getattr(self, "_render_rev", 0) + 1
+
+                made = yield from self._submit_and_wait(
+                    submit, st, frame, "Regen %s" % label, done_w, total_windows, n_win)
+                raw = made[-1]
+                got = renders.count_frames(fp, raw)
+                want = carry + total
+                if got != want:
+                    raise ValueError("Wan2GP returned %d frame(s), not the %d worked out for it"
+                                     % (got, want))
+                # output frame i is timeline frame t0 + i; the landing frame is
+                # the last one and is not kept
+                cuts = []
+                for k in run:
+                    s_k = (S - shift) if k == a else int(groups[k]["start"])
+                    e_k = int(groups[k + 1]["start"]) if k < b else E + shift_next + extend_end
+                    take = int(groups[k].get("take") or 1) + 1
+                    name = "group_w%03d-%03d_t%d.mkv" % (int(groups[k]["first_window"]) + 1,
+                                                         int(groups[k]["first_window"]) + int(groups[k]["n_windows"]),
+                                                         take)
+                    tmp = RENDERS_DIR / (name + ".new")
+                    n_k = renders.make_master(ff, fp, raw, tmp, s_k - t0, e_k - s_k, fps)
+                    if n_k != e_k - s_k:
+                        raise ValueError("the new clip for group %d came out %d frame(s), not %d"
+                                         % (k + 1, n_k, e_k - s_k))
+                    cuts.append((k, tmp, name, s_k, n_k, take))
+                prev_cut = None
+                if shift:
+                    ptake = int(prev.get("take") or 1) + 1
+                    pname = "group_w%03d-%03d_t%d.mkv" % (int(prev["first_window"]) + 1,
+                                                          int(prev["first_window"]) + int(prev["n_windows"]), ptake)
+                    ptmp = RENDERS_DIR / (pname + ".new")
+                    keep = int(prev["frames_got"]) - shift
+                    if renders.make_master(ff, fp, RENDERS_DIR / prev["master"], ptmp, 0, keep, fps) != keep:
+                        raise ValueError("could not trim the clip before")
+                    prev_cut = (ptmp, pname, keep, ptake)
+                next_cut = None
+                if shift_next:
+                    ntake = int(nxt.get("take") or 1) + 1
+                    nname = "group_w%03d-%03d_t%d.mkv" % (int(nxt["first_window"]) + 1,
+                                                          int(nxt["first_window"]) + int(nxt["n_windows"]), ntake)
+                    ntmp = RENDERS_DIR / (nname + ".new")
+                    keep = int(nxt["frames_got"]) - shift_next
+                    if renders.make_master(ff, fp, RENDERS_DIR / nxt["master"], ntmp, shift_next, keep, fps) != keep:
+                        raise ValueError("could not trim the clip after")
+                    next_cut = (ntmp, nname, keep, ntake)
+            except KeyboardInterrupt:
+                yield frame("cancelled", done_w / max(1, total_windows), done_w, total_windows,
+                            logs=[{"level": "info", "msg": "Regen cancelled; %s kept as it was." % label}])
+                return
+            except Exception as exc:
+                failed.append("%s (%s)" % (label, exc))
+                trace("regen %s FAILED, old clip(s) kept: %s" % (label, exc))
+                for f in RENDERS_DIR.glob("*.new"):
+                    try:
+                        f.unlink()
+                    except OSError:
+                        pass
+                yield frame("running", done_w / max(1, total_windows), done_w, total_windows,
+                            [{"level": "err", "msg": "Regen %s failed, old clip kept: %s" % (label, exc)}])
+                done_w += n_win
+                continue
+
+            # ---- commit: new files in place, then the record, then cleanup ----
+            # The record is rewritten only after every new file is in place,
+            # and the old files removed only after that: a crash anywhere in
+            # here leaves the record naming files that exist.
+            try:
+                old_files = self._regen_commit(rec, groups, cuts, prev, prev_cut, nxt, next_cut,
+                                               plan0, media0, base_offset, blocks, wf, seed, raw)
+            except Exception as exc:
+                failed.append("%s (saving it failed: %s)" % (label, exc))
+                trace("regen %s: could not save the result (%s); the record still names the old clips"
+                      % (label, exc))
+                yield frame("running", done_w / max(1, total_windows), done_w, total_windows,
+                            [{"level": "err", "msg": "Regen %s could not be saved: %s" % (label, exc)}])
+                done_w += n_win
+                continue
+            self._render_rev = getattr(self, "_render_rev", 0) + 1
+            for old in old_files:
+                try:
+                    (RENDERS_DIR / old).unlink()
+                except OSError:
+                    pass
+            for k, _tmp, name, *_ in cuts:
+                try:
+                    self._make_preview(RENDERS_DIR / name)
+                except Exception as exc:
+                    trace("regen: preview for %s not made yet (%s)" % (name, exc))
+            replaced.append(label)
+            done_w += n_win
+            how = ""
+            if shift:
+                how = " (started %d frame(s) early to land on the next clip)" % shift
+            elif shift_next:
+                how = " (landed %d frame(s) into the next clip, keeping the start image)" % shift_next
+            elif extend_end:
+                how = " (the piece now ends %d frame(s) later, keeping the end image)" % extend_end
+            yield frame("running", done_w / max(1, total_windows), done_w, total_windows,
+                        [{"level": "ok", "msg": "Regenerated %s%s" % (label, how)}])
+
+        self._release_model()
+        msg = "Regenerated %s." % ", ".join(replaced) if replaced else "Nothing was replaced."
+        if failed:
+            msg += " Kept the old clips for: %s." % "; ".join(failed)
+        yield frame("done" if replaced else "error", 1.0, total_windows, total_windows,
+                    logs=[{"level": "ok" if not failed else "warn", "msg": msg}],
+                    error="" if replaced else msg)
+
+    def _regen_commit(self, rec, groups, cuts, prev, prev_cut, nxt, next_cut,
+                      plan0, media0, base_offset, blocks, wf, seed, raw):
+        """Put a finished regen in place: new files first, record second.
+        Returns the old files, to be removed once the record no longer names
+        them."""
+        old_files = []
+        for k, tmp, name, s_k, n_k, take in cuts:
+            final = RENDERS_DIR / name
+            renders.replace_retry(tmp, final)
+            g = groups[k]
+            old_files.append(g["master"])
+            pk, _ = self._group_inputs(plan0, media0, base_offset, blocks,
+                                       int(g["first_window"]), int(g["n_windows"]), len(wf))
+            g.update({"start": s_k, "frames_got": n_k, "master": name,
+                      "bytes": final.stat().st_size, "sha256": renders.file_sha256(final),
+                      "hash": renders.group_hash(pk), "seed": seed, "take": take,
+                      "source": os.path.basename(raw), "regen": True,
+                      "finished": time.strftime("%Y-%m-%d %H:%M:%S")})
+        if prev_cut:
+            ptmp, pname, keep, ptake = prev_cut
+            final = RENDERS_DIR / pname
+            renders.replace_retry(ptmp, final)
+            old_files.append(prev["master"])
+            prev.update({"frames_got": keep, "master": pname, "bytes": final.stat().st_size,
+                         "sha256": renders.file_sha256(final), "take": ptake})
+        if next_cut:
+            ntmp, nname, keep, ntake = next_cut
+            final = RENDERS_DIR / nname
+            renders.replace_retry(ntmp, final)
+            old_files.append(nxt["master"])
+            nxt.update({"start": int(nxt["start"]) + (int(nxt["frames_got"]) - keep), "frames_got": keep,
+                        "master": nname, "bytes": final.stat().st_size,
+                        "sha256": renders.file_sha256(final), "take": ntake})
+        renders.write_record(RENDER_JSON, rec)
+        return old_files
+
+    def _groups_guarded(self, *args, **kwargs):
+        """Run the groups with the run marked active from first to last.
+
+        A Wan2GP job is only attached while a group renders; between groups
+        -- writing a master, hashing it, cutting the next tail -- there is
+        none. Without this, a page reload in that gap would be told nothing
+        is running and offer Continue alongside the run still going.
+        """
+        self._groups_active = True
+        try:
+            yield from self._run_groups(*args, **kwargs)
+        finally:
+            self._groups_active = False
+            self._render_active = None
+            self._render_rev = getattr(self, "_render_rev", 0) + 1
+
+    def _run_groups(self, data, base, submit, frame, fps, win, ovl, window_frames, per_group,
+                    resume=False):
         """Render the timeline as several jobs, then join them.
 
         Each group is one Wan2GP job covering `per_group` sliding windows. The
@@ -3437,28 +4806,14 @@ class H3Director2Plugin(WAN2GPPlugin):
         from the last `overlap` frames of the one before it, exactly the way a
         sliding window continues inside a single job, and every group runs on
         the SAME seed. The carried frames are regenerated by the new group, so
-        they are trimmed off its front at the join rather than appearing twice.
+        they are trimmed off its front rather than appearing twice.
+
+        Every finished group is cut to its exact slot, stored losslessly as a
+        master in workspace/renders, and recorded in render.json. With
+        `resume`, the groups the record still vouches for are kept and the run
+        picks up after the last of them.
         """
-        groups = self._group_plan(window_frames, per_group)
-        n_groups = len(groups)
-        # Work from the PLAN, not from `base`. `base` has already been through
-        # _assemble_settings, which renumbered the prompt's picture numbers for
-        # a run that has the start image, the end image and every injected
-        # frame. A group that does not have the start image needs a different
-        # shift, so slicing the finished prompt would leave every group after
-        # the first pointing at the wrong reference sheets.
-        plan0 = dict(data.get("settings") or {})
-        media0 = dict(plan0.get("media") or {})
-        base_offset = plan0.get("numbering_offset")
-        if base_offset is None:
-            base_offset = int(plan0.get("injected_count") or 0) \
-                + (1 if media0.get("image_start") else 0) \
-                + (1 if media0.get("image_end") else 0)
-        base_offset = int(base_offset or 0)
-        blocks = [b for b in re.split(r"\n\s*\n", (plan0.get("prompt") or "").replace("\r\n", "\n")) if b.strip()]
-        # One prompt block per window is the contract the relay already builds
-        # to. If that does not hold, every group gets the whole prompt rather
-        # than a silently wrong slice of it.
+        plan0, media0, base_offset, blocks = self._group_base(data)
         # One prompt block per window is what makes a group a slice of the
         # timeline. Without it there is no honest way to give a group its own
         # share, and the old fallback -- hand every group the whole prompt --
@@ -3471,14 +4826,90 @@ class H3Director2Plugin(WAN2GPPlugin):
             trace("groups REFUSED: " + msg)
             yield frame("error", error=msg)
             return
-        per_window_prompts = True
+        total_windows = len(window_frames)
+
+        # Per-group working files are cached by name. One cut short by a crash
+        # would be picked up again by the next run, so every run starts
+        # without them.
+        for f in list(DERIVED_DIR.glob("tail_*")) + list(DERIVED_DIR.glob("grpaud_*")):
+            try:
+                f.unlink()
+            except OSError:
+                pass
+
+        # ---- what is already finished ----
+        rec = renders.load_record(RENDER_JSON, PLUGIN_ID)
+        kept = []
+        if resume:
+            try:
+                res = self._render_check(rec, data, window_frames, ovl, fps)
+            except Exception as exc:
+                res = {"kept": [], "reason": None, "notes": [], "error": str(exc)}
+            if res.get("error"):
+                # ffprobe missing, or a clip held open by antivirus: nothing is
+                # wrong with the work, so nothing is thrown away.
+                msg = ("Could not check the finished groups: %s. Nothing was removed "
+                       "- try Continue again." % res["error"])
+                trace("resume STOPPED: " + msg)
+                yield frame("error", error=msg)
+                return
+            kept = res["kept"]
+            if not kept:
+                msg = ("Nothing to continue: %s. Press Generate to start over."
+                       % (res["reason"] or "no finished groups were recorded"))
+                trace("resume REFUSED: " + msg)
+                yield frame("error", error=msg)
+                return
+            for n in res["notes"]:
+                trace("resume note: " + n)
+            if res["reason"]:
+                trace("resume: keeping %d of %d finished group(s) -- %s"
+                      % (len(kept), len(rec["groups"]), res["reason"]))
+            self._render_discard(keep={g["master"] for g in kept})
+            rec["groups"] = kept
+        else:
+            if rec or RENDERS_DIR.is_dir():
+                n_old = self._render_discard()
+                if n_old:
+                    trace("fresh render: removed %d clip(s) from the previous render" % n_old)
+            rec = None
 
         # One seed for the whole piece. -1 means "pick one", and picking it
-        # here rather than per job is what keeps the groups consistent.
+        # here rather than per job is what keeps the groups consistent. A
+        # resumed render goes on with the seed its finished groups were made on.
         seed = int(base.get("seed") or -1)
-        if seed < 0:
+        if kept:
+            seed = int(rec["seed"])
+            trace("groups: continuing on seed %d, the seed the finished groups used" % seed)
+        elif seed < 0:
             seed = int(time.time()) % 2147483647
             trace("groups: seed was random; fixed at %d so every group matches" % seed)
+
+        if rec is None:
+            rec = renders.new_record(PLUGIN_ID, seed, fps, ovl, window_frames, per_group,
+                                     renders.shared_hashes(plan0))
+        rec.update({"status": "running", "window_frames": [int(x) for x in window_frames],
+                    "group_size": int(per_group), "joined": None})
+        recording = True
+        try:
+            renders.write_record(RENDER_JSON, rec)
+            self._render_rev = getattr(self, "_render_rev", 0) + 1
+        except Exception as exc:
+            recording = False
+            trace("RENDER RECORD could not be written (%s) -- this render cannot be "
+                  "continued after a crash" % exc)
+
+        # The groups: the kept ones as they were, then the rest of the windows
+        # split at the CURRENT group size, so a render that crashed at four
+        # windows a group can be continued at two.
+        kept_w = (kept[-1]["first_window"] + kept[-1]["n_windows"]) if kept else 0
+        groups = [{"windows": [int(x) for x in g["windows"]], "frames": int(g["frames"]),
+                   "start": int(g["start"]), "kept": g} for g in kept]
+        offset = sum(window_frames[:kept_w])
+        for g in self._group_plan(window_frames[kept_w:], per_group):
+            g["start"] += offset
+            groups.append(g)
+        n_groups = len(groups)
 
         # Releasing the model BETWEEN groups is off by default, and the reason
         # is that it buys nothing where it matters: the finished frames are
@@ -3489,12 +4920,14 @@ class H3Director2Plugin(WAN2GPPlugin):
         # case it does help, a VRAM baseline that creeps across groups.
         release_between = bool((data.get("settings") or {}).get("release_between_groups", False))
 
-        total_windows = len(window_frames)
-        trace("groups: %d group(s) of up to %d window(s) covering %d window(s) / %d frames"
-              % (n_groups, per_group, total_windows, sum(window_frames)))
-        yield frame("running", 0.0, 0, total_windows,
-                    [{"level": "info", "msg": "Rendering in %d group(s) of up to %d window(s)."
-                      % (n_groups, per_group)}])
+        trace("groups: %d group(s) of up to %d window(s) covering %d window(s) / %d frames%s"
+              % (n_groups, per_group, total_windows, sum(window_frames),
+                 (" -- %d already done" % len(kept)) if kept else ""))
+        yield frame("running", kept_w / max(1, total_windows), kept_w, total_windows,
+                    [{"level": "info", "msg": ("Continuing: %d of %d group(s) already done, "
+                                               "picking up at window %d."
+                                               % (len(kept), n_groups, kept_w + 1)) if kept
+                      else "Rendering in %d group(s) of up to %d window(s)." % (n_groups, per_group)}])
 
         # The look the piece opens with, measured off the first group once it
         # exists, and what every later join is compared against.
@@ -3502,30 +4935,31 @@ class H3Director2Plugin(WAN2GPPlugin):
         look_ref = None
 
         parts, made_files, done_windows = [], [], 0
-        prev_out = None
+        prev_out = None        # the previous group's render, as Wan2GP wrote it
+        prev_master = None     # ... or its master, when it was finished earlier
         w_at = 0
 
         for gi, grp in enumerate(groups):
             n_win = len(grp["windows"])
             head_trim = 0
-            first_group, last_group = gi == 0, gi == n_groups - 1
+            first_group = gi == 0
 
-            # The start image belongs to the first group and the end image to
-            # the last; a middle group has neither. Each one occupies a
-            # numbered slot ahead of the reference sheets, so dropping one has
-            # to drop the shift with it or the prompt's picture numbers move.
-            pg = dict(plan0)
-            media_g = dict(media0)
-            offset_g = base_offset
-            if not first_group and media_g.pop("image_start", None):
-                offset_g -= 1
-            if not last_group and media_g.pop("image_end", None):
-                offset_g -= 1
-            pg["media"] = media_g
-            pg["numbering_offset"] = max(0, offset_g)
-            if per_window_prompts:
-                pg["prompt"] = "\n\n".join(blocks[w_at:w_at + n_win])
+            # ---- a group finished earlier: keep it exactly as it is ----
+            if grp.get("kept"):
+                mpath = RENDERS_DIR / grp["kept"]["master"]
+                parts.append({"path": str(mpath), "trim_start_frames": 0, "trim_end_frames": 0})
+                prev_out, prev_master = None, str(mpath)
+                if look_ref is None:
+                    look_ref = self._luma_stats(str(mpath), frames=int(fps))
+                done_windows += n_win
+                w_at += n_win
+                yield frame("running", done_windows / max(1, total_windows), done_windows,
+                            total_windows, [{"level": "ok", "msg": "Group %d of %d already done - kept"
+                                             % (gi + 1, n_groups)}])
+                continue
 
+            pg, offset_g = self._group_inputs(plan0, media0, base_offset, blocks,
+                                              w_at, n_win, total_windows)
             try:
                 st = self._normalize_audio_guide(self._assemble_settings(pg))
             except Exception as exc:
@@ -3544,13 +4978,14 @@ class H3Director2Plugin(WAN2GPPlugin):
             # own share of the timeline, and the audio has to start that much
             # earlier -- otherwise the group lands short and the song drifts
             # out of sync with the picture by one overlap at every boundary.
-            carry = int(ovl) if prev_out else 0
+            carry = int(ovl) if (prev_out or prev_master) else 0
             audio_at = (grp["start"] - carry) / fps
             audio_len = (grp["frames"] + carry) / fps
 
             # Its slice of the song, so the words and sounds continue from
             # where the last group left off instead of restarting at 0:00.
             song = st.get("audio_guide")
+            song_src = song if (song and os.path.isfile(str(song))) else None
             if song and os.path.isfile(str(song)):
                 try:
                     st["audio_guide"] = self._audio_slice(song, max(0.0, audio_at), audio_len)
@@ -3558,11 +4993,19 @@ class H3Director2Plugin(WAN2GPPlugin):
                     trace("group %d: could not slice the soundtrack (%s); using the whole file"
                           % (gi + 1, exc))
 
-            if prev_out:
+            if prev_out or prev_master:
                 # Continue from the previous group's tail, the same way a
                 # sliding window continues inside one job.
                 try:
-                    tail = self._source_tail(prev_out, ovl, fps)
+                    if prev_out:
+                        tail = self._source_tail(prev_out, ovl, fps)
+                    else:
+                        # Picking up after a crash: the tail comes off the
+                        # finished group's master, cut by frame index, so it is
+                        # exactly the frames the run would have carried.
+                        tail = renders.master_tail(
+                            self._ffmpeg(), self._ffprobe(), prev_master, ovl, fps,
+                            DERIVED_DIR / ("tail_a_%s_%d.mp4" % (Path(prev_master).stem, int(ovl))))
                     # Measure the drift at every join, and say so. This is the
                     # "it gets brighter and brighter" report turned into a
                     # number: if the tail reads the same as the opening, the
@@ -3579,15 +5022,16 @@ class H3Director2Plugin(WAN2GPPlugin):
                                     % (gi, 100 * drift,
                                        "; nudged back" if hold_look else ""))
                             trace(note)
-                            yield frame("running", note, gi / float(n_groups), gi + 1, n_groups,
-                                        logs=[{"level": "info", "msg": note}])
+                            yield frame("running", done_windows / max(1, total_windows),
+                                        done_windows, total_windows,
+                                        [{"level": "info", "msg": note}])
                     st["video_source"] = tail
                     st["keep_frames_video_source"] = ""
                     ipt = st.get("image_prompt_type", "") or ""
                     if "V" not in ipt:
                         st["image_prompt_type"] = ipt + "V"
                     # A continuation regenerates the carried frames, so they
-                    # are dropped from the front of this group at the join.
+                    # are dropped from the front of this group.
                     head_trim = carry
                     st.pop("image_start", None)
                     trace("group %d: continuing from %d carried frame(s)" % (gi + 1, ovl))
@@ -3599,9 +5043,70 @@ class H3Director2Plugin(WAN2GPPlugin):
             # default-plan path. Setting it either way is correct and costs
             # nothing, but it is not a promise -- the check after the job is.
             st["video_length"] = int(grp["frames"]) + carry
-            st = self._strip_unsatisfied(st)
             want_frames = int(grp["frames"]) + carry
+            # Wan2GP puts every window on the model's frame grid, rounding to
+            # the NEAREST legal length -- so a 96-frame window comes back 89 and
+            # the group falls short of its slot. Every group after it then
+            # lands earlier on the timeline than planned, and a song drifts out
+            # of sync. So the durations are re-declared to come back AT LEAST
+            # the slot (the same arithmetic Wan2GP uses, already checked
+            # against it), and the clip is cut to exactly the slot afterwards.
+            carried = int(ovl) if st.get("video_source") else 0
+            tags = self._DURATION_TAG.findall(st.get("prompt", ""))
+            if len(tags) == n_win:
+                try:
+                    durs, total_new = self._regen_request([int(x) for x in grp["windows"]],
+                                                          carried, int(grp["frames"]))
+                    it = iter(durs)
+                    st["prompt"] = self._DURATION_TAG.sub(
+                        lambda _m: "[/duration=%.4fs]" % (next(it) / fps), st["prompt"])
+                    st["video_length"] = want_frames = carried + total_new
+                    if total_new != int(grp["frames"]):
+                        trace("group %d: declared %s so Wan2GP returns %d new frame(s) for a %d-frame "
+                              "slot (the grid rounds %s); the clip is cut to the slot"
+                              % (gi + 1, durs, total_new, int(grp["frames"]),
+                                 "up" if total_new > int(grp["frames"]) else "exactly"))
+                except Exception as exc:
+                    trace("group %d: could not work out grid-safe durations (%s); sending them as they are"
+                          % (gi + 1, exc))
+            # The extra frames the grid adds come off the open end -- except
+            # when the end is PINNED (the piece's end image, on the last group):
+            # that frame must stay. Then the group starts that many frames
+            # early and the clip before gives them up, exactly as a regen does,
+            # so both the join and the end image are kept.
+            extra = (want_frames - carried) - int(grp["frames"])
+            end_shift = keep_extra = 0
+            if st.get("image_end") and extra > 0:
+                if carried and prev_master and recording and rec.get("groups") \
+                        and int(rec["groups"][-1]["frames_got"]) - extra > carried:
+                    end_shift = extra
+                    try:
+                        st["video_source"] = renders.master_frames_at(
+                            self._ffmpeg(), self._ffprobe(), prev_master, carried, end_shift, fps,
+                            DERIVED_DIR / ("tail_a_end_%s_%d_%d.mp4" % (Path(prev_master).stem, carried, end_shift)))
+                        trace("group %d: the end image is pinned; starting %d frame(s) early so it stays"
+                              % (gi + 1, end_shift))
+                    except Exception as exc:
+                        end_shift, keep_extra = 0, extra
+                        trace("group %d: could not start early (%s); keeping %d extra frame(s) at the end"
+                              % (gi + 1, exc, extra))
+                else:
+                    keep_extra = extra
+                    trace("group %d: the end image is pinned; the piece ends %d frame(s) later to keep it"
+                          % (gi + 1, extra))
+            # The song slice is as long as the job, starting where its first
+            # frame sits -- including any carried or early frames.
+            if song_src:
+                try:
+                    st["audio_guide"] = self._audio_slice(
+                        song_src, max(0.0, (grp["start"] - end_shift - carried) / fps), want_frames / fps)
+                except Exception as exc:
+                    trace("group %d: could not re-slice the soundtrack (%s)" % (gi + 1, exc))
+            st = self._strip_unsatisfied(st)
 
+            self._render_active = {"group": gi + 1, "first_window": w_at, "n_windows": n_win,
+                                   "start": int(grp["start"]), "frames": int(grp["frames"])}
+            self._render_rev = getattr(self, "_render_rev", 0) + 1
             yield frame("running", done_windows / max(1, total_windows), done_windows, total_windows,
                         [{"level": "info", "msg": "Group %d of %d: %d window(s), %.2fs"
                           % (gi + 1, n_groups, n_win, grp["frames"] / fps)}])
@@ -3617,6 +5122,8 @@ class H3Director2Plugin(WAN2GPPlugin):
             self._stream_owner = id(job)
             self._start_background_drain(job)
 
+            watch = _AdmissionWatch(self, job, "Group %d" % (gi + 1))
+            notes = []
             last = 0.0
             while not getattr(job, "done", False):
                 stream = getattr(job, "events", None)
@@ -3624,6 +5131,7 @@ class H3Director2Plugin(WAN2GPPlugin):
                     try:
                         ev = stream.get(timeout=0.25)
                         while ev is not None:
+                            watch.saw(ev)
                             self._absorb_event(ev)
                             try:
                                 ev = stream.get_nowait()
@@ -3633,6 +5141,9 @@ class H3Director2Plugin(WAN2GPPlugin):
                         pass
                 else:
                     time.sleep(0.25)
+                note = watch.tick()
+                if note:
+                    notes.append({"level": "warn", "msg": note})
                 now = time.time()
                 if now - last >= 1.0:
                     last = now
@@ -3643,13 +5154,14 @@ class H3Director2Plugin(WAN2GPPlugin):
                     # the groups already done -- otherwise window 4 of group 5
                     # is announced as window 22 of 20.
                     in_group = max(0, min(int(js.get("window") or 0), n_win - 1))
+                    out, notes[:] = list(notes), []
                     yield frame("running",
                                 (done_windows + inner * n_win) / max(1, total_windows),
-                                done_windows + in_group, total_windows,
+                                done_windows + in_group, total_windows, out or None,
                                 phase=str(js.get("phase") or ""),
-                                detail="Group %d of %d \u00b7 window %d of %d%s"
+                                detail="Group %d of %d · window %d of %d%s"
                                        % (gi + 1, n_groups, in_group + 1, n_win,
-                                          (" \u00b7 " + str(js.get("detail"))) if js.get("detail") else ""))
+                                          (" · " + str(js.get("detail"))) if js.get("detail") else ""))
 
             self._stream_owner = None
             try:
@@ -3659,7 +5171,10 @@ class H3Director2Plugin(WAN2GPPlugin):
                 return
             self._job = None
             if getattr(result, "cancelled", False):
-                yield frame("cancelled", done_windows / max(1, total_windows), done_windows, total_windows)
+                yield frame("cancelled", done_windows / max(1, total_windows), done_windows, total_windows,
+                            logs=[{"level": "info", "msg": "Stopped. The %d finished group(s) are kept "
+                                   "- press Continue to pick up from here." % len(rec["groups"])}]
+                            if rec["groups"] and recording else None)
                 return
             if not getattr(result, "success", False):
                 errs = getattr(result, "errors", None) or ["no output"]
@@ -3670,7 +5185,7 @@ class H3Director2Plugin(WAN2GPPlugin):
                 yield frame("error", error="group %d produced no file" % (gi + 1))
                 return
 
-            prev_out = made[-1]
+            prev_out, prev_master = made[-1], None
             made_files.extend(made)
             if look_ref is None:
                 # The opening second of the finished first group: the look the
@@ -3688,10 +5203,10 @@ class H3Director2Plugin(WAN2GPPlugin):
             try:
                 got = int(round(self._ffprobe_duration(prev_out) * fps))
                 if abs(got - want_frames) > 2:
-                    note = ("group %d produced %d frame(s) (%.2fs) for a %d-frame "
-                            "(%.2fs) slice -- the joined video will be %+d frame(s) "
-                            "off here" % (gi + 1, got, got / fps, want_frames,
-                                          want_frames / fps, got - want_frames))
+                    note = ("group %d came back %d frame(s) (%.2fs) for a %d-frame (%.2fs) "
+                            "slice; its clip is cut to the slot, and the next group carries "
+                            "on from that cut" % (gi + 1, got, got / fps, want_frames,
+                                                  want_frames / fps))
                     trace("LENGTH WARNING: " + note)
                     yield frame("running", done_windows / max(1, total_windows),
                                 done_windows, total_windows,
@@ -3700,12 +5215,78 @@ class H3Director2Plugin(WAN2GPPlugin):
                     trace("group %d length OK: %d frame(s) (%.2fs)" % (gi + 1, got, got / fps))
             except Exception as exc:
                 trace("group %d: could not measure the output (%s)" % (gi + 1, exc))
-            parts.append({"path": prev_out, "trim_start_frames": head_trim, "trim_end_frames": 0})
+
+            # ---- the master: this group's slot, lossless, then recorded ----
+            # Written and flushed BEFORE the record names it, so a reboot can
+            # cost the group in flight but never leaves the record pointing at
+            # half a file.
+            master = None
+            if recording:
+                name = "group_w%03d-%03d.mkv" % (w_at + 1, w_at + n_win)
+                try:
+                    t0 = time.time()
+                    mpath = RENDERS_DIR / name
+                    frames_got = renders.make_master(self._ffmpeg(), self._ffprobe(), prev_out,
+                                                     mpath, head_trim,
+                                                     int(grp["frames"]) + end_shift + keep_extra, fps)
+                    if frames_got <= 0:
+                        raise ValueError("the master came out empty")
+                    rec["groups"].append({
+                        "first_window": w_at, "n_windows": n_win,
+                        "windows": [int(x) for x in grp["windows"]],
+                        "start": int(grp["start"]) - end_shift, "frames": int(grp["frames"]),
+                        "frames_got": frames_got, "master": name,
+                        "bytes": mpath.stat().st_size,
+                        "sha256": renders.file_sha256(mpath),
+                        "hash": renders.group_hash(pg), "seed": seed,
+                        "source": os.path.basename(prev_out),
+                        "finished": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    })
+                    if end_shift:
+                        # the clip before gives up the frames this one started early
+                        pg_prev = rec["groups"][-2]
+                        keep = int(pg_prev["frames_got"]) - end_shift
+                        ptmp = RENDERS_DIR / (pg_prev["master"] + ".new")
+                        if renders.make_master(self._ffmpeg(), self._ffprobe(), RENDERS_DIR / pg_prev["master"],
+                                               ptmp, 0, keep, fps) != keep:
+                            raise ValueError("could not trim the clip before for the end image")
+                        renders.replace_retry(ptmp, RENDERS_DIR / pg_prev["master"])
+                        pg_prev.update({"frames_got": keep,
+                                        "bytes": (RENDERS_DIR / pg_prev["master"]).stat().st_size,
+                                        "sha256": renders.file_sha256(RENDERS_DIR / pg_prev["master"])})
+                    renders.write_record(RENDER_JSON, rec)
+                    self._render_rev = getattr(self, "_render_rev", 0) + 1
+                    master = str(mpath)
+                    trace("group %d saved: %s, %d frame(s), %.1f MB, %.1fs"
+                          % (gi + 1, name, frames_got, mpath.stat().st_size / 1048576.0,
+                             time.time() - t0))
+                    try:
+                        self._make_preview(mpath)
+                    except Exception as exc:
+                        trace("group %d: no viewer preview yet (%s); it is made when first opened"
+                              % (gi + 1, exc))
+                except Exception as exc:
+                    recording = False
+                    trace("group %d: could not save its master (%s) -- the render goes on, "
+                          "but it cannot be continued past this point after a crash"
+                          % (gi + 1, exc))
+            done_name = os.path.basename(prev_out)
+            if master:
+                parts.append({"path": master, "trim_start_frames": 0, "trim_end_frames": 0})
+                # The next group continues from the MASTER's tail, not the raw
+                # render's. They are the same frames when Wan2GP returns
+                # exactly what was asked; when it returns more, the master ends
+                # at the slot and so must the frames carried on from it, or the
+                # join skips whatever the master left out. It is also exactly
+                # what a Continue after a crash carries on from, so a resumed
+                # piece and an uninterrupted one cannot differ here.
+                prev_out, prev_master = None, master
+            else:
+                parts.append({"path": prev_out, "trim_start_frames": head_trim, "trim_end_frames": 0})
             done_windows += n_win
             w_at += n_win
             yield frame("running", done_windows / max(1, total_windows), done_windows, total_windows,
-                        [{"level": "ok", "msg": "Group %d done: %s"
-                          % (gi + 1, os.path.basename(prev_out))}])
+                        [{"level": "ok", "msg": "Group %d done: %s" % (gi + 1, done_name)}])
 
             if release_between and gi < n_groups - 1:
                 self._release_model()
@@ -3717,20 +5298,37 @@ class H3Director2Plugin(WAN2GPPlugin):
         # Nothing is joined until every group is finished, and each group's
         # frames left memory when its job ended -- joining as we went would put
         # the whole video back in one process and undo the point of grouping.
-        # ffmpeg concatenates the finished files straight off disk with a
-        # stream copy, so the join itself holds nothing either.
+        # The join reads the finished files straight off disk.
         self._release_model()
 
+        def _finish(joined):
+            if not recording:
+                return
+            try:
+                rec["status"] = "complete"
+                rec["joined"] = joined
+                rec["joined_masters"] = [g["master"] for g in rec.get("groups") or []] if joined else []
+                renders.write_record(RENDER_JSON, rec)
+                self._render_rev = getattr(self, "_render_rev", 0) + 1
+            except Exception as exc:
+                trace("render record not closed (%s)" % exc)
+
         if len(parts) < 2:
-            yield frame("done", 1.0, total_windows, total_windows,
-                        files=[p["path"] for p in parts])
+            # Hand back Wan2GP's own file: the master lives in the workspace
+            # and the next fresh render clears it.
+            out_files = made_files or [p["path"] for p in parts]
+            _finish(out_files[-1] if out_files else None)
+            yield frame("done", 1.0, total_windows, total_windows, files=out_files)
             return
         yield frame("running", 0.99, total_windows, total_windows,
                     [{"level": "info", "msg": "Joining %d group(s)..." % len(parts)}])
         try:
             joined = self._join_videos({
                 "parts": parts, "fps": fps,
-                "dir": str(data.get("export_dir") or "").strip() or None,
+                # Beside Wan2GP's own renders unless a folder was chosen -- never
+                # in workspace/renders, which a fresh render clears.
+                "dir": str(data.get("export_dir") or "").strip()
+                       or (str(Path(made_files[0]).parent) if made_files else str(PLUGIN_DIR / "projects")),
                 "name": (str(data.get("project_name") or "h3-director") + "-full"),
             })["path"]
         except Exception as exc:
@@ -3740,6 +5338,7 @@ class H3Director2Plugin(WAN2GPPlugin):
                                "msg": "Groups rendered but could not be joined (%s). "
                                       "Each group's own file is listed above." % exc}])
             return
+        _finish(joined)
         yield frame("done", 1.0, total_windows, total_windows,
                     files=[joined] + made_files,
                     logs=[{"level": "ok", "msg": "Joined %d group(s): %s" % (len(parts), joined)}])
@@ -3762,7 +5361,11 @@ class H3Director2Plugin(WAN2GPPlugin):
                 "windows": windows, "logs": logs or [], "files": files or [],
                 "error": error, "phase": phase, "detail": detail,
                 "step": step, "steps": steps, "unit": unit,
-                "elapsed": round(elapsed, 1), "t": time.time()}})
+                "elapsed": round(elapsed, 1), "t": time.time(),
+                # Bumped whenever the results track has something new: a group
+                # started, or one was saved. EVERY frame carries it, so the UI
+                # cannot miss a change even when the status box skips frames.
+                "render_rev": getattr(self, "_render_rev", 0)}})
 
         try:
             msg = json.loads(raw or "{}")
@@ -3798,7 +5401,7 @@ class H3Director2Plugin(WAN2GPPlugin):
             plan_in = data.get("settings") or {}
             manual_windows = None
             if plan_in.get("manual_windows"):
-                wf = [int(x) for x in (plan_in.get("window_frames") or []) if int(x) > 0]
+                wf = self._plan_window_frames(plan_in, target, win, ovl, tagged)
                 if wf:
                     manual_windows = wf
                     total_wf = sum(wf)
@@ -3850,7 +5453,7 @@ class H3Director2Plugin(WAN2GPPlugin):
         ok, why = self._check_prompt_blocks(settings.get("prompt", ""))
         if not ok:
             trace("REFUSING to submit: %s" % why)
-            yield frame("error", why)
+            yield frame("error", error=why)
             return
         # ---- long timelines: render in groups of windows ----
         # One Wan2GP job per group instead of one for the whole timeline. Its
@@ -3859,31 +5462,75 @@ class H3Director2Plugin(WAN2GPPlugin):
         # than one very long one. Each group continues from the last one with
         # the same overlap and the same seed, so it knows where to carry on.
         group_windows = int((data.get("settings") or {}).get("group_windows") or 0)
+        resume = bool(data.get("resume"))
+        regen = data.get("regen") if isinstance(data.get("regen"), dict) else None
+        if regen:
+            # Render only the marked clips again, in place, between their
+            # neighbours. Nothing else is touched.
+            if not target or bridge_frames:
+                yield frame("error", error="Regen needs the timeline the clips were rendered from.")
+                return
+            fps_r = float(data.get("fps") or (data.get("settings") or {}).get("fps") or 24) or 24.0
+            plan_wf = self._plan_window_frames(data.get("settings") or {}, target, win, ovl, tagged)
+            yield from self._regen_guarded(data, submit, frame, fps_r, plan_wf,
+                                           list(regen.get("groups") or []), regen.get("seed", "same"))
+            return
+        if not resume and not bridge_frames and not data.get("discard_ok") and RENDER_JSON.exists():
+            # Finished clips are never thrown away by Generate on its own.
+            # Whatever still matches the timeline is KEPT and the render picks
+            # up after it -- the same as Continue. Only when nothing can be kept,
+            # or everything is already rendered, does it stop and ask; the UI
+            # sends discard_ok once the user has said yes.
+            try:
+                state = self._render_state(data)
+            except Exception as exc:
+                state = {"resumable": False, "recorded_groups": 1,
+                         "reason": "the finished clips could not be checked (%s)" % exc}
+            if state.get("running"):
+                yield frame("error", error="A render or stitch is already running - wait for it to finish.")
+                return
+            if state.get("resumable"):
+                resume = True
+                trace("Generate: keeping %s finished group(s) that still match; rendering the rest"
+                      % state.get("kept_groups"))
+            elif (state.get("recorded_groups") or 0) > 0 and not state.get("running"):
+                if state.get("complete") and state.get("kept_groups") == state.get("recorded_groups"):
+                    why = "all %s groups are already rendered and match the timeline" % state.get("recorded_groups")
+                else:
+                    why = state.get("reason") or "they no longer match the timeline"
+                msg = ("Nothing was replaced: %s. Press Generate again and confirm to render "
+                       "them again, or mark clips to regenerate just those." % why)
+                trace("Generate HELD: " + msg)
+                yield frame("error", error=msg)
+                return
+        if resume and not (target and not bridge_frames):
+            yield frame("error", error="Continue needs a timeline to render.")
+            return
+        if resume and group_windows <= 0:
+            # Groups were switched off after the render started. Continue is
+            # only possible in groups, so carry on at the size it was using.
+            rec0 = renders.load_record(RENDER_JSON, PLUGIN_ID) or {}
+            group_windows = int(rec0.get("group_size") or 0)
+            if group_windows <= 0:
+                yield frame("error", error="There is no unfinished render to continue.")
+                return
+            trace("resume: render groups are off; continuing at the %d window(s) "
+                  "per group the render started with" % group_windows)
         if group_windows > 0 and target and not bridge_frames:
             fps_g = float(data.get("fps") or (data.get("settings") or {}).get("fps") or 24) or 24.0
-            plan_in_g = data.get("settings") or {}
-            hand = [int(x) for x in (plan_in_g.get("window_frames") or []) if int(x) > 0] \
-                if plan_in_g.get("manual_windows") else []
-            if hand:
-                plan_wf = hand
-            elif tagged:
-                # The prompt carries /duration tags, so the SCHEDULER decides
-                # the windows -- one per prompt block -- and the default plan
-                # does not apply. Splitting on the default plan gave 22 windows
-                # for a 20-block prompt, the block count stopped matching, and
-                # every group was handed the WHOLE prompt: six groups each
-                # rendering all 20 windows.
-                plan_wf = plan_duration_frames(int(target), win, ovl, self._grid)[1]
-            else:
-                plan_wf = [w["output_frames"] for w in
-                           _real_plan_windows(int(target), win, ovl, self._grid)]
-            if len(plan_wf) > group_windows:
-                yield from self._run_groups(
+            plan_wf = self._plan_window_frames(data.get("settings") or {}, target, win, ovl, tagged)
+            if len(plan_wf) > group_windows or resume:
+                yield from self._groups_guarded(
                     data, settings, submit, frame, fps_g, win, ovl,
-                    plan_wf, group_windows)
+                    plan_wf, group_windows, resume=resume)
                 return
             trace("groups: %d window(s) fits in one group of %d - rendering normally"
                   % (len(plan_wf), group_windows))
+        if not bridge_frames and (RENDER_JSON.exists() or RENDERS_DIR.is_dir()):
+            # A fresh single-job render replaces whatever a grouped render left:
+            # its clips would no longer belong to what is on the timeline.
+            n_old = self._render_discard()
+            trace("fresh render: cleared the previous grouped render (%d clip(s))" % n_old)
 
         self._log_prompt("SUBMIT", settings)
         yield frame("running", 0.0, 0, windows, [{"level": "info", "msg": "Submitting %s, %d frames..." % (settings.get("model_type"), settings.get("video_length", 0))}])
@@ -4044,6 +5691,7 @@ class H3Director2Plugin(WAN2GPPlugin):
         st["elapsed"] = round(time.time() - st["started"], 1) if st.get("started") else 0.0
         st["log"] = st.get("log", [])[-120:]
         st["can_cancel"] = bool(job is not None and not getattr(job, "done", False))
+        st["render_rev"] = getattr(self, "_render_rev", 0)
         return st
 
     def _start_background_drain(self, job):

@@ -1,7 +1,7 @@
 """Smoke test: executes plugin.py against the REAL WAN2GPPlugin class source
 and the REAL _component_constructor_accepts_api, extracted from Wan2GP."""
-import ast, sys, types, importlib.util, inspect
-WGP = "/home/claude/wgpsrc/Wan2GP-main"
+import ast, os, sys, types, importlib.util, inspect
+WGP = os.environ.get("WGP") or "/home/claude/wgpsrc/Wan2GP-main"
 src = open(WGP + "/shared/utils/plugins.py", encoding="utf-8").read()
 tree = ast.parse(src)
 

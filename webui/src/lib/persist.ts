@@ -12,6 +12,12 @@ const IDLE_MS = 750;
 const MAX_MS = 30000;
 
 let timer: ReturnType<typeof setTimeout> | null = null;
+/** Nothing is written until the project on disk has been READ. If the load
+ *  fails or times out, what is on screen is the demo, and a save -- which
+ *  also happens every time the page loses focus -- would write the demo over
+ *  the real project. So saving is off until a load has actually answered. */
+let armed = false;
+export function savingArmed(): boolean { return armed; }
 let lastFlush = Date.now();
 let getPayload: (() => unknown) | null = null;
 let onSaved: ((ok: boolean, err?: string, info?: number) => void) | null = null;
@@ -23,6 +29,12 @@ export function configurePersist(fn: () => unknown, saved?: (ok: boolean, err?: 
 
 async function writeNow(): Promise<boolean> {
   if (!getPayload) return false;
+  if (!armed && hasParent()) {
+    // Not an error to report on every blur: the load is still pending or
+    // being retried, and the top bar already says nothing is being saved.
+    if (timer) { clearTimeout(timer); timer = null; }
+    return false;
+  }
   const payload = getPayload();
   lastFlush = Date.now();
   if (timer) { clearTimeout(timer); timer = null; }
@@ -60,12 +72,16 @@ export async function loadProject<T = unknown>(): Promise<T | null> {
     catch { return null; }
   }
   try {
+    // Generous: Wan2GP may still be busy starting up when the UI asks.
     const res = (await request<{
       payload?: T;
       media?: Record<string, never>;
       missing?: string[];
       fileBase?: string;
-    }>("load_project_json")) || {};
+    }>("load_project_json", {}, 120000)) || {};
+    // Python answered: whatever it said (a project, or none on disk), what
+    // is on screen from here on is the real state, so saving can start.
+    armed = true;
     // Rebuild the media cache BEFORE the payload is applied, so thumbnails,
     // waveforms and durations are already there when the timeline first draws.
     const { hydrateMedia } = await import("./media");
@@ -79,7 +95,7 @@ export async function loadProject<T = unknown>(): Promise<T | null> {
     return (res.payload as T) ?? null;
   } catch (e) {
     console.error("[H3-D] load failed", e);
-    return null;
+    throw e;
   }
 }
 

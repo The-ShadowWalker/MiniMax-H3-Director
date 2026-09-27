@@ -1,8 +1,8 @@
 """Regression guard: the NORMAL generate path must stay unaffected by the
 bridge work. Run after any change to _assemble_settings or the bridge code."""
-import ast, json, base64, sys, types, importlib.util
+import ast, os, json, base64, sys, types, importlib.util
 
-WGP = "/home/claude/wgpsrc/Wan2GP-main"
+WGP = os.environ.get("WGP") or "/home/claude/wgpsrc/Wan2GP-main"
 
 def load_plugin():
     src = open(WGP + "/shared/utils/plugins.py", encoding="utf-8").read()

@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useMemo } from "react";
-import { hydrateDirector, useDirector, useWindowStats } from "../lib/store";
+import { hydrateDirector, useDirector, useWindowStats, windowLayout } from "../lib/store";
 import { TopBar } from "./TopBar";
 import { Timeline } from "./Timeline";
 import { Rail } from "./Rail";
@@ -10,11 +10,12 @@ import { Inspector } from "./Inspector";
 import { ActionBar } from "./ActionBar";
 import { Preview } from "./Preview";
 import { VideoMonitor } from "./VideoMonitor";
+import { ResultViewer } from "./ResultViewer";
 import { PromptEditor } from "./PromptEditor";
 import { Manual } from "./Manual";
 import type { PaneId } from "../lib/types";
 import { buildPromptRelay } from "../lib/prompt";
-import { estimateMinutes, realWindows, solveVideoLength, windowSecondsWarning } from "../lib/h3";
+import { estimateMinutes, solveVideoLength, windowSecondsWarning } from "../lib/h3";
 
 const MOBILE_PANES: { id: PaneId | "timeline"; label: string }[] = [
   { id: "timeline", label: "Timeline" },
@@ -31,6 +32,8 @@ const MOBILE_PANES: { id: PaneId | "timeline"; label: string }[] = [
 export function DirectorApp() {
   const s = useDirector();
   const stats = useWindowStats();
+  // The results track is always there; the timeline is tall enough for it.
+  const hasResults = true;
 
   useEffect(() => {
     hydrateDirector();
@@ -75,8 +78,11 @@ export function DirectorApp() {
   const schedule = useMemo(() => {
     if (!s.scheduleOpen) return null;
     const maxF = Math.max(1, Math.round(s.duration_sec * s.fps));
-    const { windows: n } = solveVideoLength(maxF, s.timeline.slidingWindowSize, s.timeline.slidingWindowOverlap);
-    const wins = realWindows(maxF, s.timeline.slidingWindowSize, s.timeline.slidingWindowOverlap);
+    // The windows in force -- hand-set in manual mode -- so the preview shows
+    // what Generate will actually send.
+    const lay = windowLayout(s);
+    const wins = lay.spans;
+    const n = lay.manual ? lay.frames.length : solveVideoLength(maxF, s.timeline.slidingWindowSize, s.timeline.slidingWindowOverlap).windows;
     const relay = buildPromptRelay(s, wins);
     return {
       windows: relay.windows,
@@ -86,7 +92,7 @@ export function DirectorApp() {
   }, [s]);
 
   return (
-    <div className="app">
+    <div className={`app${hasResults ? " has-results" : ""}`}>
       <TopBar />
 
       <Timeline />
@@ -143,6 +149,7 @@ export function DirectorApp() {
       )}
       <Preview />
       <VideoMonitor />
+      <ResultViewer />
       <PromptEditor />
       <Manual />
     </div>

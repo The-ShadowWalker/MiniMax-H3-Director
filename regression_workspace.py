@@ -46,15 +46,32 @@ check("the project zip is still built from media/ alone",
       "if this changes, check what else it now sweeps up")
 
 check("Clear All takes the derived folder too",
-      "for d in (MEDIA_DIR, DERIVED_DIR):" in src)
+      "for d in (MEDIA_DIR, DERIVED_DIR, RENDERS_DIR, HISTORY_DIR):" in src)
 check("and so does opening another project",
-      src.count("for d in (MEDIA_DIR, DERIVED_DIR):") >= 2,
+      src.count("for d in (MEDIA_DIR, DERIVED_DIR, RENDERS_DIR, HISTORY_DIR):") >= 2,
       "otherwise the previous run's working files survive the switch")
+check("the rendered clips and their record go with the project",
+      src.count("RENDER_JSON)") >= 2 and "(PROJECT_JSON, PROJECT_BAK, RENDER_JSON)" in src,
+      "a cleared or switched project must not offer to continue the old render")
+check("the zip carries the rendered clips, stored not deflated",
+      '"renders/" + f.name, compress_type=zipfile.ZIP_STORED' in src)
+check("and opening a zip brings them back",
+      'n.startswith("renders/")' in src and 'n == "render.json"' in src)
+check("derived working files still never reach the zip",
+      "DERIVED_DIR.glob" not in src[src.index("def _save_project_zip"):src.index("def _clear_all")])
 check("New Project goes through Clear All",
       "return self._clear_all({\"confirmed\": True})" in src)
 check("the derived folder is served to the browser",
       "str(MEDIA_DIR), str(DERIVED_DIR)" in src,
       "a tail or mix that cannot be fetched would break its preview")
+
+# The badge in the top bar exists to catch a cached UI bundle: it only works
+# if it names the same version the terminal prints.
+tb = open(os.path.join(HERE, "webui", "src", "components", "TopBar.tsx"), encoding="utf-8").read()
+ver = re.search(r'PLUGIN_VERSION = "([^"]+)"', src).group(1)
+badge = re.search(r'H3D2_BUILD = "([^"]+)"', tb).group(1)
+check("the UI's version badge matches the plugin version (%s)" % ver, badge == ver,
+      "badge says %s -- a stale badge hides a stale cached UI" % badge)
 
 print()
 if fails:

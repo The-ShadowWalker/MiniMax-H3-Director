@@ -93,13 +93,17 @@ check("and its slice of the song starts that much earlier",
       and 'audio_len = (grp["frames"] + carry) / fps' in loop,
       "otherwise the song drifts by one overlap at every group boundary")
 check("the first group carries nothing, so neither applies to it",
-      'carry = int(ovl) if prev_out else 0' in loop)
+      'carry = int(ovl) if (prev_out or prev_master) else 0' in loop)
 check("the first group carries nothing", "if prev_out:" in loop)
 check("each group gets its own slice of the song",
       "_audio_slice(" in loop,
       "a job always starts its audio at 0:00, so the lip sync would reset")
+inputs = re.search(r"\n    def _group_inputs\(self.*?(?=\n    def )", src, re.S)
+inputs = inputs.group(0) if inputs else ""
+base_fn = re.search(r"\n    def _group_base\(self.*?(?=\n    def )", src, re.S)
+base_fn = base_fn.group(0) if base_fn else ""
 check("each group gets its own prompt blocks",
-      "blocks[w_at:w_at + n_win]" in loop)
+      "blocks[w_at:w_at + n_win]" in inputs and "self._group_inputs(" in loop)
 
 # The bug Dave spotted before it shipped: a group is a separate job, so
 # anything counted "ahead of the reference sheets" has to be counted for THAT
@@ -107,18 +111,21 @@ check("each group gets its own prompt blocks",
 # frames; a middle group has neither start nor end, so keeping the whole
 # timeline's offset would shift every picture number in its prompt.
 check("each group is assembled from the PLAN, not from the finished prompt",
-      "plan0 = dict(data.get" in loop and "_assemble_settings(pg)" in loop,
+      "plan0 = dict(data.get" in base_fn and "self._group_base(data)" in loop
+      and "_assemble_settings(pg)" in loop,
       "slicing an already-renumbered prompt keeps the wrong shift")
 check("the start image goes only to the first group",
-      'if not first_group and media_g.pop("image_start", None)' in loop)
+      'if not first_group and media_g.pop("image_start", None)' in inputs
+      and "first_group = w_at == 0" in inputs)
 check("the end image goes only to the last group",
-      'if not last_group and media_g.pop("image_end", None)' in loop)
+      'if not last_group and media_g.pop("image_end", None)' in inputs
+      and "last_group = w_at + n_win >= total_windows" in inputs)
 check("and the picture-number shift drops with them",
-      "offset_g -= 1" in loop and 'pg["numbering_offset"] = max(0, offset_g)' in loop,
+      "offset_g -= 1" in inputs and 'pg["numbering_offset"] = max(0, offset_g)' in inputs,
       "a group without the start image needs a smaller shift, or its prompt "
       "points at the wrong reference sheets")
 check("the first group keeps exactly the offset a single job would use",
-      "base_offset = plan0.get" in loop,
+      "base_offset = plan0.get" in base_fn,
       "group 1 must render identically to an ungrouped run")
 check("and the run says when a group's numbering differs",
       "picture numbers shifted by" in loop)
@@ -159,11 +166,15 @@ check("nothing is joined until every group is finished",
       loop.index("_join_videos(") > loop.rindex("submit(st)"),
       "joining inside the loop would put the whole video back in one process")
 check("the model is let go at the END, once every group is rendered",
-      "_release_model()\n\n        if len(parts)" in loop,
+      loop.index("self._release_model()\n\n        def _finish") < loop.index("if len(parts) < 2"),
       "the work is finished by then, so there is nothing to reload for")
-check("the join is a stream copy off disk, not a re-encode",
-      '"-c", "copy"' in src,
-      "decoding every group to re-encode would hold frames in memory again")
+_join = src[src.index("    def _join_videos"):src.index("\n    def ", src.index("    def _join_videos") + 10)]
+check("the join streams the finished files off disk in ONE ffmpeg pass (never whole videos in Python)",
+      "concat=n=%d:v=1:a=1" in _join and _join.count("subprocess.run(") == 1)
+check("the join cuts every part by frame index, and its sound to exactly the same span",
+      "trim=start_frame=%d:end_frame=%d" in _join and "apad,atrim=end=" in _join)
+check("the join no longer glues separately encoded AAC files (their priming slid the sound ~21 ms per join)",
+      '"-f", "concat"' not in _join)
 check("a failed join still hands back the group files",
       "could not be joined" in loop,
       "losing finished renders to a join error would be the worst outcome")
@@ -180,6 +191,13 @@ check("the look of the opening is measured once, off the first group",
 check("and every join is measured against it",
       "look drift at join" in loop,
       "without a number in the log, brightness drift is guesswork")
+# frame(status, progress, window, windows, logs): the drift report once passed
+# its message as the PROGRESS, which raised inside the tail's try-block and
+# silently started the group fresh -- a visible cut at every join.
+check("the drift report is a well-formed progress frame",
+      'yield frame("running", note' not in loop
+      and '[{"level": "info", "msg": note}])' in loop,
+      "a bad frame() call here makes every later group start without its carried frames")
 check("the drift is reported whether or not it is corrected",
       "if hold_look:" in loop and "else:" in loop)
 check("correcting it is opt-in", 'hold_look_between_groups", False)' in loop,

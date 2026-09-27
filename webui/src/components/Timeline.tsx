@@ -3,6 +3,7 @@ import { Type, Image as ImageIcon, Film, Music, HelpCircle, Play, Pause, Trash2,
 import { useDirector, useWindowStats } from "../lib/store";
 import { registerMedia, getMedia, fmtDuration , servedUrl } from "../lib/media";
 import { Confirm } from "./Confirm";
+import { ResultsLane } from "./ResultsLane";
 import { formatTimecode, stepGrid, H3 } from "../lib/h3";
 import type { Segment, TrackId } from "../lib/types";
 
@@ -106,7 +107,22 @@ function NumField({
 
 export function Timeline() {
   const [clearArm, setClearArm] = useState(false);
+  // Typing a window's length: click its seconds label (or double-click the
+  // band). The number comes up selected, so you just type and press Enter.
+  const [winEdit, setWinEdit] = useState<{ i: number; left: number; frames: number } | null>(null);
+  const [winEditHint, setWinEditHint] = useState("");
+  const winEditRef = useRef<HTMLInputElement | null>(null);
+  const openWinEdit = (i: number, left: number, frames: number) => {
+    setWinEditHint(`${frames} frames`);
+    setWinEdit({ i, left, frames });
+  };
+  useEffect(() => {
+    if (!winEdit) return;
+    const el = winEditRef.current;
+    if (el) { el.focus(); el.select(); }
+  }, [winEdit]);
   const s = useDirector();
+  const nClips = s.render?.clips?.length || 0;
   const stats = useWindowStats();
   const wrapRef = useRef<HTMLDivElement>(null);
   const [width, setWidth] = useState(800);
@@ -174,9 +190,10 @@ export function Timeline() {
   // Delete or Backspace removes the selected window. Ignored while typing,
   // so it never eats a character out of a prompt or a number field.
   useEffect(() => {
-    if (!stats.manual || s.selectedWindow == null) return;
+    if (!stats.manual || s.selectedWindow == null || s.selectedId) return;
     const onKey = (e: KeyboardEvent) => {
       if (e.key !== "Delete" && e.key !== "Backspace") return;
+      if (useDirector.getState().selectedId) return;   // a clip is selected: that is what goes
       const t = e.target as HTMLElement | null;
       const tag = (t && t.tagName) || "";
       if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" ||
@@ -186,7 +203,7 @@ export function Timeline() {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [stats.manual, s.selectedWindow, s]);
+  }, [stats.manual, s.selectedWindow, s.selectedId, s]);
 
   const dragged = useRef(false);
   const drag = useRef<{
@@ -247,7 +264,10 @@ export function Timeline() {
   };
 
   const onBg = (e: PE<HTMLDivElement>) => {
-    if ((e.target as HTMLElement).closest(".seg-c")) return;
+    // A click on a segment or a rendered clip is about that item, not about
+    // moving the playhead. (Moving it put the playhead line under the pointer,
+    // so the second click of a double-click landed on the line, not the clip.)
+    if ((e.target as HTMLElement).closest(".seg-c, .rclip")) return;
     const el = wrapRef.current;
     if (!el) return;
     const x = e.clientX - el.getBoundingClientRect().left;
@@ -359,9 +379,30 @@ export function Timeline() {
     const onKey = (e: KeyboardEvent) => {
       const tag = (e.target as HTMLElement)?.tagName;
       if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
+      if ((e.target as HTMLElement)?.isContentEditable) return;
       if (e.code === "Space") {
         e.preventDefault();
         s.togglePlay();
+      }
+      // Moving the playhead: Left / Right one frame (with Shift, one second),
+      // Home to the start, End to the end. The view scrolls to keep it in sight.
+      const key = e.key;
+      if (key === "ArrowLeft" || key === "ArrowRight" || key === "Home" || key === "End") {
+        if (e.ctrlKey || e.metaKey || e.altKey) return;
+        e.preventDefault();
+        const st = useDirector.getState();
+        const end = Math.max(1, Math.round(st.duration_sec * st.fps));
+        const fps = Math.max(1, Math.round(st.fps || 24));
+        const step = e.shiftKey ? fps : 1;
+        const at = st.timeline.playhead;
+        const to = key === "Home" ? 0 : key === "End" ? end
+          : key === "ArrowLeft" ? Math.max(0, at - step) : Math.min(end, at + step);
+        st.setPlayhead(to);
+        const vs = st.viewStart, ve = Math.max(st.viewEnd, vs + 8), span = ve - vs;
+        if (to < vs || to > ve) {
+          const start = Math.max(0, Math.min(Math.max(0, end - span), to - span / 2));
+          st.setView(start, start + span);
+        }
       }
       if ((e.key === "Delete" || e.key === "Backspace") && s.selectedId) {
         e.preventDefault();
@@ -380,10 +421,21 @@ export function Timeline() {
     <Confirm
       open={clearArm}
       title="Clear the timeline?"
-      body="Every shot, image, prompt and audio segment on the timeline is removed. References and settings are kept."
-      confirmLabel="Clear timeline"
+      body={"Every shot, image, prompt and audio segment on the timeline is removed. References and settings are kept." +
+        (nClips ? ` The ${nClips} rendered clip${nClips > 1 ? "s" : ""} on the results track ${nClips > 1 ? "are" : "is"} deleted too` +
+          " (a stitched full video is kept - it is not in the workspace). Save the project first if you want to keep them." : "")}
+      confirmLabel={nClips ? "Clear timeline and results" : "Clear timeline"}
       onCancel={() => setClearArm(false)}
-      onConfirm={() => { setClearArm(false); s.clearTimeline(); s.setToast("Timeline cleared"); }}
+      onConfirm={async () => {
+        setClearArm(false);
+        if (nClips && s.job.status === "running") {
+          s.setToast("A render is running - cancel it or let it finish before clearing its clips.");
+          return;
+        }
+        if (nClips && !(await s.clearResults())) return;
+        s.clearTimeline();
+        s.setToast(nClips ? "Timeline and results track cleared" : "Timeline cleared");
+      }}
     />
     <section className="time">
       <div className="tb">
@@ -689,6 +741,10 @@ export function Timeline() {
                     e.stopPropagation();
                     s.selectWindow(s.selectedWindow === i ? null : i);
                   }}
+                  onDoubleClick={(e) => {
+                    e.stopPropagation();
+                    openWinEdit(i, xOf(w.start) + (xOf(w.end) - xOf(w.start)) / 2, w.end - w.start);
+                  }}
                   title={bad
                     ? bad.text
                     : stats.manual
@@ -721,14 +777,47 @@ export function Timeline() {
               return (
                 <span
                   key={`wl${w.i}`}
-                  className="wlab"
+                  className="wlab edit"
+                  data-testid={`wlab-${w.i}`}
                   style={{ left: xOf(w.start) + px / 2 }}
-                  title={`Window ${w.i + 1}: ${w.end - w.start} frames`}
+                  title={`Window ${w.i + 1}: ${w.end - w.start} frames - click to type an exact length`}
+                  onPointerDown={(e) => e.stopPropagation()}
+                  onClick={(e) => { e.stopPropagation(); openWinEdit(w.i, xOf(w.start) + px / 2, w.end - w.start); }}
                 >
                   {((w.end - w.start) / s.fps).toFixed(2)}s
                 </span>
               );
             })}
+          {winEdit && (
+            <div className="wedit" data-testid="win-edit" style={{ left: winEdit.left }}
+              onPointerDown={(e) => e.stopPropagation()} onClick={(e) => e.stopPropagation()}>
+              <span className="wedit-n">Window {winEdit.i + 1}</span>
+              <input
+                ref={winEditRef}
+                className="nin"
+                inputMode="decimal"
+                defaultValue={(winEdit.frames / (s.fps || 24)).toFixed(2)}
+                onFocus={(e) => e.currentTarget.select()}
+                onChange={(e) => {
+                  const v = parseFloat(e.currentTarget.value.replace(",", "."));
+                  setWinEditHint(Number.isFinite(v) && v > 0 ? `${Math.max(1, Math.round(v * (s.fps || 24)))} frames` : "seconds");
+                }}
+                onKeyDown={(e) => {
+                  e.stopPropagation();          // Delete/Backspace edit the number, not the timeline
+                  if (e.key === "Escape") { setWinEdit(null); return; }
+                  if (e.key !== "Enter") return;
+                  const v = parseFloat(e.currentTarget.value.replace(",", "."));
+                  if (!Number.isFinite(v) || v <= 0) { setWinEditHint("type a length in seconds"); return; }
+                  const msg = s.setWindowSeconds(winEdit.i, v);
+                  setWinEdit(null);
+                  s.setToast(msg);
+                }}
+                onBlur={() => setWinEdit(null)}
+              />
+              <span className="wedit-u">s</span>
+              <span className="wedit-h">{winEditHint}</span>
+            </div>
+          )}
           {/* In manual mode every inner boundary is a handle. */}
           {s.timeline.showWindows && stats.manual &&
             stats.spans.slice(1).map((w) => (
@@ -882,7 +971,8 @@ export function Timeline() {
               </div>
             );
           })}
-          <div className="ph" style={{ left: xOf(s.timeline.playhead) }} />
+          <ResultsLane xOf={xOf} />
+          <div className="ph" data-frame={s.timeline.playhead} style={{ left: xOf(s.timeline.playhead) }} />
         </div>
       </div>
       <div

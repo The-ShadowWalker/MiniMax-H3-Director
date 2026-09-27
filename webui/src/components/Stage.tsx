@@ -73,7 +73,7 @@ function ProjectPane() {
     setBusy("Saving...");
     try {
       const r = await request<{ ok: boolean; path?: string; incomplete?: string[] }>(
-        "save_project_zip", { name: saveName, dir: saveDir }, 120000,
+        "save_project_zip", { name: saveName, dir: saveDir }, 3600000,
       );
       if (r?.incomplete?.length) {
         s.setToast(`SAVE INCOMPLETE — missing: ${r.incomplete.join(", ")}`);
@@ -139,7 +139,7 @@ function ProjectPane() {
               const pick = await request<{ path?: string; cancelled?: boolean }>("browse_zip", {}, 180000);
               if (!pick?.path) return;
               const r = await request<{ payload?: SessionPayloadLike; restored?: number; name?: string; media?: Record<string, never>; missing?: string[]; fileBase?: string }>(
-                "open_project_zip", { path: pick.path }, 180000);
+                "open_project_zip", { path: pick.path }, 3600000);
               if (r?.payload) {
                 const { hydrateMedia } = await import("../lib/media");
                 hydrateMedia(r.media, r.fileBase, r.missing);
@@ -163,7 +163,7 @@ function ProjectPane() {
                 <button className="btn sm" type="button" onClick={async () => {
                   try {
                     const r = await request<{ payload?: unknown; restored?: number; name?: string; media?: Record<string, never>; missing?: string[]; fileBase?: string }>(
-                      "open_project_zip", { path: pr.path }, 180000);
+                      "open_project_zip", { path: pr.path }, 3600000);
                     if (r?.payload) {
                       const { hydrateMedia } = await import("../lib/media");
                       hydrateMedia(r.media, r.fileBase, r.missing);
@@ -207,7 +207,14 @@ function ProjectPane() {
         onCancel={() => setNewArm(false)}
         onConfirm={async () => {
           setNewArm(false);
-          try { await request("new_project", { confirmed: true }, 60000); } catch { /* local only */ }
+          try {
+            await request("new_project", { confirmed: true }, 60000);
+          } catch (e) {
+            const why = String((e as Error)?.message || e);
+            // Refused while a render runs: it is writing into the workspace.
+            if (/running/.test(why)) { s.setToast(`Not started: ${why}`); return; }
+            /* no bridge: local only */
+          }
           s.newProject();
         }}
       />
@@ -1046,6 +1053,63 @@ function BridgeSummary() {
   );
 }
 
+function mmss(sec?: number) {
+  const t = Math.max(0, Math.round(sec || 0));
+  return `${Math.floor(t / 60)}:${String(t % 60).padStart(2, "0")}`;
+}
+
+/** An unfinished grouped render: what is finished, what Continue will do,
+ *  and why anything will be redone. Hidden while a run is going and once a
+ *  render has finished. */
+function ResumeCard() {
+  const r = useDirector((z) => z.render);
+  const running = useDirector((z) => z.job.status === "running");
+  const continueRender = useDirector((z) => z.continueRender);
+  const discardRender = useDirector((z) => z.discardRender);
+  const [arm, setArm] = useState(false);
+  if (!r || !r.has_record || r.complete || running || r.running) return null;
+  if (!r.recorded_groups) return null;
+  const kept = r.kept_groups || 0;
+  const redo = kept < (r.recorded_groups || 0);
+  return (
+    <div className="card resume" data-testid="resume-card">
+      <h4>Unfinished render</h4>
+      {r.resumable ? (
+        <div className="note ok">
+          <b>{kept}</b> group{kept === 1 ? "" : "s"} finished — {mmss(r.kept_seconds)} of {mmss(r.total_seconds)}
+          {" "}({r.kept_windows} of {r.total_windows} windows), on seed {r.seed}. Continue picks up
+          at window {(r.kept_windows || 0) + 1} from the last finished group, on the same seed.
+        </div>
+      ) : (
+        <div className="note warn">
+          The {r.recorded_groups} finished group{r.recorded_groups === 1 ? "" : "s"} cannot be kept:
+          {" "}{r.reason || "they no longer match the timeline"}. Generate will start over.
+        </div>
+      )}
+      {r.resumable && redo && r.reason && (
+        <div className="note warn">
+          {r.recorded_groups} were finished, but group {kept + 1} onward will be rendered again: {r.reason}.
+        </div>
+      )}
+      {(r.notes || []).map((n, i) => <div key={i} className="note">{n}</div>)}
+      <Row label="">
+        {r.resumable && (
+          <button className="btn sm go" type="button" onClick={() => continueRender()}>Continue</button>
+        )}
+        <button className="btn sm" type="button" onClick={() => setArm(true)}>Discard</button>
+      </Row>
+      <Confirm
+        open={arm}
+        title="Discard the unfinished render?"
+        body={`This deletes the ${r.recorded_groups} finished group clip(s) from the workspace. Generate will render everything again.`}
+        confirmLabel="Discard"
+        onCancel={() => setArm(false)}
+        onConfirm={() => { setArm(false); void discardRender(); }}
+      />
+    </div>
+  );
+}
+
 function GenPane() {
 
   const statusRef = useRef<HTMLDivElement | null>(null);
@@ -1316,6 +1380,7 @@ function GenPane() {
               />
             </Row>
           </div>
+          <ResumeCard />
           <div className={`card${s.job.status === "running" ? " status-live" : ""}`} ref={statusRef}>
             <h4>Status {s.job.status === "running" ? "\u00b7 running" : ""}</h4>
             <div className={`prog ${s.job.status === "error" ? "err" : s.job.status === "idle" ? "idle" : ""}`}>
@@ -1524,7 +1589,7 @@ function GenPane() {
             against those bands.
           </div>
 
-          <label className="chk" title="Give each window its own length instead of letting them come out equal. Drag the boundaries on the timeline, or type a length below.">
+          <label className="chk" title="Give each window its own length instead of letting them come out equal. Drag the boundaries on the timeline, or click a window's seconds there to type a length.">
             <input
               type="checkbox"
               checked={!!s.timeline.manualWindows}
@@ -1543,7 +1608,8 @@ function GenPane() {
           {s.timeline.manualWindows && (
             <>
               <div className="note">
-                Drag the boundaries on the timeline, or use the sliders below. Nothing is clamped
+                Drag the boundaries on the timeline, or click a window's seconds there to type its
+                length. Nothing is clamped
                 while you arrange — a window may sit out of range until you fix its neighbour.
                 <br />
                 <b>Hard limits:</b> {(stats.floor / s.fps).toFixed(2)}s to {(stats.ceiling / s.fps).toFixed(2)}s
@@ -1585,14 +1651,6 @@ function GenPane() {
                 {stats.frames.map((f, i) => (
                   <div className="row" key={i}>
                     <label title={`Window ${i + 1} of ${stats.frames.length}`}>Window {i + 1}</label>
-                    <input
-                      type="range"
-                      min={stats.floor}
-                      max={stats.ceiling}
-                      step={1}
-                      value={f}
-                      onChange={(e) => s.setWindowFrames(i, Number(e.target.value))}
-                    />
                     <span className="v num">{(f / s.fps).toFixed(2)}s</span>
                     <span className="v num dim">{f}f</span>
                     <button

@@ -396,7 +396,9 @@ if (toggle) {
   // click the second band to select it
   const all = await bands();
   if (all.length >= 2) {
-    await all[1].click();
+    // beside its seconds label: the label itself opens the type-a-length box
+    const bb = await all[1].boundingBox();
+    await all[1].click({ position: { x: Math.round(bb.width * 0.75), y: Math.round(bb.height / 2) } });
     await page.waitForTimeout(300);
     const sel = await page.$$eval(".winstrip .band[data-selected]", (e) => e.length);
     check("clicking a window selects it", sel === 1,
@@ -413,7 +415,11 @@ if (toggle) {
 
     // Backspace as well
     const before2 = await count();
-    (await bands())[0] && await (await bands())[0].click();
+    {
+      const b0 = (await bands())[0];
+      const bb0 = b0 && await b0.boundingBox();
+      if (b0) await b0.click({ position: { x: Math.round(bb0.width * 0.75), y: Math.round(bb0.height / 2) } });
+    }
     await page.waitForTimeout(250);
     await page.keyboard.press("Backspace");
     await page.waitForTimeout(350);

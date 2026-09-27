@@ -74,7 +74,8 @@ else:
         check("it looks like the real generate(), not a forwarder", hp._has_anchors(src))
         try:
             _, how = hp.transform_generate_source(src)
-            ok, detail = sorted(how) == ["audio_reference_gate", "target_audio_gate"], str(how)
+            ok, detail = sorted(h for h in how if not h.startswith("profile ")) == \
+                ["audio_reference_gate", "target_audio_gate"], str(how)
         except hp.HybridPipelineSourceError as exc:
             ok, detail = False, str(exc).splitlines()[0]
         check("both Hybrid transforms still apply to it", ok, detail)
@@ -141,7 +142,7 @@ try:
           "inspect.unwrap alone stops on the wrapper")
     rebuilt = hp._build_generate(Cls.generate, owner=Cls)
     check("and the Hybrid builds anyway, with both transforms",
-          sorted(getattr(rebuilt, "_hybrid_transforms", [])) ==
+          sorted(h for h in getattr(rebuilt, "_hybrid_transforms", []) if not h.startswith("profile ")) ==
           ["audio_reference_gate", "target_audio_gate"],
           str(getattr(rebuilt, "_hybrid_transforms", None)))
     check("the walk back cannot loop forever",

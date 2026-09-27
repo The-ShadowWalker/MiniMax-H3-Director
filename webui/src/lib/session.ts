@@ -1,5 +1,5 @@
 import { buildPromptRelay } from "./prompt";
-import { chosenAudioMode, defaultGroupWindows, realWindows, spansFromFrames } from "./h3";
+import { chosenAudioMode, defaultGroupWindows, fitFramesTo, realWindows, spansFromFrames } from "./h3";
 import { groupWindowsFor } from "./groups";
 import type { SessionPayload } from "./types";
 
@@ -128,7 +128,7 @@ export function buildGenerationPlan(p: SessionPayload) {
     // writes one /duration tag per window from these instead of working out
     // equal ones.
     manual_windows: manual,
-    window_frames: manual ? (p.timeline.windowFrames as number[]) : undefined,
+    window_frames: manual ? fitFramesTo(p.timeline.windowFrames as number[], total) : undefined,
     // Saved reference mods: which ones, how strongly, in apply order. The
     // relay turns this into the custom_settings payload the RefMods plugin
     // reads; it is dropped entirely when nothing is picked.

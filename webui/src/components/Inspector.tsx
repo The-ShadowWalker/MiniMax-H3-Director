@@ -1,5 +1,5 @@
-import { useDirector, useWindowStats } from "../lib/store";
-import { formatTimecode, realWindows } from "../lib/h3";
+import { useDirector, useWindowStats, windowLayout } from "../lib/store";
+import { formatTimecode } from "../lib/h3";
 import { getMedia, fmtDuration , servedUrl } from "../lib/media";
 import { useState } from "react";
 import { PromptBox } from "./PromptBox";
@@ -129,8 +129,7 @@ export function Inspector() {
       </div>
       <div className="ib">
         {(() => {
-          const total = Math.round(s.duration_sec * s.fps);
-          const bands = realWindows(total, s.timeline.slidingWindowSize, s.timeline.slidingWindowOverlap);
+          const bands = windowLayout(s).spans;
           const cuts = bands.map((b) => b.start).filter((c) => c > seg.start && c < seg.start + seg.length);
           if (!cuts.length) return null;
           return (
@@ -188,6 +187,34 @@ export function Inspector() {
           );
         })()}
 
+        {(seg.track === "audio" || seg.track === "clipaudio") && (() => {
+          // Any time, not only when the file was added: the
+          // timeline ends where this audio ends.
+          const fps = s.fps || 24;
+          // the file's own length when it is known, else the clip's
+          const m = getMedia(seg.mediaId);
+          const len = m && m.durationSec > 0 ? m.durationSec : seg.length / fps;
+          if (!(len > 0)) return null;
+          const end = Math.round((seg.start / fps + len) * 100) / 100;
+          const same = Math.abs(end - s.duration_sec) < 0.02;
+          return (
+            <div className="fs"><div className="row">
+              <label>Timeline</label>
+              {same ? (
+                <span className="v" data-testid="fit-timeline-audio-ok">ends with this audio ({end.toFixed(2)}s)</span>
+              ) : (
+                <button type="button" className="btn sm" data-testid="fit-timeline-audio"
+                  title={`The timeline is ${s.duration_sec.toFixed(2)}s. Make it end where this audio ends. Nothing on the timeline is moved or cut.`}
+                  onClick={() => {
+                    s.setDuration(end);
+                    s.setToast(`Timeline set to ${end.toFixed(2)}s, the length of ${m?.name || "this audio"}`);
+                  }}>
+                  Set timeline to this audio ({end.toFixed(2)}s)
+                </button>
+              )}
+            </div></div>
+          );
+        })()}
         {seg.track === "control" && !seg.mediaId && (
           <BridgePlan segId={seg.id} />
         )}

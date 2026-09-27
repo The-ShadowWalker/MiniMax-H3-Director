@@ -58,7 +58,9 @@ export function request<T = unknown>(cmd: string, data: Record<string, unknown> 
       },
     });
     try {
-      window.parent.postMessage({ source: FRAME_TAG, cmd, data, id }, "*");
+      // ttl: how long this caller will wait, so the Wan2GP side waits as long
+      // before it gives up on the answer and moves on to the next request.
+      window.parent.postMessage({ source: FRAME_TAG, cmd, data, id, ttl: timeoutMs }, "*");
     } catch (e) {
       clearTimeout(timer);
       pending.delete(id);

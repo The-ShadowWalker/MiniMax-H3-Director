@@ -4,7 +4,7 @@ import { request } from "../lib/bridge";
 import { flushNow } from "../lib/persist";
 import { downloadJson, readSessionFile } from "../lib/session";
 
-const H3D2_BUILD = "2.43.1";
+const H3D2_BUILD = "1.6.19";
 
 export function TopBar() {
   const fileRef = useRef<HTMLInputElement>(null);
@@ -19,7 +19,14 @@ export function TopBar() {
       <div className="chipf">
         <span className={s.dirty ? "dot warn" : "dot"} />
         <b>{s.project_name}</b>
-        <span style={{ color: "var(--ink3)" }}>{s.savedAt ? `saved ${s.savedAt}` : s.dirty ? "unsaved" : "demo"}</span>
+        {s.loadBlocked ? (
+          <span className="pill w" data-testid="not-saving"
+            title="Your project has not loaded from Wan2GP yet. Until it does, nothing is saved, so what is on screen cannot overwrite it.">
+            NOT SAVING · project not loaded yet ({s.loadBlocked})
+          </span>
+        ) : (
+          <span style={{ color: "var(--ink3)" }}>{s.savedAt ? `saved ${s.savedAt}` : s.dirty ? "unsaved" : "demo"}</span>
+        )}
       </div>
       <button
         className="btn sm"
@@ -37,7 +44,7 @@ export function TopBar() {
             }
             await flushNow();
             const r = await request<{ ok: boolean; path?: string; incomplete?: string[] }>(
-              "save_project_zip", { name: s.project_name, dir }, 180000);
+              "save_project_zip", { name: s.project_name, dir }, 3600000);
             if (r?.incomplete?.length) s.setToast(`SAVE INCOMPLETE - missing: ${r.incomplete.join(", ")}`);
             else s.setToast(`Saved to ${r?.path || dir}`);
           } catch (e) {
@@ -55,7 +62,7 @@ export function TopBar() {
             s.patch({ saveDir: pick.dir });
             await flushNow();
             const r = await request<{ path?: string }>("save_project_zip",
-              { name: s.project_name, dir: pick.dir }, 180000);
+              { name: s.project_name, dir: pick.dir }, 3600000);
             s.setToast(`Saved to ${r?.path || pick.dir}`);
           } catch (e) { s.setToast(`Save failed: ${String(e)}`); }
         }}>
@@ -70,7 +77,7 @@ export function TopBar() {
             if (pick?.path) {
               const r = await request<{ payload?: unknown; restored?: number; name?: string;
                 media?: Record<string, never>; missing?: string[]; fileBase?: string }>(
-                "open_project_zip", { path: pick.path }, 180000);
+                "open_project_zip", { path: pick.path }, 3600000);
               if (r?.payload) {
                 const { hydrateMedia } = await import("../lib/media");
                 hydrateMedia(r.media, r.fileBase, r.missing);

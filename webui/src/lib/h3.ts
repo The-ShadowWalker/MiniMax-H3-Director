@@ -734,3 +734,20 @@ export function defaultGroupWindows(
   const fits = Math.floor(budgetGiB / perWindow);
   return Math.max(1, Math.min(windowFrames.length, fits || 1));
 }
+
+/** Hand-set window lengths made to add up to `total`: the last window grows,
+ *  or shrinks -- and windows are dropped from the end only when there is
+ *  nothing left of them. Every other window keeps its length. */
+export function fitFramesTo(frames: number[], total: number): number[] {
+  const out = frames.map((f) => Math.max(1, Math.round(f)));
+  let diff = Math.max(1, Math.round(total)) - out.reduce((a, b) => a + b, 0);
+  if (diff > 0) out[out.length - 1] += diff;
+  while (diff < 0 && out.length) {
+    const last = out.length - 1;
+    const can = out[last] - 1;
+    if (-diff <= can || last === 0) { out[last] = Math.max(1, out[last] + diff); diff = 0; break; }
+    diff += out[last];
+    out.pop();
+  }
+  return out;
+}

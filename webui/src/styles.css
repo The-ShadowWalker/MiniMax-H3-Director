@@ -130,7 +130,9 @@ border:1px solid var(--ln2);color:var(--ink2);cursor:pointer}
 .chip.on{background:var(--sigbg);border-color:#2c4a68;color:var(--sig)}
 .adv{font-size:11px;color:var(--sig);cursor:pointer}
 .act{grid-area:act;background:var(--pan);border-top:1px solid var(--ln);display:flex;
-align-items:center;gap:8px;padding:0 12px}
+align-items:center;gap:8px;padding:0 12px;overflow-x:auto;overflow-y:hidden}
+/* never squeeze a button out of sight: the bar scrolls sideways instead */
+.act>*{flex-shrink:0}
 .stat{font-size:11px;color:var(--ink2);margin-left:auto;display:flex;gap:12px;align-items:center}
 
 /* --- H3 Director: iframe host adjustments --- */
@@ -480,6 +482,16 @@ canvas.wave{position:absolute;inset:0;width:100%;height:100%;pointer-events:none
 .warnbox.soft{opacity:.9}
 .warnbox.soft b{color:var(--warn)}
 
+/* the seconds label opens a box to type the length */
+.wlab.edit{pointer-events:auto;cursor:text;z-index:6}
+.wlab.edit:hover{background:#fff;box-shadow:0 0 0 1px rgba(0,0,0,.35)}
+.wedit{position:absolute;top:100%;transform:translateX(-50%);margin-top:3px;z-index:40;
+  display:flex;align-items:center;gap:5px;padding:5px 7px;border-radius:6px;white-space:nowrap;
+  background:var(--pan);border:1px solid var(--ln);box-shadow:0 6px 18px rgba(0,0,0,.45);font-size:11px}
+.wedit input{width:64px}
+.wedit-n{color:var(--ink2)}
+.wedit-h{color:var(--ink2);min-width:64px}
+
 /* a selected window band */
 .winstrip .band[data-selected]{outline:2px solid #fff;outline-offset:-2px;
   box-shadow:0 0 0 1px rgba(0,0,0,.45) inset;filter:brightness(1.25)}
@@ -512,3 +524,56 @@ canvas.wave{position:absolute;inset:0;width:100%;height:100%;pointer-events:none
 .gblab{position:absolute;left:4px;top:0;line-height:13px;font-size:10px;
   color:#8fb0d8;font-variant-numeric:tabular-nums;pointer-events:none}
 .gband.alt .gblab{color:#d3a75f}
+/* unfinished-render card: plain text flow, amber when something must be redone */
+.card.resume{border-color:var(--sig)}
+.card.resume .note{display:block;margin-bottom:6px}
+.note.warn{background:#2a2112;border-color:#5a4520;color:#f0cf95}
+/* results track: what was rendered, where it lands */
+.app.has-results{grid-template-rows:42px 340px 1fr 38px}
+.trk.results{background:#101317;border-top:1px solid #2a3038}
+.rclip{position:absolute;top:13px;height:28px;border-radius:3px;overflow:hidden;
+background:#26303b center/100% 100% no-repeat;border:1px solid #3d7a5c;
+box-shadow:inset 0 0 0 1px rgba(0,0,0,.35)}
+.rclip .rlab{position:absolute;left:3px;top:2px;font-size:9px;line-height:1;padding:2px 4px;
+border-radius:2px;background:rgba(10,14,18,.78);color:#cfe9dc;white-space:nowrap}
+.rclip[data-status="redo"],.rclip[data-status="after"]{border-color:var(--warn)}
+.rclip[data-status="redo"]::after,.rclip[data-status="after"]::after{content:"";position:absolute;inset:0;
+background:repeating-linear-gradient(135deg,rgba(217,164,65,.28) 0 6px,rgba(0,0,0,0) 6px 12px)}
+.rclip[data-status="redo"] .rlab,.rclip[data-status="after"] .rlab{color:#f0cf95}
+.rclip[data-status="unchecked"]{border-color:#6b7280;filter:grayscale(.7)}
+.rclip.live{border:1px dashed var(--sig);background:rgba(127,178,232,.10);animation:rpulse 1.6s ease-in-out infinite}
+.rclip.live .rlab{color:#bcd7f5}
+@keyframes rpulse{50%{background:rgba(127,178,232,.22)}}
+.rempty{position:absolute;left:8px;top:21px;font-size:10px;color:var(--ink3);font-style:italic;white-space:nowrap}
+/* results viewer: the monitor window, plus two stacked players and a strip */
+.monitor.rviewer{width:560px;height:400px;min-width:300px;min-height:230px;display:flex;flex-direction:column;z-index:89}
+.rv-stage{position:relative;flex:1 1 auto;min-height:0;background:#000}
+.rv-stage video{position:absolute;inset:0;width:100%;height:100%;object-fit:contain;background:#000}
+.rv-bar{position:relative;flex:0 0 auto;height:14px;margin:6px 8px 0;background:#1b2027;border-radius:3px;cursor:pointer}
+.rv-seg{position:absolute;top:2px;bottom:2px;background:#2f6b50;border-right:1px solid #0f1114}
+.rv-seg[data-status="redo"],.rv-seg[data-status="after"]{background:#6b5424}
+.rv-head{position:absolute;top:-2px;bottom:-2px;width:2px;margin-left:-1px;background:#fff}
+.rv-ctl{display:flex;align-items:center;gap:6px}
+.rv-time{margin-left:4px;color:var(--ink2)}
+.rv-note{margin-left:auto;color:var(--warn)}
+.rclip{cursor:zoom-in}
+/* the playhead is a line to look at, never something to click on */
+.ph{pointer-events:none}
+.rv-empty{position:absolute;inset:0;display:grid;place-items:center;color:var(--ink3);font-size:11px;padding:10px;text-align:center}
+.rv-hint{flex:1;color:var(--ink3);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+/* a clip marked to regenerate */
+.rclip[data-marked="1"]{outline:2px solid #e8b04a;outline-offset:-1px}
+.rclip .rmark{position:absolute;right:3px;top:1px;font-size:13px;line-height:1;color:#ffd27a;text-shadow:0 0 3px #000}
+
+/* results track: where the windows inside a clip meet, and the split button */
+.rclip .rwin{position:absolute;top:0;bottom:0;width:0;border-left:1px dashed rgba(255,255,255,.75);pointer-events:none}
+.rclip .rsplit{position:absolute;right:3px;bottom:2px;z-index:3;padding:0 6px;line-height:14px;font-size:10px;font-weight:600;
+  border-radius:3px;border:1px solid #0b0e12;background:#ffd27a;color:#1a1204;cursor:pointer;white-space:nowrap}
+.rclip .rsplit:hover{background:#ffe3a6}
+/* right-click menu on a result clip */
+.rmenu{position:fixed;z-index:200;min-width:190px;padding:4px;border-radius:6px;background:var(--pan);
+  border:1px solid var(--ln);box-shadow:0 8px 22px rgba(0,0,0,.5);display:flex;flex-direction:column}
+.rmenu-h{font-size:10px;color:var(--ink3);padding:3px 8px 5px}
+.rmenu button{all:unset;cursor:pointer;padding:5px 8px;border-radius:4px;font-size:12px;color:var(--ink)}
+.rmenu button:hover:not(:disabled){background:rgba(127,178,232,.16)}
+.rmenu button:disabled{opacity:.4;cursor:default}

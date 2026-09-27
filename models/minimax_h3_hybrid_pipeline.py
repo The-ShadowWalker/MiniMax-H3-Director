@@ -87,7 +87,12 @@ _TRANSFORMS = (
             r'if\s+self\.reference_mode\s+and\s+'
             r'(?:self\.fixed_prompt\s+is\s+None\s+and\s+)?'
             r'(?:not\s+refinement_mode\s+and\s+)?'
-            r'"A"\s+in\s+\(\s*audio_prompt_type\s+or\s+""\s*\)\s*:'
+            r'"A"\s+in\s+\(\s*audio_prompt_type\s+or\s+""\s*\)'
+            # WanGP 13.14 adds `and not soundtrack` (its own "S" flag: use
+            # the audio as the soundtrack, not a voice reference). The Hybrid
+            # never uses the song as a voice reference, so the policy method
+            # decides either way.
+            r'(?:\s+and\s+not\s+soundtrack)?\s*:'
         ),
         "replacement": (
             'if self._hybrid_should_add_audio_reference('
@@ -100,7 +105,8 @@ _TRANSFORMS = (
         # Older: `not self.reference_mode and ...`
         # Newer: `(refinement_mode or not self.reference_mode) and ...`
         "pattern": re.compile(
-            r'if\s+(?:\(\s*refinement_mode\s+or\s+not\s+self\.reference_mode'
+            # WanGP 13.14: `(refinement_mode or soundtrack or not ...`
+            r'if\s+(?:\(\s*refinement_mode\s+or\s+(?:soundtrack\s+or\s+)?not\s+self\.reference_mode'
             r'(?:\s+or\s+self\.fixed_prompt\s+is\s+not\s+None)?\s*\)'
             r'|not\s+self\.reference_mode)\s+and\s+'
             r'any\(\s*flag\s+in\s+\(\s*audio_prompt_type\s+or\s+""\s*\)\s+'
@@ -142,34 +148,88 @@ def _source_excerpt(source: str) -> str:
     return "\n".join(out) if out else "  (no candidate lines found at all)"
 
 
+def _compat_module():
+    """H3 Director's compat module (which Wan2GP, and what each needs), or None."""
+    global _COMPAT
+    if _COMPAT is not False:
+        return _COMPAT
+    _COMPAT = None
+    pkg = (__package__ or "").rsplit(".", 1)[0]
+    for name in ([pkg + ".compat"] if pkg else []) + ["compat"]:
+        try:
+            import importlib
+            _COMPAT = importlib.import_module(name)
+            break
+        except Exception:
+            continue
+    return _COMPAT
+
+
+_COMPAT = False  # False = not looked yet, None = not found
+
+
+def _profile_candidates():
+    """[(profile name, {transform name: compiled pattern})], best guess first.
+
+    The compat module orders them by the Wan2GP version that is running;
+    the tolerant built-in patterns (which accept every known shape) are the
+    last resort, and are all there is if compat cannot be loaded.
+    """
+    out = []
+    compat = _compat_module()
+    if compat is not None:
+        try:
+            version, _profile, _line = compat.current()
+            for prof in compat.candidates(version):
+                pats = {}
+                for spec in _TRANSFORMS:
+                    rx = prof.get("hybrid_" + spec["name"])
+                    if rx:
+                        pats[spec["name"]] = re.compile(rx)
+                if len(pats) == len(_TRANSFORMS):
+                    out.append((prof.get("name", "?"), pats))
+        except Exception as exc:
+            print("[H3 Hybrid] compatibility profiles unavailable (%s); using the built-in patterns" % exc)
+    out.append(("built-in (any known shape)", {spec["name"]: spec["pattern"] for spec in _TRANSFORMS}))
+    return out
+
+
 def transform_generate_source(source: str):
     """Apply both transforms to `source`. Returns (new_source, how).
 
     Both must apply. A partial application is refused -- opening the target
     audio path without closing the voice-clone path (or the reverse) would
     silently produce the wrong conditioning rather than an error.
+
+    Each compatibility profile is tried in turn, the one for the running
+    Wan2GP first; the first whose BOTH patterns match exactly once is used.
     """
     refinement = _refinement_expr(source)
-    how = []
-    for spec in _TRANSFORMS:
-        pattern = spec["pattern"]
-        replacement = spec["replacement"].format(refinement=refinement)
-        found = pattern.findall(source)
-        if len(found) == 1:
-            source = pattern.sub(lambda _m: replacement, source, count=1)
-            how.append(spec["name"])
+    tried = []
+    for prof_name, pats in _profile_candidates():
+        counts = {name: len(rx.findall(source)) for name, rx in pats.items()}
+        tried.append("%s: %s" % (prof_name, ", ".join("%s=%d" % kv for kv in counts.items())))
+        if any(n != 1 for n in counts.values()):
             continue
-        raise HybridPipelineSourceError(
-            "Wan2GP MiniMax H3 pipeline has changed shape: could not take "
-            f'ownership of {spec["name"]} ({spec["purpose"]}); '
-            f"matches={len(found)} (expected exactly 1).\n"
-            "This plugin will NOT guess at an unknown pipeline.\n"
-            "Relevant source from the installed MiniMaxH3Pipeline.generate():\n"
-            + _source_excerpt(source)
-        )
-    if refinement == "False":
-        how.append("no-refinement_mode")
-    return source, how
+        out = source
+        how = []
+        for spec in _TRANSFORMS:
+            replacement = spec["replacement"].format(refinement=refinement)
+            out = pats[spec["name"]].sub(lambda _m: replacement, out, count=1)
+            how.append(spec["name"])
+        if refinement == "False":
+            how.append("no-refinement_mode")
+        how.append("profile " + prof_name)
+        return out, how
+    first = _TRANSFORMS[0]
+    raise HybridPipelineSourceError(
+        "Wan2GP MiniMax H3 pipeline has changed shape: could not take "
+        f'ownership of {first["name"]} ({first["purpose"]}) with any known profile.\n'
+        "Tried: " + "; ".join(tried) + ".\n"
+        "This plugin will NOT guess at an unknown pipeline.\n"
+        "Relevant source from the installed MiniMaxH3Pipeline.generate():\n"
+        + _source_excerpt(source)
+    )
 
 
 def _refmods_module():

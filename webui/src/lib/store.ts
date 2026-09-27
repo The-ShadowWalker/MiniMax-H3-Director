@@ -28,6 +28,7 @@ import {
   windowFloorFrames,
   windowSecondsWarning,
   planGroups,
+  fitFramesTo,
 } from "./h3";
 import { buildPromptRelay } from "./prompt";
 import { groupWindowsFor } from "./groups";
@@ -69,6 +70,10 @@ export interface DirectorState extends SessionPayload {
   /** Give window `i` exactly this many frames, taking the difference from the
    *  next window so the total still matches the timeline. */
   setWindowFrames: (i: number, frames: number) => void;
+  /** Set window i to a typed length in seconds, the way dragging its end
+   *  would (the windows after it give and take, the total stays the
+   *  timeline's). Turns manual windows on if needed. Returns what happened. */
+  setWindowSeconds: (i: number, sec: number) => string;
   /** Throw away the hand-set layout and go back to equal windows. */
   resetWindowFrames: () => void;
   /** Resize windows to the durations typed into the prompts. */
@@ -145,8 +150,36 @@ export interface DirectorState extends SessionPayload {
   recover: () => boolean;
   resetDemo: () => void;
   newProject: () => void;
+  /** Delete the finished clips and their record. False if it was refused. */
+  clearResults: () => Promise<boolean>;
   previewSchedule: () => void;
-  generate: (scope: "all" | "here") => void;
+  generate: (scope: "all" | "here", opts?: { resume?: boolean; fresh?: boolean; regen?: { groups: number[]; seed: string } }) => void;
+  /** Result clips marked to be rendered again, by group number. */
+  regenMarks: number[];
+  toggleRegenMark: (group: number) => void;
+  clearRegenMarks: () => void;
+  /** "new" (default) or "same": the seed a regen uses. */
+  regenMarked: () => void;
+  /** Join the finished clips into one video. */
+  stitch: () => Promise<void>;
+  /** Cut a finished clip into one clip per window, so one part can be redone. */
+  splitClip: (group: number) => Promise<void>;
+  /** Split every marked clip that covers more than one window. */
+  splitMarked: () => Promise<void>;
+  stitching: boolean;
+  /** What a grouped render has finished, and what Continue would do with it. */
+  render: RenderState | null;
+  refreshRender: () => Promise<void>;
+  continueRender: () => void;
+  discardRender: () => Promise<void>;
+  /** The results viewer: which group it opened on, and where it sits. */
+  resultView: { group: number; opened: number; x?: number; y?: number } | null;
+  setResultView: (v: { group: number; opened: number; x?: number; y?: number } | null) => void;
+  /** Set while the project on disk has not loaded: nothing is saved then. */
+  loadBlocked: string | null;
+  /** Generate was pressed while an unfinished render could be continued. */
+  startOverArm: boolean;
+  setStartOverArm: (v: boolean) => void;
   cancel: () => void;
   applyToGenerator: () => Promise<void>;
   previewPrompt: () => Promise<void>;
@@ -158,11 +191,58 @@ export interface DirectorState extends SessionPayload {
   setScheduleOpen: (v: boolean) => void;
 }
 
+/** One finished render group, as the results track draws it. */
+export interface RenderClip {
+  group: number;
+  first_window: number;
+  n_windows: number;
+  start: number;
+  frames: number;
+  frames_got: number;
+  master: string;
+  bytes?: number | null;
+  seed?: number;
+  finished?: string;
+  /** done: matches the timeline. redo: the first that no longer does.
+   *  after: follows a redo, so it renders again too. unchecked: unknown. */
+  status: "done" | "redo" | "after" | "unchecked";
+  /** The length of each window inside this clip, in frames. */
+  windows?: number[];
+  why?: string;
+  /** How many times this group has been rendered. */
+  take?: number;
+  /** This clip's OWN prompt or media changed since it was rendered. */
+  changed?: boolean;
+}
+
+/** Python's answer to render_state: the same check Continue itself makes. */
+export interface RenderState {
+  has_record: boolean;
+  running: boolean;
+  resumable: boolean;
+  complete: boolean;
+  recorded_groups?: number;
+  kept_groups?: number;
+  kept_windows?: number;
+  total_windows?: number;
+  kept_seconds?: number;
+  total_seconds?: number;
+  reason?: string | null;
+  notes?: string[];
+  seed?: number;
+  clips?: RenderClip[];
+  active?: { group: number; first_window: number; n_windows: number; start: number; frames: number } | null;
+  /** The last stitched full video, and whether a clip changed since. */
+  joined?: string | null;
+  stitch_stale?: boolean;
+  stitch_why?: string;
+}
+
 function totalFrames(s: Pick<SessionPayload, "fps" | "duration_sec">) {
   return Math.max(1, Math.round(s.duration_sec * s.fps));
 }
 
-function clampSeg(seg: Segment, maxF: number, snap: boolean, win: number, ovl: number, others: Segment[]): Segment {
+function clampSeg(seg: Segment, maxF: number, snap: boolean, wins: { start: number; end: number }[], others: Segment[]): Segment {
   let start = Math.max(0, Math.round(seg.start));
   let length = Math.max(4, Math.round(seg.length));
   if (start + length > maxF) {
@@ -174,7 +254,7 @@ function clampSeg(seg: Segment, maxF: number, snap: boolean, win: number, ovl: n
     }
   }
   if (snap) {
-    const wins = realWindows(maxF, win, ovl);
+    // The windows IN FORCE: hand-set ones in manual mode, not the automatic plan.
     const edges = [0, maxF, ...wins.flatMap((w) => [w.start, w.end])];
     for (const o of others) {
       if (o.id === seg.id || o.track !== seg.track) continue;
@@ -285,6 +365,35 @@ export const useDirector = create<DirectorState>()((set, get) => ({
           return { timeline: { ...st.timeline, windowFrames: frames }, dirty: (markDirty(), true) };
         }),
 
+      setWindowSeconds: (i, sec) => {
+        let st = get();
+        const fps = st.fps || 24;
+        const want = Math.max(1, Math.round(sec * fps));
+        if (!st.timeline.manualWindows) {
+          // typing a length is setting it by hand: start from the windows
+          // as they are drawn now
+          st.setManualWindows(true);
+          if (!st.timeline.showWindows) st.patchTimeline({ showWindows: true });
+          st = get();
+        }
+        const frames = st.timeline.windowFrames || [];
+        if (i < 0 || i >= frames.length) return "There is no such window.";
+        if (frames.length === 1) return "The only window is as long as the timeline - change the Duration instead.";
+        const startOf = (k: number, fr: number[]) => fr.slice(0, k).reduce((a, b) => a + b, 0);
+        const total = frames.reduce((a, b) => a + b, 0);
+        if (i < frames.length - 1) {
+          // move this window's END; the windows after it make room
+          st.dragWindowEdge(i + 1, startOf(i, frames) + want);
+        } else {
+          // the last window: move its START; the window before it makes room
+          st.dragWindowEdge(i, total - want);
+        }
+        const got = (get().timeline.windowFrames || [])[i] ?? frames[i];
+        const secs = (n: number) => `${(n / fps).toFixed(2)}s`;
+        return got === want
+          ? `Window ${i + 1} is now ${secs(got)} (${got} frames)`
+          : `Window ${i + 1} could only go to ${secs(got)} (${got} frames) - the other windows cannot give up more`;
+      },
       setWindowFrames: (i, want) =>
         set((st) => {
           const frames = [...(st.timeline.windowFrames || [])];
@@ -329,7 +438,10 @@ export const useDirector = create<DirectorState>()((set, get) => ({
         }),
 
       selectedWindow: null,
-      selectWindow: (i) => set({ selectedWindow: i }),
+      // ONE thing is selected at a time: Delete removes that thing and only
+      // that. A window left selected used to be removed along with the clip
+      // you had picked since.
+      selectWindow: (i) => set(i == null ? { selectedWindow: null } : { selectedWindow: i, selectedId: null }),
 
       removeSelectedWindow: () => {
         const st = get();
@@ -429,6 +541,140 @@ export const useDirector = create<DirectorState>()((set, get) => ({
       statusOpen: false,
       bridgeOk: null,
       saveInfo: "",
+      render: null,
+      regenMarks: [],
+      toggleRegenMark: (group) => set((st) => ({
+        regenMarks: st.regenMarks.includes(group)
+          ? st.regenMarks.filter((g) => g !== group)
+          : [...st.regenMarks, group].sort((a, b) => a - b),
+      })),
+      clearRegenMarks: () => set({ regenMarks: [] }),
+      regenMarked: () => {
+        const st = get();
+        if (!st.regenMarks.length) return;
+        // Always on the render's own seed: the clips either side were made on
+        // it, and a different one makes the new take stop matching them.
+        st.generate("all", { regen: { groups: st.regenMarks, seed: "same" } });
+      },
+      splitClip: async (group) => {
+        const st = get();
+        if (!hasParent() || st.job.status === "running") return;
+        let plan;
+        try {
+          plan = assembleWanSettings(st as unknown as SessionPayload);
+        } catch (e) {
+          set({ toast: `Could not split: ${String(e)}` });
+          return;
+        }
+        set({ toast: `Splitting G${group} into its windows...` });
+        try {
+          const r = await request<{ pieces: number }>("render_split",
+            { settings: plan, target_frames: totalFrames(st), fps: st.fps, group }, 600000);
+          // clip numbers after it move up, so marks made before would point
+          // at the wrong clips
+          set({ regenMarks: [], toast: `G${group} is now ${r.pieces} clips, one per window - mark the one to redo` });
+        } catch (e) {
+          set({ toast: `Could not split G${group}: ${String((e as Error)?.message || e)}` });
+        } finally {
+          void get().refreshRender();
+        }
+      },
+      splitMarked: async () => {
+        const st = get();
+        if (!hasParent() || st.job.status === "running") return;
+        const clips = st.render?.clips || [];
+        // Highest first: splitting a clip renumbers the ones after it, never
+        // the ones before, so the numbers still to do stay right.
+        const todo = st.regenMarks
+          .filter((g) => (clips.find((c) => c.group === g)?.n_windows || 0) > 1)
+          .sort((a, b) => b - a);
+        if (!todo.length) { set({ toast: "None of the marked clips has more than one window to split into" }); return; }
+        let plan;
+        try {
+          plan = assembleWanSettings(st as unknown as SessionPayload);
+        } catch (e) {
+          set({ toast: `Could not split: ${String(e)}` });
+          return;
+        }
+        let done = 0;
+        const failed: string[] = [];
+        for (const g of todo) {
+          set({ toast: `Splitting G${g} into its windows...` });
+          try {
+            await request("render_split", { settings: plan, target_frames: totalFrames(st), fps: st.fps, group: g }, 600000);
+            done += 1;
+          } catch (e) {
+            failed.push(`G${g}: ${String((e as Error)?.message || e)}`);
+          }
+        }
+        set({
+          regenMarks: [],
+          toast: failed.length
+            ? `Split ${done} clip(s); not split - ${failed.join("; ")}`
+            : `Split ${done} clip(s) into one clip per window - now mark the part to redo`,
+        });
+        void get().refreshRender();
+      },
+      stitching: false,
+      stitch: async () => {
+        const st = get();
+        if (!hasParent() || st.stitching) return;
+        set({ stitching: true, toast: "Stitching the clips into one video..." });
+        try {
+          const r = await request<{ path: string; clips: number; complete: boolean; frames: number; planned: number }>(
+            "stitch", { name: st.project_name, dir: st.saveDir || "" }, 3600000);
+          set({ toast: `Stitched ${r.clips} clip(s): ${r.path}${r.complete ? "" : " (the render is not finished yet - this is what exists so far)"}` });
+          useDirector.setState((c) => ({ job: { ...c.job, files: [r.path], logs: [...c.job.logs,
+            { t: Date.now(), level: "ok" as const, msg: `Stitched ${r.clips} clip(s): ${r.path}` }] } as GenJob }));
+        } catch (e) {
+          set({ toast: `Stitch failed: ${String((e as Error)?.message || e)}` });
+        } finally {
+          set({ stitching: false });
+          // the Stitch button goes back to normal once the video is current
+          void get().refreshRender();
+        }
+      },
+      resultView: null,
+      setResultView: (v) => set({ resultView: v }),
+      loadBlocked: null,
+      startOverArm: false,
+      setStartOverArm: (v) => set({ startOverArm: v }),
+      refreshRender: async () => {
+        if (!hasParent()) return;
+        // One check at a time: a second call while one is out just asks for
+        // one more afterwards, so a burst of edits costs two checks, not ten.
+        if (renderAsk.busy) { renderAsk.again = true; return; }
+        renderAsk.busy = true;
+        try {
+          await refreshRenderOnce();
+        } finally {
+          renderAsk.busy = false;
+          if (renderAsk.again) { renderAsk.again = false; void get().refreshRender(); }
+        }
+      },
+      continueRender: () => get().generate("all", { resume: true }),
+      clearResults: async () => {
+        // The finished clips go with the timeline they were rendered from.
+        // A stitched full video is not in the workspace and is left alone.
+        if (hasParent()) {
+          try {
+            await request("render_discard", {}, 60000);
+          } catch (e) {
+            set({ toast: `The results track was not cleared: ${String((e as Error)?.message || e)}` });
+            return false;
+          }
+        }
+        set({ render: null, regenMarks: [], resultView: null });
+        void get().refreshRender();
+        return true;
+      },
+      discardRender: async () => {
+        if (hasParent()) {
+          try { await request("render_discard", {}, 60000); } catch { /* reported below */ }
+        }
+        set({ render: null, toast: "Unfinished render discarded" });
+        void get().refreshRender();
+      },
       setPreview: (p) => set({ preview: p }),
       setLockClipAudio: (v) => set({ lockClipAudio: v, dirty: (markDirty(), true) }),
       setStatusOpen: (v) => set({ statusOpen: v }),
@@ -464,10 +710,17 @@ export const useDirector = create<DirectorState>()((set, get) => ({
         const duration_sec = Math.max(0.5, Math.min(600, sec));
         set((s) => {
           const maxF = Math.round(duration_sec * s.fps);
+          // Hand-set windows keep the lengths you gave them; the LAST one
+          // takes up the change so they still cover exactly the timeline.
+          // Left alone, the windows stopped short of (or ran past) the new
+          // end, and the plan then added a window of its own to cover it.
+          const hand = s.timeline.manualWindows && s.timeline.windowFrames?.length
+            ? fitFramesTo(s.timeline.windowFrames, maxF) : s.timeline.windowFrames;
           return {
             duration_sec,
             timeline: {
               ...s.timeline,
+              windowFrames: hand,
               durationSec: duration_sec,
               playhead: Math.min(s.timeline.playhead, maxF),
               // Changing the timeline length changes the TIMELINE, nothing
@@ -507,7 +760,7 @@ export const useDirector = create<DirectorState>()((set, get) => ({
             : {}),
         }));
       },
-      select: (id) => set({ selectedId: id, pane: id ? get().pane : get().pane }),
+      select: (id) => set(id ? { selectedId: id, selectedWindow: null } : { selectedId: null }),
       selectRef: (i) => set({ selectedRef: i }),
       updateSeg: (id, p) =>
         set((s) => ({
@@ -527,8 +780,7 @@ export const useDirector = create<DirectorState>()((set, get) => ({
               { ...seg, start, length: length ?? seg.length },
               maxF,
               s.timeline.snap,
-              s.timeline.slidingWindowSize,
-              s.timeline.slidingWindowOverlap,
+              windowLayout(s).spans,
               segs,
             );
           });
@@ -603,8 +855,7 @@ export const useDirector = create<DirectorState>()((set, get) => ({
           base,
           maxF,
           s.timeline.snap,
-          s.timeline.slidingWindowSize,
-          s.timeline.slidingWindowOverlap,
+          windowLayout(s).spans,
           s.timeline.segments,
         );
         set({
@@ -640,8 +891,8 @@ export const useDirector = create<DirectorState>()((set, get) => ({
         set((s) => {
           const seg = s.timeline.segments.find((x) => x.id === id);
           if (!seg) return {};
-          const total = totalFrames(s);
-          const bands = realWindows(total, s.timeline.slidingWindowSize, s.timeline.slidingWindowOverlap);
+          // Split where the windows ACTUALLY are: hand-set in manual mode.
+          const bands = windowLayout(s).spans;
           const cuts = bands
             .map((b) => b.start)
             .filter((c) => c > seg.start && c < seg.start + seg.length);
@@ -842,15 +1093,19 @@ export const useDirector = create<DirectorState>()((set, get) => ({
           playing: false,
           toast: `Loaded ${p.project_name}`,
           job: { id: "idle", status: "idle", windowIndex: 0, windows: 0, progress: 0, logs: [] },
+          render: null,
         });
+        // A different project (opened, new, or restored) brings its own
+        // render record, or none: ask again rather than show the old one.
+        setTimeout(() => void get().refreshRender(), 0);
       },
       recover: () => {
         try {
           void loadProject<SessionPayload>().then((p) => {
             if (p?.timeline) { get().loadSession(p); set({ toast: "Recovered last autosave" }); }
             else set({ toast: "No autosave found" });
-          });
-          set({ toast: "Recovered last autosave" });
+          }).catch((e) => set({ toast: `Could not reach Wan2GP to recover: ${String(e?.message || e)}` }));
+          set({ toast: "Recovering the last autosave..." });
           return true;
         } catch {
           set({ toast: "Autosave was unreadable" });
@@ -863,6 +1118,9 @@ export const useDirector = create<DirectorState>()((set, get) => ({
         set({ toast: "Loaded Grinch_1 demo" });
       },
       newProject: () => {
+        // the workspace, clips included, was wiped by Python just before
+        set({ render: null, regenMarks: [], resultView: null });
+        setTimeout(() => void get().refreshRender(), 0);
         // Model-side settings are carried over: the same checkpoint,
         // resolution and sampling are almost always reused, and re-picking
         // them every time is friction. Everything that describes the PROJECT
@@ -940,8 +1198,23 @@ export const useDirector = create<DirectorState>()((set, get) => ({
           }
         })();
       },
-      generate: (scope) => {
+      generate: (scope, opts) => {
         const s = get();
+        let resume = !!opts?.resume;
+        const regen = opts?.regen;
+        // Finished clips are never thrown away without asking. Whatever still
+        // matches the timeline is kept and Generate renders only the rest --
+        // the same as Continue. Only when nothing can be kept, or everything is
+        // already rendered, is there a question: render them all again?
+        const clipsDone = s.render?.has_record ? (s.render.clips?.length || s.render.recorded_groups || 0) : 0;
+        if (!regen && !resume && !opts?.fresh && s.job.status !== "running" && !s.render?.running) {
+          if (s.render?.resumable) {
+            resume = true;
+          } else if (clipsDone > 0) {
+            set({ startOverArm: true });
+            return;
+          }
+        }
         if (s.job.status === "running") {
           // Never fail silently here. A run that died without reporting back
           // leaves this stuck on "running" and every later Generate became a
@@ -997,7 +1270,7 @@ export const useDirector = create<DirectorState>()((set, get) => ({
           : planDurations(maxF, s.timeline.slidingWindowSize, s.timeline.slidingWindowOverlap).windows;
         const here = scope === "here";
         const startW = here
-          ? realWindows(maxF, s.timeline.slidingWindowSize, s.timeline.slidingWindowOverlap).findIndex(
+          ? lay.spans.findIndex(
               (w) => s.timeline.playhead >= w.start && s.timeline.playhead < w.end,
             )
           : 0;
@@ -1006,7 +1279,11 @@ export const useDirector = create<DirectorState>()((set, get) => ({
         const job: GenJob = {
           id: uid("job"), status: "running", files: [], windowIndex: Math.max(0, startW),
           windows: here ? 1 : n, progress: 0, startedAt: Date.now(),
-          logs: [{ t: Date.now(), level: "info", msg: `Submitting to Wan2GP — ${s.pipeline} · ${s.advanced.checkpoint} · ${s.advanced.resolution}` }],
+          logs: [{ t: Date.now(), level: "info", msg: regen
+            ? `Regenerating group(s) ${regen.groups.join(", ")} on ${regen.seed === "same" ? "the render's own seed" : "a new seed"} — the other clips are not touched`
+            : resume
+            ? `Keeping ${s.render?.kept_groups ?? 0} finished group(s) that still match — rendering the rest`
+            : `Submitting to Wan2GP — ${s.pipeline} · ${s.advanced.checkpoint} · ${s.advanced.resolution}` }],
         };
         set({ job, pane: "gen", statusOpen: true, finalPrompt: "", finalPromptNote: "" });
 
@@ -1031,7 +1308,9 @@ export const useDirector = create<DirectorState>()((set, get) => ({
                 { t: Date.now(), level: "info" as const,
                   msg: `Plan: ${plan.model_type} · ${plan.video_length}f @ ${plan.fps}fps · ${shots} window prompt(s) · prompt ${String(plan.prompt || "").length} chars` }] } as GenJob,
             }));
-            const hasBridges = s.timeline.segments.some(
+            // Continue always goes back through the grouped render it is
+            // continuing, never through a bridge run.
+            const hasBridges = !resume && !regen && s.timeline.segments.some(
               (x) => x.track === "control" && !x.mediaId && String(x.prompt || "").trim());
             if (hasBridges) {
               // Bridge mode: Python runs one pass per gap and joins the result.
@@ -1051,7 +1330,14 @@ export const useDirector = create<DirectorState>()((set, get) => ({
               send("log", { message: `bridge run requested: ${plan.model_type}` });
               return;
             }
-            send("generate", { scope, target_frames: maxF, playhead: s.timeline.playhead, settings: plan });
+            // discard_ok ONLY when the user has said yes to rendering finished
+            // clips again. Without it Python keeps whatever still matches, and
+            // holds the render rather than replace anything on a guess.
+            const discardOk = !!opts?.fresh;
+            send("generate", { scope, target_frames: maxF, playhead: s.timeline.playhead, settings: plan,
+                               ...(resume ? { resume: true } : {}),
+                               ...(regen ? { regen } : {}),
+                               ...(discardOk ? { discard_ok: true } : {}) });
             send("log", { message: `generate requested: ${plan.model_type}` });
             setTimeout(() => {
               const st2 = useDirector.getState();
@@ -1084,8 +1370,12 @@ export const useDirector = create<DirectorState>()((set, get) => ({
             step: number | null; steps: number | null; unit: string;
             window: number; windows: number; files: string[]; error: string;
             elapsed: number; attached: boolean; can_cancel: boolean;
-            log: { level: string; msg: string }[];
+            log: { level: string; msg: string }[]; render_rev?: number;
           }>("job_state", {}, 20000);
+          if (r && typeof r.render_rev === "number" && r.render_rev !== renderRev.seen) {
+            renderRev.seen = r.render_rev;
+            void get().refreshRender();
+          }
           if (!r || r.status === "idle") {
             // Nothing running server-side: make sure the UI is not stuck.
             useDirector.setState((c) => (c.job.status === "running"
@@ -1195,6 +1485,29 @@ export const useDirector = create<DirectorState>()((set, get) => ({
 
 let genSubscribed = false;
 
+const renderAsk = { busy: false, again: false };
+const renderRev = { seen: -1 };
+
+/** Ask Python what the render record says, against the timeline as it is. */
+async function refreshRenderOnce() {
+  const st = useDirector.getState();
+  let plan;
+  try {
+    plan = assembleWanSettings(st as unknown as SessionPayload);
+  } catch (e) {
+    send("log", { message: `results track: could not build the plan to check against (${String(e)})` });
+    return;
+  }
+  try {
+    // Generous: after a reboot the first check may have clips to read.
+    const r = await request<RenderState>("render_state",
+      { settings: plan, target_frames: totalFrames(st), fps: st.fps }, 300000);
+    if (r) useDirector.setState({ render: r });
+  } catch (e) {
+    send("log", { message: `results track: render_state failed (${String(e)})` });
+  }
+}
+
 /** Ask Python whether a job is really running. If it is not, clear the stale
  *  state so the next Generate works instead of silently doing nothing. */
 function st_checkStuck() {
@@ -1274,8 +1587,27 @@ export function hydrateDirector() {
         status?: string; progress?: number; window?: number; windows?: number;
         logs?: { level: string; msg: string }[]; files?: string[]; error?: string;
         phase?: string; detail?: string; step?: number | null; steps?: number | null;
-        unit?: string; elapsed?: number;
+        unit?: string; elapsed?: number; render_rev?: number;
       };
+      // A group starting or finishing changes the results track. Every frame
+      // carries render_rev, bumped by Python on each of those, so a change is
+      // seen even when the frame that announced it was skipped.
+      const revMoved = typeof f.render_rev === "number" && f.render_rev !== renderRev.seen;
+      if (typeof f.render_rev === "number") renderRev.seen = f.render_rev;
+      const groupMoved = (f.logs || []).some((l) => /^Group \d+ (of \d+|done)/.test(l.msg));
+      // Clear the marks only when every marked clip was regenerated; a partly
+      // failed regen keeps them, so what is left can be tried again.
+      if (f.status === "done" && (f.logs || []).some((l) => /^Regenerated /.test(l.msg) && l.level === "ok")) {
+        useDirector.setState({
+          regenMarks: [],
+          toast: "Regen done. Play it on the results track - if you are happy with it, press Stitch now to update the full video.",
+        });
+      }
+      if (revMoved || groupMoved || f.status === "done" || f.status === "error" || f.status === "cancelled") {
+        // The render record changed on the way: finished, or stopped with
+        // groups that Continue can pick up.
+        setTimeout(() => void useDirector.getState().refreshRender(), 300);
+      }
       useDirector.setState((c) => {
         const added = (f.logs || []).map((l) => ({ t: Date.now(), level: l.level as GenJob["logs"][number]["level"], msg: l.msg }));
         if (f.error) added.push({ t: Date.now(), level: "err" as const, msg: f.error });
@@ -1316,14 +1648,59 @@ export function hydrateDirector() {
       }
     },
   );
+  // Hand-set windows always add up to the timeline, however it got out of
+  // step (a project from an older build, an fps change, a length change):
+  // the last window takes up the difference. Otherwise the plan covered the
+  // gap with an extra window of its own at the end.
+  useDirector.subscribe((st) => {
+    const fr = st.timeline.windowFrames;
+    if (!st.timeline.manualWindows || !fr?.length) return;
+    const maxF = Math.max(1, Math.round(st.duration_sec * st.fps));
+    if (fr.reduce((a, b) => a + b, 0) === maxF && fr.every((f) => f >= 1 && Number.isInteger(f))) return;
+    useDirector.setState((c) => ({ timeline: { ...c.timeline, windowFrames: fitFramesTo(fr, maxF) } }));
+  });
+  // After every autosave, re-check an unfinished render against what is now
+  // on the timeline: editing a finished group's prompt changes what Continue
+  // can keep, and the card should say so before the button is pressed.
+  useDirector.subscribe((st, prev) => {
+    // Not while a render runs: then render_rev says when the record changed,
+    // and the page carries as little extra traffic as it can.
+    if (st.savedAt !== prev.savedAt && st.render?.has_record && st.job.status !== "running") void st.refreshRender();
+  });
+  bootLoad(0);
+}
+
+/** Load the project on disk. If Wan2GP does not answer, NOTHING is saved
+ *  (see persist.ts) and the load is tried again, with the top bar saying so,
+ *  until it does -- the demo on screen must never be mistaken for the work. */
+function bootLoad(attempt: number) {
   void loadProject<SessionPayload>().then((p) => {
+    if (attempt > 0) useDirector.getState().setToast("Project loaded.");
+    useDirector.setState({ loadBlocked: null });
+    useDirector.getState().setBridge(true, p?.timeline ? "project loaded" : "no saved project yet");
     if (p?.timeline) useDirector.getState().loadSession(p);
+    // After a crash or a reboot this is the first thing worth knowing.
+    void useDirector.getState().refreshRender().then(() => {
+      const r = useDirector.getState().render;
+      if (r?.resumable) {
+        useDirector.getState().setToast(
+          `An unfinished render can be continued — ${r.kept_windows} of ${r.total_windows} windows are done. Press Continue.`);
+      }
+    });
     const gone = missingMedia();
     if (gone.length) {
       useDirector.getState().setToast(
         `${gone.length} media file${gone.length > 1 ? "s" : ""} could not be found on disk — those items will show as missing.`,
       );
     }
+  }).catch((e) => {
+    const wait = Math.min(30, 5 * (attempt + 1));
+    useDirector.setState({ loadBlocked: `retrying in ${wait}s` });
+    useDirector.getState().setBridge(false,
+      `NOT SAVING - your project has not loaded yet (${String(e?.message || e)}); retrying in ${wait}s`);
+    useDirector.getState().setToast(
+      `Could not load your project from Wan2GP yet. Nothing will be saved until it loads - retrying in ${wait}s.`);
+    setTimeout(() => bootLoad(attempt + 1), wait * 1000);
   });
 }
 
@@ -1339,7 +1716,10 @@ export function windowLayout(s: Pick<DirectorState, "duration_sec" | "fps" | "ti
     ? s.timeline.windowFrames
     : null;
   if (frames) {
-    return { maxF, win, ovl, manual: true, frames, spans: spansFromFrames(frames) };
+    // always exactly the timeline, even for a project saved before the
+    // windows were kept in step with its length
+    const fit = fitFramesTo(frames, maxF);
+    return { maxF, win, ovl, manual: true, frames: fit, spans: spansFromFrames(fit) };
   }
   const spans = realWindows(maxF, win, ovl);
   return {
