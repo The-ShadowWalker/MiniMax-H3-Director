@@ -16,7 +16,7 @@ settings, renders the piece, and lets you fix any part of it without starting ov
 
 ---
 
-<!-- Add a screenshot of the plugin tab here: ![H3 Director](docs/screenshot.png) -->
+<img width="1915" height="1005" alt="Screenshot 2026-09-27 134038" src="https://github.com/user-attachments/assets/63fdf99f-af48-4fae-85f7-1e8d8b35edcf" />
 
 ## Contents
 
