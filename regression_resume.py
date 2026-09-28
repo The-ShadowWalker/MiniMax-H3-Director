@@ -28,6 +28,7 @@ import os
 import re
 import shutil
 import subprocess
+import time
 import sys
 import tempfile
 import types
@@ -340,6 +341,23 @@ jpg = _b64.b64decode(poster["data"].split(",", 1)[1])
 check("each clip has a filmstrip poster", poster["data"].startswith("data:image/jpeg;base64,")
       and jpg[:2] == b"\xff\xd8" and len(jpg) > 500, len(jpg))
 check("  ... cached, not re-rendered", p._render_poster({"master": clips[0]["master"]})["data"] == poster["data"])
+vw, vh = [int(x) for x in subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+          "stream=width,height", "-of", "csv=p=0", str(m.RENDERS_DIR / clips[0]["master"])],
+          capture_output=True, text=True).stdout.strip().split(",")]
+p16 = p._render_poster({"master": clips[0]["master"], "count": 11})
+sw, sh = [int(x) for x in subprocess.run(["ffprobe", "-v", "error", "-show_entries", "stream=width,height", "-of", "csv=p=0",
+          "-i", "pipe:0"], input=_b64.b64decode(p16["data"].split(",", 1)[1]), capture_output=True).stdout.decode().strip().split(",")]
+check("a wider clip gets more frames: asked for 11, it gets the next strip size up (16)", p16["count"] == 16, p16["count"])
+check("  ... each frame at the video's own shape, not stretched (%dx%d tiles for %dx%d video)"
+      % (p16["tile_w"], p16["tile_h"], vw, vh),
+      abs(p16["tile_w"] / p16["tile_h"] - vw / vh) < 0.03 and sw == 16 * p16["tile_w"] and sh == p16["tile_h"],
+      (p16["tile_w"], p16["tile_h"], sw, sh))
+fr_ = p16["frames"]
+check("  ... spread evenly through the clip, first stretch to last",
+      fr_ == sorted(fr_) and len(set(fr_)) == 16 and fr_[0] < clips[0]["frames_got"] / 16
+      and fr_[-1] >= clips[0]["frames_got"] * 15 / 16, fr_)
+check("  ... never more frames than the clip has", p._render_poster({"master": clips[0]["master"], "count": 10 ** 6})["count"]
+      <= clips[0]["frames_got"])
 pv = p._render_preview({"master": clips[0]["master"]})
 pv_codecs = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "stream=codec_name,pix_fmt",
                             "-of", "csv=p=0", pv["file"]], capture_output=True, text=True).stdout.split()
@@ -588,12 +606,8 @@ try:
     check("a one-window clip cannot be split again", False)
 except ValueError as e:
     check("a one-window clip cannot be split again", "single window" in str(e), str(e))
-changed = data_for(prompts=PROMPTS[:2] + ["rain starts, HARDER"] + PROMPTS[3:])
-try:
-    p._render_split({**changed, "group": 3})
-    check("a clip whose prompt changed is not split (its parts could not be checked)", False)
-except ValueError as e:
-    check("a clip whose prompt changed is not split (its parts could not be checked)", "changed" in str(e), str(e))
+check("the pieces were copied frame for frame, not encoded again", out.get("copied") is True, out)
+check("every piece keeps its own check of its window", all(len(x.get("window_hashes") or []) == 1 for x in after["groups"][:2]))
 p._job = object()
 try:
     p._render_split({**data_for(), "group": 3})
@@ -601,6 +615,43 @@ try:
 except ValueError as e:
     check("not while a render is running", "running" in str(e), str(e))
 p._job = None
+
+# The UI's way: it starts, answers at once, and tells how far it has got.
+g3_master = record()["groups"][2]["master"]
+# window 3's prompt is changed first: the clip is still split, and only the
+# piece for window 3 is then shown as changed
+changed = data_for(prompts=PROMPTS[:2] + ["rain starts, HARDER"] + PROMPTS[3:])
+st0 = p._render_split_start({**changed, "group": 3})
+check("a split started from the page answers at once", st0.get("started") and st0.get("pieces") == 2, st0)
+try:
+    p._stitch({"name": "x", "dir": str(TMP / "split")})
+    busy_ok = p._split_state().get("state") != "running"   # already finished: nothing to refuse
+except ValueError as e:
+    busy_ok = "split" in str(e)
+check("  ... nothing else that rewrites the clips can start meanwhile", busy_ok)
+seen_states = []
+for _ in range(600):
+    js = p._split_state()
+    seen_states.append((js.get("state"), js.get("done"), js.get("total")))
+    if js.get("state") != "running":
+        break
+    time.sleep(0.05)
+check("  ... split_state reports it running, then done", js.get("state") == "done" and js.get("total") == 2
+      and js.get("done") == 2, seen_states[-3:])
+check("  ... and the lock is off once it has finished", not getattr(p, "_splitting", False))
+rec3 = record()
+check("  ... G3 became two clips", len(rec3["groups"]) == len(after["groups"]) + 1
+      and [x["n_windows"] for x in rec3["groups"][2:4]] == [1, 1], [x["n_windows"] for x in rec3["groups"]])
+check("  ... and the old clip is gone", not (m.RENDERS_DIR / g3_master).exists())
+rs3 = p._render_state(changed)
+flags = [c.get("changed") for c in rs3["clips"]]
+check("a clip whose prompt changed is still split, and only the piece whose prompt changed shows as changed",
+      flags == [False, False, True, False, False], flags)
+try:
+    p._render_split_start({**data_for(), "group": 99})
+    check("a split that cannot be done says so straight away", False)
+except ValueError as e:
+    check("a split that cannot be done says so straight away", "no clip" in str(e), str(e))
 
 print("\nthe run is active from first group to last:")
 seen = []

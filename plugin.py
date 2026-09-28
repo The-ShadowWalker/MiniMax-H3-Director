@@ -39,7 +39,7 @@ try:
 except ImportError:
     import compat
 
-PLUGIN_VERSION = "1.6.19"
+PLUGIN_VERSION = "1.6.21"
 PLUGIN_ID = "h3_director2"
 PLUGIN_NAME = "H3 Director"
 LOG_PREFIX = "[H3-D]"
@@ -1110,9 +1110,9 @@ class H3Director2Plugin(WAN2GPPlugin):
                 out = self._render_state(data)
             elif cmd == "render_discard":
                 # Never under a running render: it is writing those clips.
-                if getattr(self, "_groups_active", False) or getattr(self, "_job", None) \
-                        or getattr(self, "_stitching", False):
-                    raise ValueError("a render or stitch is running - cancel it or let it finish first")
+                busy = self._busy_why()
+                if busy:
+                    raise ValueError("%s - cancel it or let it finish first" % busy)
                 out = {"ok": True, "removed": self._render_discard()}
                 self._render_rev = getattr(self, "_render_rev", 0) + 1
                 trace("results track cleared: %d file(s) removed" % out["removed"])
@@ -1123,7 +1123,9 @@ class H3Director2Plugin(WAN2GPPlugin):
             elif cmd == "stitch":
                 out = self._stitch(data)
             elif cmd == "render_split":
-                out = self._render_split(data)
+                out = self._render_split_start(data)
+            elif cmd == "split_state":
+                out = self._split_state()
             elif cmd == "diagnose":
                 out = {"report": self._diagnose()}
             elif cmd == "print_env":
@@ -1295,9 +1297,9 @@ class H3Director2Plugin(WAN2GPPlugin):
     def _clear_all(self, data):
         if not data.get("confirmed"):
             return {"ok": False, "needs_confirm": True}
-        if getattr(self, "_groups_active", False) or getattr(self, "_job", None) \
-                or getattr(self, "_stitching", False):
-            raise ValueError("a render or stitch is running - cancel it or let it finish first")
+        busy = self._busy_why()
+        if busy:
+            raise ValueError("%s - cancel it or let it finish first" % busy)
         freed = 0
         for d in (MEDIA_DIR, DERIVED_DIR, RENDERS_DIR, HISTORY_DIR):
             for f in d.glob("*"):
@@ -3872,6 +3874,15 @@ class H3Director2Plugin(WAN2GPPlugin):
         pg["prompt"] = "\n\n".join(blocks[w_at:w_at + n_win])
         return pg, offset_g
 
+    def _window_hashes(self, plan0, media0, base_offset, blocks, w0, n, total):
+        """The check each window of a group would get as a clip of its own."""
+        try:
+            return [renders.group_hash(self._group_inputs(plan0, media0, base_offset, blocks, k, 1, total)[0])
+                    for k in range(int(w0), int(w0) + int(n))]
+        except Exception as exc:
+            trace("could not record per-window checks (%s)" % exc)
+            return []
+
     def _render_check(self, rec, data, window_frames, ovl, fps):
         """How much of the recorded render the CURRENT plan can keep."""
         plan0, media0, base_offset, blocks = self._group_base(data)
@@ -3954,13 +3965,16 @@ class H3Director2Plugin(WAN2GPPlugin):
         """
         rec = renders.load_record(RENDER_JSON, PLUGIN_ID)
         running = bool(getattr(self, "_job", None)) or bool(getattr(self, "_groups_active", False)) or \
-            bool(getattr(self, "_stitching", False)) or \
+            bool(getattr(self, "_stitching", False)) or bool(getattr(self, "_splitting", False)) or \
             (getattr(self, "_jobstate", {}) or {}).get("status") == "running"
         out = {"has_record": bool(rec), "running": running, "resumable": False,
                "complete": bool(rec and rec.get("status") == "complete"), "clips": [],
                # The group being rendered right now, so the results track can
                # show where the run has got to.
-               "active": dict(self._render_active) if running and getattr(self, "_render_active", None) else None}
+               "active": dict(self._render_active) if running and getattr(self, "_render_active", None) else None,
+               # a split going on, so a page opened (or reloaded) during one
+               # shows it too
+               "splitting": self._split_state() if getattr(self, "_splitting", False) else None}
         if not rec:
             return out
         fps = float(data.get("fps") or (data.get("settings") or {}).get("fps") or rec.get("fps") or 24)
@@ -4075,8 +4089,73 @@ class H3Director2Plugin(WAN2GPPlugin):
             })
         return clips
 
+    def _busy_why(self):
+        """What is running that a split, stitch, clear or discard must wait
+        for, or "" when nothing is."""
+        if getattr(self, "_groups_active", False) or getattr(self, "_job", None):
+            return "a render is running"
+        if getattr(self, "_stitching", False):
+            return "a stitch is running"
+        if getattr(self, "_splitting", False):
+            return "a clip is being split"
+        return ""
+
     def _render_split(self, data):
-        """Cut one finished clip into one clip per window, losslessly.
+        """Cut one finished clip into one clip per window, losslessly, and
+        wait for it (the tests; the UI uses _render_split_start)."""
+        busy = self._busy_why()
+        if busy:
+            raise ValueError("%s - split once it has finished" % busy)
+        job = self._split_prepare(data)
+        self._splitting = True
+        try:
+            return self._split_run(job)
+        finally:
+            self._splitting = False
+
+    def _render_split_start(self, data):
+        """Start a split and answer at once; the UI then asks split_state
+        until it is done, and shows how far it has got.
+
+        A long clip takes a while to cut, and the bridge answers one request
+        at a time, so waiting for it here would freeze the page with nothing
+        on screen to say it is working."""
+        busy = self._busy_why()
+        if busy:
+            raise ValueError("%s - split once it has finished" % busy)
+        job = self._split_prepare(data)
+        import threading
+        self._splitting = True
+        self._split_job = {"state": "running", "group": job["group"], "total": job["n"], "done": 0,
+                           "step": "starting", "started": time.time(), "note": "", "error": "",
+                           "masters": []}
+
+        def work():
+            try:
+                out = self._split_run(job, progress=self._split_job)
+                self._split_job.update(state="done", done=job["n"], step="done",
+                                       note=out.get("note") or "", masters=out.get("masters") or [])
+            except Exception as exc:
+                trace("split G%d FAILED: %s" % (job["group"], exc))
+                self._split_job.update(state="error", error=str(exc), step="failed")
+            finally:
+                self._split_job["elapsed"] = round(time.time() - self._split_job["started"], 1)
+                self._splitting = False
+                self._render_rev = getattr(self, "_render_rev", 0) + 1
+
+        threading.Thread(target=work, name="h3d2-split", daemon=True).start()
+        return {"ok": True, "started": True, "group": job["group"], "pieces": job["n"]}
+
+    def _split_state(self):
+        """How the split started by _render_split_start is getting on."""
+        job = dict(getattr(self, "_split_job", None) or {"state": "idle"})
+        if job.get("state") == "running":
+            job["elapsed"] = round(time.time() - job.get("started", time.time()), 1)
+        return job
+
+    def _split_prepare(self, data):
+        """Everything a split needs, worked out before anything is cut, so a
+        split that cannot be done says why straight away.
 
         A group of four windows that is good except for one can then have
         just that one rendered again. Every piece is the exact frames and
@@ -4084,14 +4163,10 @@ class H3Director2Plugin(WAN2GPPlugin):
         results track, the stitched video and Continue are all unchanged by
         it -- there are simply more, smaller clips.
 
-        Only a clip that still matches the timeline can be split: each
-        piece's check against the timeline is worked out from the timeline
-        as it is now, which is only true of every piece if it is true of the
-        whole clip. Split first, then change the part you want to redo.
+        It is cut where the clip's own windows met when it was rendered,
+        so it can be split even after its prompts or window lengths were
+        changed on the timeline.
         """
-        if getattr(self, "_groups_active", False) or getattr(self, "_job", None) \
-                or getattr(self, "_stitching", False):
-            raise ValueError("a render or stitch is running - split once it has finished")
         rec = renders.load_record(RENDER_JSON, PLUGIN_ID)
         groups = (rec or {}).get("groups") or []
         gi = int(data.get("group") or 0) - 1
@@ -4101,59 +4176,118 @@ class H3Director2Plugin(WAN2GPPlugin):
         n = int(g.get("n_windows") or 0)
         if n < 2:
             raise ValueError("G%d is already a single window" % (gi + 1))
-        layout = self._group_layout(data)
-        if layout is None:
-            raise ValueError("there is no timeline to split against")
-        wf = [int(x) for x in layout["window_frames"]]
-        w0 = int(g["first_window"])
-        if wf[w0:w0 + n] != [int(x) for x in g.get("windows") or []]:
-            raise ValueError("the windows under G%d were changed on the timeline since it was "
-                             "rendered, so where its parts begin and end is no longer known" % (gi + 1))
-        plan0, media0, base_offset, blocks = self._group_base(data)
-        if len(blocks) != len(wf):
-            raise ValueError("the prompt no longer lines up with the windows")
-
-        def hash_for(k, m):
-            pg, _ = self._group_inputs(plan0, media0, base_offset, blocks, k, m, len(wf))
-            return renders.group_hash(pg)
-
-        if hash_for(w0, n) != g.get("hash"):
-            raise ValueError("G%d's prompt or media changed since it was rendered. Split it before "
-                             "changing the part you want to redo (undo the change, split, then "
-                             "change it again)" % (gi + 1))
         src = RENDERS_DIR / str(g["master"])
         if not src.is_file():
             raise ValueError("G%d's clip is missing from the workspace" % (gi + 1))
+        # Where to cut comes from the CLIP: the windows it was rendered with,
+        # counted from where its first window began. That is what its frames
+        # are, whatever the timeline says now.
+        rec_windows = [int(x) for x in g.get("windows") or []]
+        w0 = int(g["first_window"])
+        if len(rec_windows) != n or any(x <= 0 for x in rec_windows):
+            raise ValueError("G%d's record does not say how long its windows were" % (gi + 1))
         fps = float(rec.get("fps") or data.get("fps") or 24)
         start, got = int(g["start"]), int(g["frames_got"])
-        # where each window begins on the timeline, as frames into this clip
-        cuts = [sum(wf[:k]) - start for k in range(w0 + 1, w0 + n)]
+        rec_wf = [int(x) for x in rec.get("window_frames") or []]
+        base = sum(rec_wf[:w0]) if rec_wf[w0:w0 + n] == rec_windows else start
+        cuts, at = [], base
+        for x in rec_windows[:-1]:
+            at += x
+            cuts.append(at - start)
         edges = [0] + cuts + [got]
         if any(b <= a for a, b in zip(edges, edges[1:])):
             raise ValueError("G%d's windows do not fall inside its clip (%s)" % (gi + 1, edges))
+
+        # Each piece's check against the timeline. Clips rendered from 1.6.20
+        # on carry every window's own check from the moment they were made,
+        # so each piece knows exactly whether ITS prompt has changed since.
+        # Older clips carry one check for the whole clip: if that still
+        # matches, every piece matches; if it does not, which part changed
+        # cannot be known, so the pieces are checked against the timeline as
+        # it is now and the note says to mark the part to redo by hand.
+        note = ""
+        saved = [str(x) for x in g.get("window_hashes") or []]
+        piece_hashes = saved if len(saved) == n else None
+        if piece_hashes is None:
+            now = None
+            layout = self._group_layout(data)
+            if layout is not None:
+                plan0, media0, base_offset, blocks = self._group_base(data)
+                wf = [int(x) for x in layout["window_frames"]]
+                if len(blocks) == len(wf):
+                    now = self._window_hashes(plan0, media0, base_offset, blocks, w0, n, len(wf))
+                    whole, _ = self._group_inputs(plan0, media0, base_offset, blocks, w0, n, len(wf))
+                    if renders.group_hash(whole) != g.get("hash") or wf[w0:w0 + n] != rec_windows:
+                        note = ("G%d changed since it was rendered and it is from before pieces kept their "
+                                "own check, so the plugin cannot tell which part changed: mark the one "
+                                "to redo yourself" % (gi + 1))
+            piece_hashes = now if now and len(now) == n else [g.get("hash")] * n
+            if not note and not now:
+                note = "the timeline could not be read, so the pieces could not be checked"
+        return {"group": gi + 1, "gi": gi, "g": g, "n": n, "w0": w0, "src": src, "fps": fps,
+                "start": start, "edges": edges, "rec_windows": rec_windows,
+                "piece_hashes": piece_hashes, "note": note}
+
+    def _split_run(self, job, progress=None):
+        """Cut the pieces _split_prepare worked out and put them on the
+        results track in place of the clip. `progress`, when given, is kept
+        up to date for split_state."""
+        gi, g, n, w0 = job["gi"], job["g"], job["n"], job["w0"]
+        src, fps, start, edges = job["src"], job["fps"], job["start"], job["edges"]
+        rec_windows, piece_hashes, note = job["rec_windows"], job["piece_hashes"], job["note"]
+        t_start = time.time()
+        prog = progress if progress is not None else {}
         ff, fp = self._ffmpeg(), self._ffprobe()
+        trace("split G%d (%s) into %d clip(s): started" % (gi + 1, g["master"], n))
+        # The clips are FFV1 with every frame a keyframe, so the frames are
+        # copied as they are rather than encoded again -- seconds, not
+        # minutes. If that cannot be done (an older clip, an ffmpeg that
+        # will not), it falls back to cutting it the slow, sure way.
+        prog.update(step="reading the clip")
+        try:
+            packets = renders.video_packets(fp, src)
+            if len(packets) != int(g["frames_got"]):
+                raise ValueError("%d frames read, %d recorded" % (len(packets), int(g["frames_got"])))
+        except Exception as exc:
+            trace("split: frames cannot be copied as they are (%s); cutting them the slow way" % exc)
+            packets = None
         take = int(g.get("take") or 1)
         pieces, made = [], []
         try:
             for j in range(n):
                 k = w0 + j
+                prog.update(done=j, step="cutting piece %d of %d" % (j + 1, n))
                 name = "group_w%03d-%03d_t%d.mkv" % (k + 1, k + 1, take)
                 while (RENDERS_DIR / name).exists():
                     name = name[:-4] + "s.mkv"
                 dst = RENDERS_DIR / name
                 count = edges[j + 1] - edges[j]
-                wrote = renders.make_master(ff, fp, src, dst, edges[j], count, fps)
+                wrote = None
+                if packets is not None:
+                    try:
+                        wrote = renders.copy_cut(ff, fp, src, dst, edges[j], count, fps, packets)
+                    except Exception as exc:
+                        trace("split: piece %d could not be copied (%s); cutting it the slow way" % (j + 1, exc))
+                        packets = None
+                if wrote is None:
+                    wrote = renders.make_master(ff, fp, src, dst, edges[j], count, fps)
                 made.append(dst)
                 if wrote != count:
                     raise ValueError("part %d of G%d came out %d frame(s), not %d" % (j + 1, gi + 1, wrote, count))
                 piece = dict(g)
                 piece.update({
-                    "first_window": k, "n_windows": 1, "windows": [wf[k]],
-                    "start": start + edges[j], "frames": wf[k], "frames_got": count,
+                    "first_window": k, "n_windows": 1, "windows": [rec_windows[j]],
+                    "start": start + edges[j], "frames": rec_windows[j], "frames_got": count,
                     "master": name, "bytes": dst.stat().st_size, "sha256": renders.file_sha256(dst),
-                    "hash": hash_for(k, 1), "split_from": g["master"],
+                    "hash": piece_hashes[j], "window_hashes": [piece_hashes[j]],
+                    "split_from": g["master"],
                 })
                 pieces.append(piece)
+            prog.update(done=n, step="saving")
+            fresh = renders.load_record(RENDER_JSON, PLUGIN_ID) or {}
+            fg = fresh.get("groups") or []
+            if gi >= len(fg) or fg[gi].get("master") != g["master"]:
+                raise ValueError("the results track changed while splitting; try again")
         except Exception:
             for f in made:
                 try:
@@ -4161,15 +4295,6 @@ class H3Director2Plugin(WAN2GPPlugin):
                 except OSError:
                     pass
             raise
-        fresh = renders.load_record(RENDER_JSON, PLUGIN_ID) or rec
-        fg = fresh.get("groups") or []
-        if gi >= len(fg) or fg[gi].get("master") != g["master"]:
-            for f in made:
-                try:
-                    f.unlink()
-                except OSError:
-                    pass
-            raise ValueError("the results track changed while splitting; try again")
         fg[gi:gi + 1] = pieces
         # The stitched video is the same frames: it stays up to date.
         was = fresh.get("joined_masters")
@@ -4188,33 +4313,61 @@ class H3Director2Plugin(WAN2GPPlugin):
                 except OSError:
                     pass
         self._render_rev = getattr(self, "_render_rev", 0) + 1
-        trace("split G%d (%s) into %d clip(s): %s" % (gi + 1, g["master"], n,
-                                                     ", ".join(pc["master"] for pc in pieces)))
-        return {"ok": True, "group": gi + 1, "pieces": n,
-                "masters": [pc["master"] for pc in pieces]}
+        trace("split G%d (%s) into %d clip(s) in %.1fs (%s): %s%s"
+              % (gi + 1, g["master"], n, time.time() - t_start,
+                 "frames copied" if packets is not None else "re-cut",
+                 ", ".join(pc["master"] for pc in pieces), (" -- " + note) if note else ""))
+        return {"ok": True, "group": gi + 1, "pieces": n, "note": note,
+                "copied": packets is not None, "masters": [pc["master"] for pc in pieces]}
+
+    # Frames per filmstrip the results track can ask for. It asks for the
+    # smallest that fills the clip at its width on screen; a clip that needs
+    # fewer than a strip has shows an even pick of them, so zooming the
+    # timeline rarely needs a new strip.
+    POSTER_COUNTS = (4, 8, 16, 32, 48)
+    POSTER_HEIGHT = 56          # twice the clip's height on the track: sharp on HiDPI screens
 
     def _render_poster(self, data):
-        """A small filmstrip -- first, middle and last frame -- of one finished
-        group, for its block on the results track. Cached beside the other
-        working files and handed back inline: the UI runs in a sandboxed frame
-        that cannot count on reaching the workspace by URL."""
+        """A filmstrip of one finished group for its block on the results
+        track: `count` frames spread evenly through it, side by side, each at
+        the video's own shape. The track lays them out at their true shape
+        too, so nothing is stretched. Cached beside the other working files
+        and handed back inline: the UI runs in a sandboxed frame that cannot
+        count on reaching the workspace by URL."""
         name = Path(str(data.get("master") or "")).name
         master = RENDERS_DIR / name
         if not name or not master.is_file():
             raise ValueError("no such rendered clip: %s" % name)
+        want = int(data.get("count") or 0)
+        count = next((c for c in self.POSTER_COUNTS if c >= want), self.POSTER_COUNTS[-1])
+        n = max(1, self._frames_cached(master))
+        count = max(1, min(count, n))
+        h = self.POSTER_HEIGHT
         size = master.stat().st_size
         DERIVED_DIR.mkdir(parents=True, exist_ok=True)
-        out = DERIVED_DIR / ("poster_%s_%d.jpg" % (master.stem, size))
+        out = DERIVED_DIR / ("poster_%s_%d_n%d_h%d.jpg" % (master.stem, size, count, h))
+        # the frame at the middle of each of `count` equal stretches of the clip
+        pick = [min(n - 1, int((i + 0.5) * n / count)) for i in range(count)]
         if not out.is_file():
             import subprocess
-            n = max(1, self._frames_cached(master))
-            pick = sorted({0, n // 2, n - 1})
             sel = "+".join("eq(n\\,%d)" % k for k in pick)
+            # even width, so every tile in the strip is the same size
             subprocess.run([self._ffmpeg(), "-y", "-v", "error", "-i", str(master),
-                            "-vf", "select='%s',scale=-2:64,tile=%dx1" % (sel, len(pick)),
-                            "-frames:v", "1", "-q:v", "4", str(out)],
+                            "-vf", "select='%s',scale=-2:%d:flags=lanczos,tile=%dx1" % (sel, h, count),
+                            "-frames:v", "1", "-q:v", "3", str(out)],
                            check=True, capture_output=True, timeout=300)
-        return {"master": name, "bytes": size,
+        # the tile size is read off the strip itself, so the track lays the
+        # frames out at exactly the size they were made
+        img = next((st for st in renders.probe_streams(self._ffprobe(), out)
+                    if st.get("codec_type") == "video"), {})
+        try:
+            tile_w, tile_h = int(img.get("width") or 0) // count, int(img.get("height") or 0)
+        except (TypeError, ValueError):
+            tile_w = tile_h = 0
+        if not tile_w or not tile_h:
+            tile_w, tile_h = int(round(h * 16 / 9)), h
+        return {"master": name, "bytes": size, "count": count, "frames": pick,
+                "tile_w": tile_w, "tile_h": tile_h,
                 "data": "data:image/jpeg;base64," + base64.b64encode(out.read_bytes()).decode("ascii")}
 
     def _make_preview(self, master):
@@ -4258,8 +4411,9 @@ class H3Director2Plugin(WAN2GPPlugin):
         with nothing trimmed, and encoded once. Written beside the render's
         earlier joined video (or into the chosen folder), never into the
         workspace, which a fresh render clears."""
-        if getattr(self, "_groups_active", False) or getattr(self, "_job", None):
-            raise ValueError("a render is running - stitch once it has finished")
+        busy = self._busy_why()
+        if busy:
+            raise ValueError("%s - stitch once it has finished" % busy)
         rec = renders.load_record(RENDER_JSON, PLUGIN_ID)
         groups = (rec or {}).get("groups") or []
         if not groups:
@@ -4757,6 +4911,8 @@ class H3Director2Plugin(WAN2GPPlugin):
             g.update({"start": s_k, "frames_got": n_k, "master": name,
                       "bytes": final.stat().st_size, "sha256": renders.file_sha256(final),
                       "hash": renders.group_hash(pk), "seed": seed, "take": take,
+                      "window_hashes": self._window_hashes(plan0, media0, base_offset, blocks,
+                                                           int(g["first_window"]), int(g["n_windows"]), len(wf)),
                       "source": os.path.basename(raw), "regen": True,
                       "finished": time.strftime("%Y-%m-%d %H:%M:%S")})
         if prev_cut:
@@ -5239,6 +5395,11 @@ class H3Director2Plugin(WAN2GPPlugin):
                         "bytes": mpath.stat().st_size,
                         "sha256": renders.file_sha256(mpath),
                         "hash": renders.group_hash(pg), "seed": seed,
+                        # each window's own check, as it was when rendered, so
+                        # the clip can later be split and each piece still knows
+                        # whether ITS prompt changed
+                        "window_hashes": self._window_hashes(plan0, media0, base_offset, blocks,
+                                                             w_at, n_win, total_windows),
                         "source": os.path.basename(prev_out),
                         "finished": time.strftime("%Y-%m-%d %H:%M:%S"),
                     })
@@ -5461,6 +5622,9 @@ class H3Director2Plugin(WAN2GPPlugin):
         # so five groups of four windows behave like five short renders rather
         # than one very long one. Each group continues from the last one with
         # the same overlap and the same seed, so it knows where to carry on.
+        if getattr(self, "_splitting", False):
+            yield frame("error", error="A clip is being split - wait for it to finish.")
+            return
         group_windows = int((data.get("settings") or {}).get("group_windows") or 0)
         resume = bool(data.get("resume"))
         regen = data.get("regen") if isinstance(data.get("regen"), dict) else None

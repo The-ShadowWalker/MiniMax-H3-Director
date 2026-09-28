@@ -69,12 +69,35 @@ writeFileSync(host, `<!doctype html><html><body style="margin:0">
     if (m.cmd === "generate") window.jobStatus = "running";
     if (!m.id) return;
     if (m.cmd === "render_state") return reply(m.id, window.renderState);
-    if (m.cmd === "render_split") return reply(m.id, { ok: true, group: m.data.group, pieces: 2 });
+    // A split runs in the background, as in Python: render_split answers at
+    // once and split_state tells how far it has got. splitHold keeps it
+    // running until the test lets go; splitFail makes it end in an error.
+    if (m.cmd === "render_split") {
+      window.splitJob = { state: "running", group: m.data.group, done: 0, total: 2, step: "reading the clip", elapsed: 0, n: 0 };
+      return reply(m.id, { ok: true, started: true, group: m.data.group, pieces: 2 });
+    }
+    if (m.cmd === "split_state") {
+      const j = window.splitJob || { state: "idle" };
+      if (j.state === "running" && !window.splitHold) {
+        j.n += 1;
+        j.done = Math.min(2, j.n - 1);
+        j.step = "cutting piece " + (j.done + 1) + " of 2";
+        if (j.n >= 3) Object.assign(j, window.splitFail ? { state: "error", error: window.splitFail } : { state: "done", done: 2, step: "done" });
+      }
+      return reply(m.id, { ...j });
+    }
     // an installed model, so the "no H3 models" notice never covers the ones tested here
     if (m.cmd === "list_models") return reply(m.id, { models: [{ model_type: "minimax_h3_hybrid", name: "H3 Hybrid" }] });
     if (m.cmd === "render_discard") { window.renderState = { has_record: false, running: false, resumable: false, complete: false }; return reply(m.id, { ok: true, removed: 2 }); }
     if (m.cmd === "load_project_json") return reply(m.id, { payload: null });
-    if (m.cmd === "render_poster") return reply(m.id, { data: "data:image/svg+xml;base64," + btoa('<svg xmlns="http://www.w3.org/2000/svg" width="300" height="60"><rect width="300" height="60" fill="#3a6"/></svg>') });
+    if (m.cmd === "render_poster") {
+      // a strip as Python makes it: one 16:9 tile per frame, side by side
+      const n = [4, 8, 16, 32, 48].find((c) => c >= (m.data.count || 0)) || 48;
+      const tiles = Array.from({ length: n }, (_, i) =>
+        '<rect x="' + i * 100 + '" width="100" height="56" fill="hsl(' + Math.round(360 * i / n) + ',60%,45%)"/>').join("");
+      return reply(m.id, { master: m.data.master, count: n, tile_w: 100, tile_h: 56,
+        data: "data:image/svg+xml;base64," + btoa('<svg xmlns="http://www.w3.org/2000/svg" width="' + n * 100 + '" height="56">' + tiles + '</svg>') });
+    }
     if (m.cmd === "save_project_json") return reply(m.id, { ok: true, bytes: 10 });
     if (m.cmd === "job_state") return reply(m.id, { status: window.jobStatus, attached: true, log: [], files: [] });
     reply(m.id, { ok: true });
@@ -92,6 +115,13 @@ const frame = page.frames().find((fr) => fr.url().endsWith("index.html"));
 const sent = () => page.evaluate(() => window.sent);
 const generates = async () => (await sent()).filter((m) => m.cmd === "generate");
 const toast = () => frame.evaluate(() => document.body.innerText);
+const splitIdle = async (ms = 8000) => {
+  for (let t = 0; t < ms; t += 200) {
+    if (await app.locator('[data-testid="split-status"]').count() === 0) return true;
+    await page.waitForTimeout(200);
+  }
+  return false;
+};
 const endRun = async (status = "error") => {
   await page.evaluate((st) => window.push("gen", { status: st, progress: 1, logs: [] }), status);
   await page.waitForTimeout(700);
@@ -224,7 +254,27 @@ check("a block says what it is and why it will be redone",
   lane?.clips[1].title);
 check("the rendering group says so", /G3 · rendering/.test(lane?.clips[2].label || ""));
 check("posters are asked for, one per clip",
-  (await sent()).filter((m) => m.cmd === "render_poster" && /^group_w/.test(m.data.master)).length === 2);
+  new Set((await sent()).filter((m) => m.cmd === "render_poster" && /^group_w/.test(m.data.master)).map((m) => m.data.master)).size === 2);
+await page.waitForTimeout(400);
+{
+  const strip = await frame.evaluate(() => [...document.querySelectorAll(".rclip")].filter((c) => c.querySelector(".rstrip")).map((c) => {
+    const r = c.getBoundingClientRect();
+    const tiles = [...c.querySelectorAll(".rtile")].map((t) => t.getBoundingClientRect());
+    return { w: r.width, n: tiles.length, tw: tiles[0]?.width, th: tiles[0]?.height,
+      end: tiles.length ? tiles[tiles.length - 1].right - r.left : 0,
+      frames: [...c.querySelectorAll(".rtile")].map((t) => Number(t.dataset.frame)),
+      count: Number(c.querySelector(".rstrip").dataset.count), bg: getComputedStyle(c).backgroundImage };
+  }));
+  check("each finished clip shows a filmstrip", strip.length === 2, JSON.stringify(strip));
+  check("  ... its frames at their true shape (16:9 here), not stretched to fill the clip",
+    strip.every((x) => Math.abs(x.tw / x.th - 100 / 56) < 0.02 && x.bg === "none"), JSON.stringify(strip.map((x) => [x.tw, x.th, x.bg])));
+  check("  ... as many as it takes to fill the clip's width",
+    strip.every((x) => x.end >= x.w - 1 && x.n === Math.ceil(x.w / x.tw)), JSON.stringify(strip.map((x) => [x.w, x.n, x.end])));
+  check("  ... from a strip with at least that many frames, each tile showing its own moment in order",
+    strip.every((x) => x.count >= Math.min(48, x.n) && x.frames.every((f, i, a) => i === 0 || f >= a[i - 1])
+      && new Set(x.frames).size === Math.min(x.n, x.count)), JSON.stringify(strip.map((x) => [x.count, x.frames])));
+  await page.screenshot({ path: resolve(dir, "filmstrip.png"), clip: { x: 0, y: 250, width: 1600, height: 170 } });
+}
 await page.screenshot({ path: resolve(dir, "results-lane.png"), clip: { x: 0, y: 0, width: 1600, height: 420 } });
 
 // ---- marking clips and regenerating them ----
@@ -248,6 +298,7 @@ check("  ... and has a split button; a one-window clip does not",
   const sp = (await sent()).filter((m) => m.cmd === "render_split");
   check("  ... which asks Python to split exactly that clip", sp.length === n0 + 1 && sp[sp.length - 1].data.group === 1,
     JSON.stringify(sp.map((x) => x.data.group)));
+  check("  ... and it finishes", await splitIdle());
   check("  ... and the button says what it does", /Split/.test(await app.locator('[data-testid="split-1"]').innerText()));
   // right-click menu
   const c1 = app.locator('.rclip[data-group="1"]');
@@ -262,6 +313,7 @@ check("  ... and has a split button; a one-window clip does not",
   await page.waitForTimeout(600);
   check("  ... and Split there splits that clip, and closes the menu",
     (await sent()).filter((m) => m.cmd === "render_split").length === nm + 1 && await menu.count() === 0);
+  await splitIdle();
   await app.locator('.rclip[data-group="2"]').click({ button: "right", position: { x: 40, y: 10 } });
   await page.waitForTimeout(250);
   check("  ... a one-window clip cannot be split from it", await app.locator('[data-testid="menu-split"]').isDisabled());
@@ -306,7 +358,72 @@ check("mark a clip of several windows and 'Split marked into windows' appears be
   const sp = (await sent()).filter((m) => m.cmd === "render_split").slice(n0);
   check("  ... which splits only the marked clips that have windows to split", sp.length === 1 && sp[0].data.group === 1,
     JSON.stringify(sp.map((x) => x.data.group)));
+  await splitIdle();
   check("  ... and clears the marks", JSON.stringify(await marked()) === "[]", JSON.stringify(await marked()));
+}
+// While a split works, the page says so, and keeps saying so until it is done
+{
+  await page.evaluate(() => { window.splitHold = true; });
+  await app.locator('[data-testid="split-1"]').click();
+  await page.waitForTimeout(1600);
+  const status = app.locator('[data-testid="split-status"]');
+  check("while a clip is being split, the bar says so", await status.count() === 1
+    && /Splitting G1/.test(await status.innerText()) && /please wait/.test(await status.innerText()),
+    await status.innerText().catch(() => "no status"));
+  check("  ... and the clip itself shows it is being split", await app.locator('[data-testid="splitting-1"]').count() === 1
+    && /Splitting/.test(await app.locator('[data-testid="splitting-1"]').innerText()));
+  await page.screenshot({ path: resolve(dir, "splitting.png"), clip: { x: 0, y: 250, width: 1600, height: 170 } });
+  check("  ... it is still showing well after a passing message would have gone", await (async () => {
+    await page.waitForTimeout(3200);
+    return await status.count() === 1;
+  })());
+  await page.evaluate(() => { window.splitJob.done = 1; window.splitJob.step = "cutting piece 2 of 2"; window.splitJob.elapsed = 4; });
+  await page.waitForTimeout(1000);
+  check("  ... and how far it has got", /piece 2 of 2/.test(await status.innerText()), await status.innerText());
+  const bar = await page.screenshot({ path: resolve(dir, "splitting-bar.png"), clip: { x: 0, y: 1030, width: 1600, height: 70 } });
+  void bar;
+  check("  ... Generate, Stitch and the split buttons wait for it",
+    await app.getByRole("button", { name: "Generate", exact: true }).isDisabled()
+    && await app.locator('[data-testid="stitch"]').isDisabled()
+    && await app.locator('.rsplit').count() === 0);
+  const n1 = (await sent()).filter((m) => m.cmd === "render_split").length;
+  await app.locator('.rclip[data-group="1"]').click({ button: "right", position: { x: 40, y: 10 } });
+  await page.waitForTimeout(250);
+  check("  ... and a second split cannot be started from the menu", await app.locator('[data-testid="menu-split"]').isDisabled());
+  await page.keyboard.press("Escape");
+  check("  ... nor was one sent", (await sent()).filter((m) => m.cmd === "render_split").length === n1);
+  await page.evaluate(() => { window.splitHold = false; });
+  check("once it is done, the notice goes", await splitIdle());
+  check("  ... and it says the clip was split", /is now 2 clips/.test(await toast()));
+  check("  ... and everything can be used again", !(await app.getByRole("button", { name: "Generate", exact: true }).isDisabled()));
+}
+// A split that fails says so, and the message stays until it is closed
+{
+  await page.evaluate(() => { window.splitFail = "not enough disk space"; });
+  await app.locator('[data-testid="split-1"]').click();
+  await splitIdle();
+  await page.waitForTimeout(3200);
+  const msg = app.locator('[data-testid="split-msg"]');
+  check("a split that fails says why, and it stays on screen", await msg.count() === 1
+    && /Could not split G1: not enough disk space/.test(await msg.innerText()), await msg.innerText().catch(() => "no message"));
+  await msg.getByRole("button").click();
+  await page.waitForTimeout(200);
+  check("  ... until it is closed", await msg.count() === 0);
+  await page.evaluate(() => { window.splitFail = null; });
+}
+// A page reloaded during a split picks it up
+{
+  await page.evaluate(() => {
+    window.splitHold = true;
+    window.splitJob = { state: "running", group: 1, done: 1, total: 2, step: "cutting piece 2 of 2", elapsed: 9, n: 0 };
+    window.renderState = { ...window.renderState, splitting: { ...window.splitJob } };
+  });
+  await page.evaluate(() => window.push("gen", { status: "done", logs: [] }));
+  await page.waitForTimeout(1500);
+  check("a page that finds a split already going shows it", await app.locator('[data-testid="split-status"]').count() === 1,
+    await frame.evaluate(() => document.querySelector(".act")?.textContent || ""));
+  await page.evaluate(() => { window.splitHold = false; window.renderState = { ...window.renderState, splitting: null }; });
+  check("  ... until it finishes", await splitIdle());
 }
 await app.locator('.rclip[data-group="2"]').click({ position: { x: 40, y: 10 } });
 await page.waitForTimeout(450);

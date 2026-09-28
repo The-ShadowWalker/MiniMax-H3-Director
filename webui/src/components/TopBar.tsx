@@ -4,7 +4,7 @@ import { request } from "../lib/bridge";
 import { flushNow } from "../lib/persist";
 import { downloadJson, readSessionFile } from "../lib/session";
 
-const H3D2_BUILD = "1.6.19";
+const H3D2_BUILD = "1.6.21";
 
 export function TopBar() {
   const fileRef = useRef<HTMLInputElement>(null);

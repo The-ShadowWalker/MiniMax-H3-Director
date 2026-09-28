@@ -2,11 +2,47 @@ import { useEffect, useRef, useState } from "react";
 import { useDirector, type RenderClip } from "../lib/store";
 import { request, hasParent } from "../lib/bridge";
 
-/** Poster strips by clip file and size: a re-rendered clip gets a new size,
- *  so it gets a new strip, and an unchanged one is never fetched twice. */
-const posters = new Map<string, string>();
+/** Filmstrips by clip file and size: a re-rendered clip gets a new size, so
+ *  it gets a new strip, and an unchanged one is never fetched twice. Each is
+ *  `count` frames spread evenly through the clip, side by side, every one at
+ *  the video's own shape (tile_w x tile_h). The best one fetched is kept. */
+interface Strip { data: string; count: number; tile_w: number; tile_h: number }
+const posters = new Map<string, Strip>();
 const asking = new Set<string>();
 const keyOf = (c: { master?: string | null; bytes?: number | null }) => `${c.master}:${c.bytes ?? ""}`;
+/** The strip sizes Python makes (plugin.py POSTER_COUNTS). */
+const COUNTS = [4, 8, 16, 32, 48];
+const bucket = (k: number) => COUNTS.find((c) => c >= k) ?? COUNTS[COUNTS.length - 1];
+/** A clip's picture area on the track: its height minus the border. */
+const TILE_H = 26;
+
+/** How many frames fit across a clip `width` pixels wide at their true shape. */
+function framesAcross(width: number, strip: Strip | undefined, aspect: number) {
+  const a = strip && strip.tile_h ? strip.tile_w / strip.tile_h : aspect;
+  return Math.max(1, Math.ceil(width / (TILE_H * a)));
+}
+
+/** The frames laid along a clip, each at its true shape, like an editor's
+ *  filmstrip. Each tile shows the frame from the moment under its middle. */
+function Filmstrip({ strip, width }: { strip: Strip; width: number }) {
+  const tw = TILE_H * (strip.tile_w / Math.max(1, strip.tile_h));
+  const n = Math.max(1, Math.ceil(width / tw));
+  const tiles = [];
+  for (let i = 0; i < n; i++) {
+    const at = Math.min(0.999, ((i + 0.5) * tw) / Math.max(1, width));
+    const j = Math.min(strip.count - 1, Math.floor(at * strip.count));
+    tiles.push(
+      <span key={i} className="rtile" data-frame={j}
+        style={{
+          left: i * tw, width: tw,
+          backgroundImage: `url(${strip.data})`,
+          backgroundSize: `${strip.count * tw}px ${TILE_H}px`,
+          backgroundPosition: `${-j * tw}px 0`,
+        }} />,
+    );
+  }
+  return <span className="rstrip" data-testid="filmstrip" data-count={strip.count} data-tiles={n}>{tiles}</span>;
+}
 
 function mmss(frames: number, fps: number) {
   const t = Math.max(0, Math.round(frames / (fps || 24)));
@@ -35,8 +71,10 @@ export function ResultsLane({ xOf }: { xOf: (frame: number) => number }) {
   const setPlayhead = useDirector((z) => z.setPlayhead);
   const marks = useDirector((z) => z.regenMarks);
   const toggleMark = useDirector((z) => z.toggleRegenMark);
-  const running = useDirector((z) => z.job.status === "running");
   const splitClip = useDirector((z) => z.splitClip);
+  const splitting = useDirector((z) => z.splitting);
+  // no split, mark or regen while a render, stitch or split is going on
+  const busy = useDirector((z) => z.job.status === "running" || z.stitching || !!z.splitting);
   const clickTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   // The last mark made by a single click, so a SLOW double-click -- slower
   // than the wait below, well inside what Windows counts as a double-click --
@@ -61,19 +99,42 @@ export function ResultsLane({ xOf }: { xOf: (frame: number) => number }) {
   const clips = render?.clips || [];
   const active = render?.active || null;
 
-  // Fetch any poster strip not seen before.
+  // The video's shape, for sizing a clip's strip before the first one arrives.
+  const aspect = useDirector((z) => {
+    const m = /^(\d+)\s*[x×]\s*(\d+)/.exec(String(z.advanced.resolution || ""));
+    return m ? Number(m[1]) / Math.max(1, Number(m[2])) : 16 / 9;
+  });
+  // What each clip needs: enough frames to fill its width on screen at their
+  // true shape. A wider clip (or a zoom in) asks for a bigger strip.
+  const needs = clips.filter((c) => !!c.master).map((c) => {
+    const left = xOf(c.start);
+    const width = Math.max(6, xOf(c.start + (c.frames_got || c.frames)) - left);
+    const have = posters.get(keyOf(c));
+    const count = Math.min(bucket(framesAcross(width, have, aspect)), Math.max(1, c.frames_got || c.frames || 1));
+    return { c, count, have };
+  });
+  const needKey = needs.map((x) => `${keyOf(x.c)}#${x.count}`).join("|");
   useEffect(() => {
     if (!hasParent()) return;
-    for (const c of clips) {
+    for (const { c, count, have } of needs) {
       const k = keyOf(c);
-      if (!c.master || posters.has(k) || asking.has(k)) continue;
-      asking.add(k);
-      void request<{ data: string }>("render_poster", { master: c.master }, 120000)
-        .then((r) => { if (r?.data) { posters.set(k, r.data); bump((n) => n + 1); } })
+      if (have && have.count >= count) continue;
+      const ask = `${k}#${count}`;
+      if (asking.has(ask)) continue;
+      asking.add(ask);
+      void request<Strip & { master: string }>("render_poster", { master: c.master, count }, 120000)
+        .then((r) => {
+          if (!r?.data) return;
+          const cur = posters.get(k);
+          if (!cur || r.count > cur.count) {
+            posters.set(k, { data: r.data, count: r.count || 1, tile_w: r.tile_w || 16, tile_h: r.tile_h || 9 });
+            bump((n) => n + 1);
+          }
+        })
         .catch(() => undefined)
-        .finally(() => asking.delete(k));
+        .finally(() => asking.delete(ask));
     }
-  }, [clips]);
+  }, [needKey]); // eslint-disable-line react-hooks/exhaustive-deps
 
   return (
     <div className="trk results" data-lane="results" style={{ height: 44 }}>
@@ -99,19 +160,20 @@ export function ResultsLane({ xOf }: { xOf: (frame: number) => number }) {
             data-start={c.start}
             data-frames={c.frames_got}
             data-marked={marks.includes(c.group) ? "1" : undefined}
+            data-splitting={splitting?.group === c.group ? "1" : undefined}
             onClick={(e) => {
               // A click marks the clip to be rendered again -- but only once it
               // is clear it was not the first half of a double-click, which
               // opens the monitor instead and must not mark anything.
               e.stopPropagation();
-              if (e.detail > 1 || running) return;
+              if (e.detail > 1 || busy) return;
               clickTimer.current = setTimeout(() => {
                 clickTimer.current = null;
                 toggleMark(c.group);
                 lastMark.current = { group: c.group, t: Date.now() };
               }, 260);
             }}
-            style={{ left, width, backgroundImage: img ? `url(${img})` : undefined }}
+            style={{ left, width }}
             onContextMenu={(e) => {
               e.preventDefault();
               e.stopPropagation();
@@ -140,6 +202,7 @@ export function ResultsLane({ xOf }: { xOf: (frame: number) => number }) {
               c.n_windows > 1 ? `Split it into its ${c.n_windows} windows with the Split button, or right-click` : "Right-click for more",
             ].join("\n")}
           >
+            {img && <Filmstrip strip={img} width={width} />}
             <span className="rlab">G{c.group}{c.take && c.take > 1 ? ` · take ${c.take}` : ""}</span>
             {marks.includes(c.group) && <span className="rmark" title="Marked to regenerate">&#x21bb;</span>}
             {/* where the windows inside it meet */}
@@ -147,7 +210,14 @@ export function ResultsLane({ xOf }: { xOf: (frame: number) => number }) {
               const at = (c.windows || []).slice(0, k + 1).reduce((a, b) => a + b, 0);
               return <span key={k} className="rwin" style={{ left: xOf(c.start + at) - left }} />;
             })}
-            {c.n_windows > 1 && !running && (
+            {splitting?.group === c.group && (
+              <span className="rsplitting" data-testid={`splitting-${c.group}`}>
+                <i style={{ width: `${splitting.total ? Math.round((100 * splitting.done) / splitting.total) : 0}%` }} />
+                <span className="spin" aria-hidden="true" />
+                &#x2702; Splitting... {splitting.total ? `${Math.min(splitting.done + 1, splitting.total)}/${splitting.total}` : ""}
+              </span>
+            )}
+            {c.n_windows > 1 && !busy && (
               <button type="button" className="rsplit" data-testid={`split-${c.group}`}
                 title={`Split G${c.group} into ${c.n_windows} clips, one per window, so a single part can be regenerated. Nothing is re-rendered: each piece is the exact frames it already has.`}
                 onClick={(e) => { e.stopPropagation(); void splitClip(c.group); }}
@@ -162,12 +232,12 @@ export function ResultsLane({ xOf }: { xOf: (frame: number) => number }) {
         <div className="rmenu" data-testid="clip-menu" style={{ left: menu.x, top: menu.y }}
           onPointerDown={(e) => e.stopPropagation()} onContextMenu={(e) => e.preventDefault()}>
           <div className="rmenu-h">G{menu.c.group} · window{menu.c.n_windows > 1 ? `s ${menu.c.first_window + 1}–${menu.c.first_window + menu.c.n_windows}` : ` ${menu.c.first_window + 1}`}</div>
-          <button type="button" disabled={running || menu.c.n_windows < 2} data-testid="menu-split"
+          <button type="button" disabled={busy || menu.c.n_windows < 2} data-testid="menu-split"
             title={menu.c.n_windows < 2 ? "This clip is already a single window" : undefined}
             onClick={() => { const g = menu.c.group; setMenu(null); void splitClip(g); }}>
             &#x2702; Split into its {menu.c.n_windows > 1 ? `${menu.c.n_windows} windows` : "windows"}
           </button>
-          <button type="button" disabled={running} data-testid="menu-mark"
+          <button type="button" disabled={busy} data-testid="menu-mark"
             onClick={() => { const g = menu.c.group; setMenu(null); toggleMark(g); }}>
             {marks.includes(menu.c.group) ? "Unmark" : "Mark to regenerate"}
           </button>

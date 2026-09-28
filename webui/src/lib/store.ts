@@ -166,6 +166,11 @@ export interface DirectorState extends SessionPayload {
   splitClip: (group: number) => Promise<void>;
   /** Split every marked clip that covers more than one window. */
   splitMarked: () => Promise<void>;
+  /** A split in progress, so the page can show it is working. */
+  splitting: SplitProgress | null;
+  /** How the last split ended, when it did not simply work: stays until closed. */
+  splitMsg: { kind: "error" | "note"; text: string } | null;
+  setSplitMsg: (m: { kind: "error" | "note"; text: string } | null) => void;
   stitching: boolean;
   /** What a grouped render has finished, and what Continue would do with it. */
   render: RenderState | null;
@@ -216,6 +221,17 @@ export interface RenderClip {
 }
 
 /** Python's answer to render_state: the same check Continue itself makes. */
+export interface SplitProgress {
+  group: number;
+  /** pieces finished so far, of `total` */
+  done: number;
+  total: number;
+  step: string;
+  elapsed: number;
+  /** when several marked clips are split: which one of how many this is */
+  batch?: { k: number; of: number };
+}
+
 export interface RenderState {
   has_record: boolean;
   running: boolean;
@@ -236,6 +252,8 @@ export interface RenderState {
   joined?: string | null;
   stitch_stale?: boolean;
   stitch_why?: string;
+  /** a split going on right now (so a reloaded page shows it too) */
+  splitting?: { state: string; group: number; done: number; total: number; step: string; elapsed: number } | null;
 }
 
 function totalFrames(s: Pick<SessionPayload, "fps" | "duration_sec">) {
@@ -556,32 +574,40 @@ export const useDirector = create<DirectorState>()((set, get) => ({
         // it, and a different one makes the new take stop matching them.
         st.generate("all", { regen: { groups: st.regenMarks, seed: "same" } });
       },
+      splitting: null,
+      splitMsg: null,
+      setSplitMsg: (m) => set({ splitMsg: m }),
       splitClip: async (group) => {
         const st = get();
-        if (!hasParent() || st.job.status === "running") return;
+        if (!hasParent() || st.job.status === "running" || st.stitching || st.splitting) return;
         let plan;
         try {
           plan = assembleWanSettings(st as unknown as SessionPayload);
         } catch (e) {
-          set({ toast: `Could not split: ${String(e)}` });
+          set({ splitMsg: { kind: "error", text: `Could not split: ${String(e)}` } });
           return;
         }
-        set({ toast: `Splitting G${group} into its windows...` });
+        const n = (st.render?.clips || []).find((c) => c.group === group)?.n_windows || 0;
+        set({ splitMsg: null, splitting: { group, done: 0, total: n, step: "starting", elapsed: 0 } });
         try {
-          const r = await request<{ pieces: number }>("render_split",
-            { settings: plan, target_frames: totalFrames(st), fps: st.fps, group }, 600000);
+          const r = await runSplit(group, plan, st);
           // clip numbers after it move up, so marks made before would point
           // at the wrong clips
-          set({ regenMarks: [], toast: `G${group} is now ${r.pieces} clips, one per window - mark the one to redo` });
+          set({
+            regenMarks: [],
+            toast: `G${group} is now ${r.pieces} clips, one per window - mark the one to redo`,
+            splitMsg: r.note ? { kind: "note", text: `G${group} was split. ${r.note}.` } : null,
+          });
         } catch (e) {
-          set({ toast: `Could not split G${group}: ${String((e as Error)?.message || e)}` });
+          set({ splitMsg: { kind: "error", text: `Could not split G${group}: ${String((e as Error)?.message || e)}` } });
         } finally {
+          set({ splitting: null });
           void get().refreshRender();
         }
       },
       splitMarked: async () => {
         const st = get();
-        if (!hasParent() || st.job.status === "running") return;
+        if (!hasParent() || st.job.status === "running" || st.stitching || st.splitting) return;
         const clips = st.render?.clips || [];
         // Highest first: splitting a clip renumbers the ones after it, never
         // the ones before, so the numbers still to do stay right.
@@ -593,25 +619,35 @@ export const useDirector = create<DirectorState>()((set, get) => ({
         try {
           plan = assembleWanSettings(st as unknown as SessionPayload);
         } catch (e) {
-          set({ toast: `Could not split: ${String(e)}` });
+          set({ splitMsg: { kind: "error", text: `Could not split: ${String(e)}` } });
           return;
         }
         let done = 0;
         const failed: string[] = [];
-        for (const g of todo) {
-          set({ toast: `Splitting G${g} into its windows...` });
-          try {
-            await request("render_split", { settings: plan, target_frames: totalFrames(st), fps: st.fps, group: g }, 600000);
-            done += 1;
-          } catch (e) {
-            failed.push(`G${g}: ${String((e as Error)?.message || e)}`);
+        const notes: string[] = [];
+        set({ splitMsg: null });
+        try {
+          for (const [i, g] of todo.entries()) {
+            const batch = todo.length > 1 ? { k: i + 1, of: todo.length } : undefined;
+            const n = clips.find((c) => c.group === g)?.n_windows || 0;
+            set({ splitting: { group: g, done: 0, total: n, step: "starting", elapsed: 0, batch } });
+            try {
+              const r = await runSplit(g, plan, st, batch);
+              done += 1;
+              if (r.note) notes.push(r.note);
+            } catch (e) {
+              failed.push(`G${g}: ${String((e as Error)?.message || e)}`);
+            }
           }
+        } finally {
+          set({ splitting: null });
         }
         set({
           regenMarks: [],
-          toast: failed.length
-            ? `Split ${done} clip(s); not split - ${failed.join("; ")}`
-            : `Split ${done} clip(s) into one clip per window - now mark the part to redo`,
+          toast: `Split ${done} clip(s) into one clip per window - now mark the part to redo`,
+          splitMsg: failed.length
+            ? { kind: "error", text: `Split ${done} clip(s); not split - ${failed.join("; ")}` }
+            : notes.length ? { kind: "note", text: notes.join(". ") + "." } : null,
         });
         void get().refreshRender();
       },
@@ -1488,6 +1524,70 @@ let genSubscribed = false;
 const renderAsk = { busy: false, again: false };
 const renderRev = { seen: -1 };
 
+interface SplitJobState {
+  state: "idle" | "running" | "done" | "error";
+  group: number; done: number; total: number; step: string; elapsed: number;
+  note?: string; error?: string;
+}
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/** Start a split and wait for it, keeping `splitting` up to date so the
+ *  results track and the action bar show how far it has got. Python does the
+ *  cutting in the background: the bridge stays free to answer while it works. */
+async function runSplit(group: number, plan: unknown, st: DirectorState, batch?: { k: number; of: number }) {
+  const r = await request<{ started?: boolean; pieces: number }>("render_split",
+    { settings: plan, target_frames: totalFrames(st), fps: st.fps, group }, 60000);
+  useDirector.setState((s) => ({
+    splitting: { ...(s.splitting || { done: 0, step: "starting", elapsed: 0 }), group, total: r.pieces, batch },
+  }));
+  return watchSplit(batch);
+}
+
+/** Ask how the split is getting on until it has finished. */
+async function watchSplit(batch?: { k: number; of: number }): Promise<{ pieces: number; note: string }> {
+  let misses = 0;
+  for (;;) {
+    await sleep(700);
+    let j: SplitJobState;
+    try {
+      j = await request<SplitJobState>("split_state", {}, 15000);
+      misses = 0;
+    } catch (e) {
+      // a busy bridge is not a failed split: keep asking for a while
+      if (++misses > 40) throw new Error(`lost touch with the split (${String((e as Error)?.message || e)})`);
+      continue;
+    }
+    if (j.state === "running") {
+      useDirector.setState({
+        splitting: { group: j.group, done: j.done, total: j.total, step: j.step, elapsed: j.elapsed, batch },
+      });
+      continue;
+    }
+    if (j.state === "done") return { pieces: j.total, note: j.note || "" };
+    if (j.state === "error") throw new Error(j.error || "the split failed");
+    throw new Error("the split stopped without saying why");
+  }
+}
+
+/** A page opened or reloaded while a split runs picks it up and shows it. */
+function followSplit(sp: NonNullable<RenderState["splitting"]>) {
+  const st = useDirector.getState();
+  if (st.splitting) return;
+  useDirector.setState({
+    splitting: { group: sp.group, done: sp.done, total: sp.total, step: sp.step, elapsed: sp.elapsed },
+  });
+  watchSplit()
+    .then(() => useDirector.setState({ toast: `G${sp.group} is now ${sp.total} clips, one per window` }))
+    .catch((e) => useDirector.setState({
+      splitMsg: { kind: "error", text: `Could not split G${sp.group}: ${String((e as Error)?.message || e)}` },
+    }))
+    .finally(() => {
+      useDirector.setState({ splitting: null });
+      void useDirector.getState().refreshRender();
+    });
+}
+
 /** Ask Python what the render record says, against the timeline as it is. */
 async function refreshRenderOnce() {
   const st = useDirector.getState();
@@ -1503,6 +1603,7 @@ async function refreshRenderOnce() {
     const r = await request<RenderState>("render_state",
       { settings: plan, target_frames: totalFrames(st), fps: st.fps }, 300000);
     if (r) useDirector.setState({ render: r });
+    if (r?.splitting && r.splitting.state === "running") followSplit(r.splitting);
   } catch (e) {
     send("log", { message: `results track: render_state failed (${String(e)})` });
   }

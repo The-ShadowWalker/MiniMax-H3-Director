@@ -171,7 +171,7 @@ def new_record(app, seed, fps, ovl, window_frames, per_group, shared):
 def probe_streams(ffprobe, path):
     out = subprocess.run(
         [ffprobe, "-v", "error", "-show_entries",
-         "stream=index,codec_type,pix_fmt,sample_rate,channels", "-of", "json", str(path)],
+         "stream=index,codec_type,pix_fmt,width,height,sample_rate,channels", "-of", "json", str(path)],
         capture_output=True, text=True, timeout=120)
     try:
         return json.loads(out.stdout or "{}").get("streams") or []
@@ -258,6 +258,83 @@ def make_master(ffmpeg, ffprobe, src, dst, head, frames, fps):
             except OSError:
                 pass
     return count_frames(ffprobe, dst)
+
+
+def video_packets(ffprobe, path):
+    """[(pts_time text, md5 of the packet)] for every frame of the first video
+    stream, in order. Read from the container, nothing decoded, so it is quick
+    even for a long lossless clip."""
+    out = subprocess.run(
+        [ffprobe, "-v", "error", "-select_streams", "v:0", "-show_data_hash", "md5",
+         "-show_entries", "packet=pts_time,data_hash", "-of", "csv=p=0", str(path)],
+        capture_output=True, text=True, timeout=1800)
+    if out.returncode != 0:
+        raise ProbeError("ffprobe failed on %s: %s" % (Path(path).name, (out.stderr or "").strip()[:200]))
+    rows = []
+    for line in (out.stdout or "").splitlines():
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) >= 2 and parts[0] not in ("", "N/A"):
+            rows.append((parts[0], parts[1]))
+    return rows
+
+
+def copy_cut(ffmpeg, ffprobe, src, dst, head, frames, fps, packets):
+    """make_master's cut without re-encoding the picture, for a master that
+    is already FFV1: every frame of one is a keyframe (-g 1), so the frames
+    are copied as they are, byte for byte. The sound is cut exactly like
+    make_master cuts it (24-bit PCM, by time), which is quick.
+
+    `packets` is video_packets(src). What was written is checked packet by
+    packet against the source; any difference raises, so the caller can fall
+    back to make_master. Returns the frame count written."""
+    src, dst = Path(src), Path(dst)
+    head, frames, fps = int(head), int(frames), float(fps)
+    want = [h for _, h in packets[head:head + frames]]
+    if len(want) != frames:
+        raise ValueError("the clip has %d frames; frames %d-%d are not all in it"
+                         % (len(packets), head, head + frames - 1))
+    streams = probe_streams(ffprobe, src)
+    video = next((s for s in streams if s.get("codec_type") == "video"), None)
+    if video is None:
+        raise ValueError("%s has no video stream" % src.name)
+    has_audio = any(s.get("codec_type") == "audio" for s in streams)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dst.with_name(dst.stem + ".partial" + dst.suffix)
+    cmd = [ffmpeg, "-y", "-v", "error"]
+    if head > 0:
+        cmd += ["-ss", packets[head][0]]
+    if head + frames < len(packets):
+        # read the picture only up to (not into) the frame after the piece.
+        # Not -frames:v: that ends the whole output at the last frame and
+        # cuts off the sound still due after it.
+        span = float(packets[head + frames][0]) - float(packets[head][0])
+        cmd += ["-t", "%.6f" % max(0.5 / fps, span - 0.5 / fps)]
+    cmd += ["-i", str(src)]
+    if has_audio:
+        cmd += ["-i", str(src)]
+    cmd += ["-map", "0:v:0", "-c:v", "copy"]
+    if has_audio:
+        cmd += ["-map", "1:a:0",
+                "-af", "atrim=start=%.6f:end=%.6f,asetpts=PTS-STARTPTS"
+                       % (head / fps, (head + frames) / fps),
+                "-c:a", "pcm_s24le"]
+    cmd += ["-avoid_negative_ts", "make_zero", "-f", "matroska", str(tmp)]
+    try:
+        subprocess.run(cmd, check=True, capture_output=True, timeout=3600)
+        got = [h for _, h in video_packets(ffprobe, tmp)]
+        if got != want:
+            raise ValueError("the copied frames of %s do not match the source (%d written, %d wanted)"
+                             % (dst.name, len(got), len(want)))
+        fsync_file(tmp)
+        replace_retry(tmp, dst)
+        fsync_dir(dst.parent)
+    finally:
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+    return len(want)
 
 
 def _carry_cut(ffmpeg, ffprobe, master, start, end, fps, out):
