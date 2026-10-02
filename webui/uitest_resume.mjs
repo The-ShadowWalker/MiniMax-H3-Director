@@ -517,6 +517,39 @@ check("  ... and the card and Continue are gone",
   await app.locator('[data-testid="resume-card"]').count() === 0
   && await app.locator('[data-testid="continue-render"]').count() === 0);
 // Clearing the timeline clears the results track with it
+// A one-window clip whose window was cut in two on the timeline can be split to match
+{
+  // G2 was rendered as ONE window covering what are now windows 3 and 4 on
+  // the timeline, and a regen of it started 4 frames early (so its start is
+  // a few frames off the window edge). Python has not been asked again: the
+  // record says nothing about splitting -- the page works it out itself.
+  const w2 = bands[2].frames + bands[3].frames;
+  const c2 = { ...clip(2, 2, 1, "redo", "the windows under group 2 were changed on the timeline"),
+    start: starts[2] - 4, frames: w2, frames_got: w2 + 4, windows: [w2] };
+  const recut = { ...doneState, clips: [clip(1, 0, 2, "done"), c2,
+    { ...clip(3, 4, bands.length - 4, "after", "renders again after group 2") }] };
+  await page.evaluate((st) => { window.renderState = st; }, recut);
+  await page.evaluate(() => window.push("gen", { status: "done", logs: [] }));
+  await page.waitForTimeout(900);
+  check("a one-window clip whose window was re-cut on the timeline offers Split",
+    await app.locator('[data-testid="split-2"]').count() === 1 && await app.locator('[data-testid="split-3"]').count() === 0);
+  check("  ... with a line where it would be cut: on the window edge", await frame.evaluate((edge) => {
+    const l = document.querySelectorAll('.rclip[data-group="2"] .rwin');
+    return l.length === 1 && Math.abs(l[0].getBoundingClientRect().left - edge) <= 2;
+  }, bands[3].left), String(bands[3].left));
+  await app.locator('.rclip[data-group="2"]').click({ button: "right", position: { x: 20, y: 10 } });
+  await page.waitForTimeout(250);
+  check("  ... and its menu says it splits at the new windows",
+    /Split at the new windows \(2\)/.test(await app.locator('[data-testid="menu-split"]').innerText().catch(() => ""))
+    && !(await app.locator('[data-testid="menu-split"]').isDisabled()));
+  await page.keyboard.press("Escape");
+  const n0 = (await sent()).filter((m) => m.cmd === "render_split").length;
+  await app.locator('[data-testid="split-2"]').click();
+  await page.waitForTimeout(500);
+  const sp = (await sent()).filter((m) => m.cmd === "render_split").slice(n0);
+  check("  ... which asks Python to split that clip", sp.length === 1 && sp[0].data.group === 2, JSON.stringify(sp.map((x) => x.data)));
+  await splitIdle();
+}
 await page.evaluate((st) => { window.renderState = st; }, doneState);
 await page.evaluate(() => window.push("gen", { status: "done", logs: [] }));
 await page.waitForTimeout(800);

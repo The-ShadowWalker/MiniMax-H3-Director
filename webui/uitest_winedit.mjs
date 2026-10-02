@@ -230,6 +230,28 @@ if (audio) {
   check("  ... but not while typing in a box", await ph() === before, `${before} -> ${await ph()}`);
 }
 
+// 10. in manual mode "- window" is always there, not only once a window is selected
+{
+  await page.mouse.click(5, 5);
+  await page.keyboard.press("Escape");                   // nothing selected
+  await page.waitForTimeout(150);
+  const btn = page.locator('[data-testid="remove-window"]');
+  check("in manual mode the remove-window button is there with no window selected",
+    await manualOn() && await btn.count() === 1 && !(await btn.isDisabled()));
+  const w = await frames();
+  // the playhead into the second window, then remove
+  await page.keyboard.press("Home"); await page.waitForTimeout(100);
+  for (let i = 0; i < Math.ceil((w[0] + 5) / fps); i++) await page.keyboard.press("Shift+ArrowRight");
+  await page.waitForTimeout(150);
+  await btn.click();
+  await page.waitForTimeout(300);
+  const w2 = await frames();
+  check("  ... and it removes the window under the playhead (the second, folded into the next)",
+    w2.length === w.length - 1 && w2[0] === w[0] && w2[1] === w[1] + w[2],
+    `${JSON.stringify(w)} -> ${JSON.stringify(w2)}`);
+  check("  ... the timeline total is unchanged", w2.reduce((a, b) => a + b, 0) === w.reduce((a, b) => a + b, 0));
+}
+
 check("no uncaught errors", errors.length === 0, errors[0]);
 await browser.close();
 console.log();

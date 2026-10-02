@@ -21,9 +21,33 @@ function stripDurationTags(text: string) {
   return (text || "").replace(/\[\s*\/\s*duration\s*=[^\]]*\]/gi, " ");
 }
 
-function segsForWindow(segs: Segment[], w: WindowSpan): Segment[] {
+/** How much of a shot has to be inside a window for its prompt to go there:
+ *  a quarter of the shot, or a quarter of the window (a long shot running
+ *  across several windows). Less than that is a shot that only runs a little
+ *  past a window edge -- a boundary placed by eye a few frames off -- and its
+ *  prompt would otherwise be sent to the neighbouring window as well, where
+ *  it does not belong. */
+export const SPILL_SHARE = 0.25;
+
+/** The windows (indices into `wins`) a shot's prompt is sent to. Every shot
+ *  goes to at least one: the window holding most of it. */
+export function windowsForSegment(seg: { start: number; length: number }, wins: { start: number; end: number }[]): number[] {
+  const a = seg.start, b = seg.start + seg.length;
+  const ov = wins.map((w) => Math.max(0, Math.min(b, w.end) - Math.max(a, w.start)));
+  const out = ov
+    .map((o, i) => ({ o, i }))
+    .filter(({ o, i }) => o > 0 && (o >= SPILL_SHARE * seg.length || o >= SPILL_SHARE * (wins[i].end - wins[i].start)))
+    .map(({ i }) => i);
+  if (out.length) return out;
+  const best = ov.reduce((bi, o, i) => (o > ov[bi] ? i : bi), 0);
+  return ov[best] > 0 ? [best] : [];
+}
+
+function segsForWindow(segs: Segment[], w: WindowSpan, wins: WindowSpan[]): Segment[] {
+  const at = wins.indexOf(w);
   return segs
     .filter((s) => s.track === "video" && s.start < w.end && s.start + s.length > w.start)
+    .filter((s) => windowsForSegment(s, wins).includes(at))
     .sort((a, b) => a.start - b.start);
 }
 
@@ -37,7 +61,7 @@ export function buildPromptRelay(session: SessionPayload, wins: WindowSpan[]) {
       .map((t) => parseInt(t, 10)),
   );
   const windows = wins.map((w) => {
-    const covering = segsForWindow(session.timeline.segments, w);
+    const covering = segsForWindow(session.timeline.segments, w, wins);
     const bits: string[] = [];
     if (hard.has(w.i + 1)) bits.push("[/new_shot]");
     const dur = (w.end - w.start) / fps;

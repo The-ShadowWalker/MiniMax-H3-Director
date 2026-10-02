@@ -142,7 +142,10 @@ def fake_wan2gp(extra_frames=0):
             pos, q = locate(first_frame(st["video_source"], TMP / "c0.png"), STARTS[k] - carry)
             info.update(carry=carry, carried_from=pos, carry_q=q)
         # Wan2GP's own geometry: each window on the frame grid
-        outs = m._scheduler_outputs(([OVL] + durs) if carry else durs, 481, OVL, p._grid)
+        # the job's own overlap: Wan2GP continues from that many frames
+        ov = int(st.get("sliding_window_overlap") or OVL)
+        info["overlap"] = ov
+        outs = m._scheduler_outputs(([ov] + durs) if carry else durs, 481, ov, p._grid)
         outs = outs[1:] if carry else outs
         new = sum(outs) + extra_frames
         if carry:
@@ -248,14 +251,16 @@ jobs.clear()
 fr = regen([3])
 job = jobs[-1] if jobs else {}
 check("it is done", fr[-1]["status"] == "done", fr[-1])
-check("one job, continuing from the clip before", len(jobs) == 1 and job.get("carry") == OVL, jobs)
+check("one job, continuing from the clip before, with the render's own overlap",
+      len(jobs) == 1 and job.get("carry") == OVL and job.get("overlap") == OVL, jobs)
 check("and it really landed on the next clip's first frame", job.get("landed") is True and job.get("landing_at") == STARTS[3],
       job)
 rec = record()
 g2, g3 = rec["groups"][1], rec["groups"][2]
 shift = STARTS[2] - g3["start"]
 check("it started %d frame(s) early, and the clip before gave them up" % shift,
-      g2["frames_got"] == before["groups"][1]["frames_got"] - shift and job.get("carried_from") == STARTS[2] - shift - OVL,
+      g2["frames_got"] == before["groups"][1]["frames_got"] - shift
+      and job.get("carried_from") == STARTS[2] - shift - job.get("carry", -1),
       (shift, g2["frames_got"], job))
 check("the new clip replaced the old one", g3["master"] != before["groups"][2]["master"]
       and not (m.RENDERS_DIR / before["groups"][2]["master"]).exists() and g3.get("take") == 2)
@@ -301,6 +306,27 @@ n, worst, at = stitched_matches("last")
 check("seamless (worst %.1f dB)" % worst, n == TOTAL and worst > 30, (n, worst, at))
 
 # ================================================================ a wrong length
+print("\ncarrying in most of the clip before (switched on):")
+p.REGEN_CARRY_MOST = True
+jobs.clear()
+prev_len = record()["groups"][1]["frames_got"]
+fr = regen([3])
+job = jobs[-1] if jobs else {}
+LEGAL = list(range(int(p._grid["OVERLAP_OFFSET"]), int(p._grid["OVERLAP_MAX"]) + 1, int(p._grid["OVERLAP_STEP"])))
+check("it is done", fr[-1]["status"] == "done", fr[-1])
+check("it carries in much more of the clip before than the %d-frame overlap (%s of its %d frames), "
+      "as the job's overlap" % (OVL, job.get("carry"), prev_len),
+      job.get("carry", 0) > OVL and job.get("carry") in LEGAL and job.get("overlap") == job.get("carry")
+      and job.get("carry") < prev_len, job)
+check("  ... the most it can: the next size up would not fit in the clip before",
+      job.get("carry", 0) + int(p._grid["OVERLAP_STEP"]) > prev_len or job.get("carry") == LEGAL[-1], job)
+check("  ... carried from exactly the frames before the slot", job.get("carry_q", 0) > 30, job)
+check("  ... and it still lands exactly on the next clip", job.get("landed") is True, job)
+check("the clips still tile the timeline", contiguous(), [(x["start"], x["frames_got"]) for x in record()["groups"]])
+n, worst, at = stitched_matches("carry")
+check("seamless (worst %.1f dB)" % worst, n == TOTAL and worst > 30, (n, worst, at))
+p.REGEN_CARRY_MOST = False
+
 print("\nwhen Wan2GP comes back a different length:")
 snap = json.dumps(record())
 files = sorted(f.name for f in m.RENDERS_DIR.glob("*.mkv"))

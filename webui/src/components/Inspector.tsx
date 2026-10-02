@@ -1,4 +1,5 @@
 import { useDirector, useWindowStats, windowLayout } from "../lib/store";
+import { windowsForSegment } from "../lib/prompt";
 import { formatTimecode } from "../lib/h3";
 import { getMedia, fmtDuration , servedUrl } from "../lib/media";
 import { useState } from "react";
@@ -130,7 +131,12 @@ export function Inspector() {
       <div className="ib">
         {(() => {
           const bands = windowLayout(s).spans;
-          const cuts = bands.map((b) => b.start).filter((c) => c > seg.start && c < seg.start + seg.length);
+          // Only the windows its prompt is actually sent to: a shot that runs
+          // a few frames past a window edge stays with its own window.
+          const goes = windowsForSegment(seg, bands);
+          const cuts = goes.length > 1
+            ? bands.map((b) => b.start).filter((c) => c > seg.start && c < seg.start + seg.length)
+            : [];
           if (!cuts.length) return null;
           return (
             <div className="fs warnbox">

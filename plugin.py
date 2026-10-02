@@ -39,7 +39,7 @@ try:
 except ImportError:
     import compat
 
-PLUGIN_VERSION = "1.6.21"
+PLUGIN_VERSION = "1.6.24"
 PLUGIN_ID = "h3_director2"
 PLUGIN_NAME = "H3 Director"
 LOG_PREFIX = "[H3-D]"
@@ -3996,6 +3996,17 @@ class H3Director2Plugin(WAN2GPPlugin):
         kept = res["kept"]
         kept_w = (kept[-1]["first_window"] + kept[-1]["n_windows"]) if kept else 0
         out["clips"] = self._result_clips(rec, len(kept), res)
+        # Where each clip can be split, so the track offers it and draws the
+        # cuts: at its own windows, or at the timeline's windows when they
+        # were re-cut inside it.
+        for i, (c, g) in enumerate(zip(out["clips"], rec.get("groups") or [])):
+            try:
+                sp = self._split_points(rec, g, [int(x) for x in wf], i)
+                c["split_into"] = len(sp["windows"])
+                c["split_cuts"] = sp["edges"][1:-1]
+                c["split_mode"] = sp["mode"]
+            except Exception:
+                c["split_into"] = 0
         # Which clips' OWN inputs changed, each judged on its own -- the check
         # above stops at the first, since for Continue everything after a
         # change goes too; a regen only needs the ones that changed.
@@ -4153,41 +4164,68 @@ class H3Director2Plugin(WAN2GPPlugin):
             job["elapsed"] = round(time.time() - job.get("started", time.time()), 1)
         return job
 
-    def _split_prepare(self, data):
-        """Everything a split needs, worked out before anything is cut, so a
-        split that cannot be done says why straight away.
+    @staticmethod
+    def _edge_slack(rec):
+        """How far a clip's start or end may sit from a window edge and still
+        be on it: a regen starts up to a few frames early to land exactly on
+        the next clip, which moves the join off the edge by that much. Never
+        more than the overlap."""
+        return max(1, int((rec or {}).get("overlap") or 18))
 
-        A group of four windows that is good except for one can then have
-        just that one rendered again. Every piece is the exact frames and
-        sound it already had (FFV1 and PCM, cut by frame index), so the
-        results track, the stitched video and Continue are all unchanged by
-        it -- there are simply more, smaller clips.
+    @staticmethod
+    def _near_edge(cum, frame, tol):
+        """Index of the window edge nearest `frame`, if it is within `tol`."""
+        if not cum:
+            return None
+        i = min(range(len(cum)), key=lambda j: abs(cum[j] - int(frame)))
+        return i if abs(cum[i] - int(frame)) <= tol else None
 
-        It is cut where the clip's own windows met when it was rendered,
-        so it can be split even after its prompts or window lengths were
-        changed on the timeline.
-        """
-        rec = renders.load_record(RENDER_JSON, PLUGIN_ID)
-        groups = (rec or {}).get("groups") or []
-        gi = int(data.get("group") or 0) - 1
-        if not (0 <= gi < len(groups)):
-            raise ValueError("there is no clip G%s" % data.get("group"))
-        g = groups[gi]
+    def _split_points(self, rec, g, cur_wf, gi=0):
+        """Where clip `g` can be cut, or ValueError saying why it cannot.
+
+        Two ways, in this order:
+
+          * at the timeline's windows, when they were re-cut inside the clip
+            since it was rendered -- a 10s window split into two 5s ones, each
+            with its own prompt. The clip's two ends must still be window
+            edges, so every piece is exactly one of the new windows;
+          * at the windows the clip was rendered with, when it covers more
+            than one (a group of several windows).
+
+        Returns {"mode": "timeline" | "recorded", "edges": cut points from the
+        clip's first frame (first 0, last its length), "windows": the window
+        each piece fills, "first_window": the first piece's window index}."""
         n = int(g.get("n_windows") or 0)
-        if n < 2:
-            raise ValueError("G%d is already a single window" % (gi + 1))
-        src = RENDERS_DIR / str(g["master"])
-        if not src.is_file():
-            raise ValueError("G%d's clip is missing from the workspace" % (gi + 1))
-        # Where to cut comes from the CLIP: the windows it was rendered with,
-        # counted from where its first window began. That is what its frames
-        # are, whatever the timeline says now.
+        w0 = int(g.get("first_window") or 0)
+        start, got = int(g["start"]), int(g["frames_got"])
         rec_windows = [int(x) for x in g.get("windows") or []]
-        w0 = int(g["first_window"])
+        inside = False
+        if cur_wf:
+            cum = [0]
+            for x in cur_wf:
+                cum.append(cum[-1] + int(x))
+            tol = self._edge_slack(rec)
+            k, k2 = self._near_edge(cum, start, tol), self._near_edge(cum, start + got, tol)
+            inside = any(start + tol < c < start + got - tol for c in cum)
+            if k is not None and k2 is not None and k2 - k >= 2:
+                wins = [int(x) for x in cur_wf[k:k2]]
+                if wins != rec_windows:
+                    # A regen that started a few frames early (to land exactly
+                    # on the clip after it) leaves the join a few frames off the
+                    # window edge, so the clip's ends are matched to the nearest
+                    # edge; the cuts inside are exactly at the window edges.
+                    edges = [0] + [c - start for c in cum[k + 1:k2]] + [got]
+                    if all(b > a for a, b in zip(edges, edges[1:])):
+                        return {"mode": "timeline", "edges": edges, "windows": wins, "first_window": k}
+        if n < 2:
+            if inside:
+                raise ValueError("G%d does not start and end on the timeline's windows, so it cannot be cut "
+                                 "to match them" % (gi + 1))
+            raise ValueError("G%d is already a single window" % (gi + 1))
         if len(rec_windows) != n or any(x <= 0 for x in rec_windows):
             raise ValueError("G%d's record does not say how long its windows were" % (gi + 1))
-        fps = float(rec.get("fps") or data.get("fps") or 24)
-        start, got = int(g["start"]), int(g["frames_got"])
+        # Where it was rendered to be cut: its own windows, counted from where
+        # its first window began.
         rec_wf = [int(x) for x in rec.get("window_frames") or []]
         base = sum(rec_wf[:w0]) if rec_wf[w0:w0 + n] == rec_windows else start
         cuts, at = [], base
@@ -4197,35 +4235,78 @@ class H3Director2Plugin(WAN2GPPlugin):
         edges = [0] + cuts + [got]
         if any(b <= a for a, b in zip(edges, edges[1:])):
             raise ValueError("G%d's windows do not fall inside its clip (%s)" % (gi + 1, edges))
+        return {"mode": "recorded", "edges": edges, "windows": rec_windows, "first_window": w0}
 
-        # Each piece's check against the timeline. Clips rendered from 1.6.20
-        # on carry every window's own check from the moment they were made,
-        # so each piece knows exactly whether ITS prompt has changed since.
-        # Older clips carry one check for the whole clip: if that still
-        # matches, every piece matches; if it does not, which part changed
-        # cannot be known, so the pieces are checked against the timeline as
-        # it is now and the note says to mark the part to redo by hand.
+    def _split_prepare(self, data):
+        """Everything a split needs, worked out before anything is cut, so a
+        split that cannot be done says why straight away.
+
+        A clip that is good except for one part can then have just that part
+        rendered again. Every piece is the exact frames and sound it already
+        had (FFV1 and PCM, cut by frame index), so the stitched video is
+        unchanged by it -- there are simply more, smaller clips.
+        """
+        rec = renders.load_record(RENDER_JSON, PLUGIN_ID)
+        groups = (rec or {}).get("groups") or []
+        gi = int(data.get("group") or 0) - 1
+        if not (0 <= gi < len(groups)):
+            raise ValueError("there is no clip G%s" % data.get("group"))
+        g = groups[gi]
+        src = RENDERS_DIR / str(g["master"])
+        if not src.is_file():
+            raise ValueError("G%d's clip is missing from the workspace" % (gi + 1))
+        layout = self._group_layout(data)
+        cur_wf = [int(x) for x in layout["window_frames"]] if layout is not None else []
+        sp = self._split_points(rec, g, cur_wf, gi)
+        edges, windows, k0 = sp["edges"], sp["windows"], sp["first_window"]
+        n = len(windows)
+        fps = float(rec.get("fps") or data.get("fps") or 24)
+        start = int(g["start"])
+
         note = ""
-        saved = [str(x) for x in g.get("window_hashes") or []]
-        piece_hashes = saved if len(saved) == n else None
-        if piece_hashes is None:
-            now = None
-            layout = self._group_layout(data)
-            if layout is not None:
-                plan0, media0, base_offset, blocks = self._group_base(data)
-                wf = [int(x) for x in layout["window_frames"]]
-                if len(blocks) == len(wf):
-                    now = self._window_hashes(plan0, media0, base_offset, blocks, w0, n, len(wf))
-                    whole, _ = self._group_inputs(plan0, media0, base_offset, blocks, w0, n, len(wf))
-                    if renders.group_hash(whole) != g.get("hash") or wf[w0:w0 + n] != rec_windows:
-                        note = ("G%d changed since it was rendered and it is from before pieces kept their "
-                                "own check, so the plugin cannot tell which part changed: mark the one "
-                                "to redo yourself" % (gi + 1))
-            piece_hashes = now if now and len(now) == n else [g.get("hash")] * n
-            if not note and not now:
-                note = "the timeline could not be read, so the pieces could not be checked"
-        return {"group": gi + 1, "gi": gi, "g": g, "n": n, "w0": w0, "src": src, "fps": fps,
-                "start": start, "edges": edges, "rec_windows": rec_windows,
+        if sp["mode"] == "timeline":
+            # Cut to the timeline's new windows. The pieces are the frames the
+            # clip already has; they are taken as made for the windows they
+            # now fill, so the results track shows them as done and the one
+            # to redo is marked by hand. (Their old prompt was the window that
+            # has just been cut in two -- there is nothing finer to check.)
+            plan0, media0, base_offset, blocks = self._group_base(data)
+            if len(blocks) != len(cur_wf):
+                raise ValueError("the prompt has %d block(s) but the timeline has %d window(s): give each new "
+                                 "window its prompt first" % (len(blocks), len(cur_wf)))
+            piece_hashes = self._window_hashes(plan0, media0, base_offset, blocks, k0, n, len(cur_wf))
+            if len(piece_hashes) != n:
+                raise ValueError("the new windows' prompts could not be read")
+            note = ("G%d was cut at the timeline's new windows; each piece is taken as made for its window - "
+                    "mark the one to redo" % (gi + 1))
+        else:
+            # Each piece's check against the timeline. Clips rendered from
+            # 1.6.20 on carry every window's own check from the moment they
+            # were made, so each piece knows exactly whether ITS prompt has
+            # changed since. Older clips carry one check for the whole clip:
+            # if that still matches, every piece matches; if it does not,
+            # which part changed cannot be known, so the pieces are checked
+            # against the timeline as it is now and the note says to mark the
+            # part to redo by hand.
+            saved = [str(x) for x in g.get("window_hashes") or []]
+            piece_hashes = saved if len(saved) == n else None
+            if piece_hashes is None:
+                now = None
+                if layout is not None:
+                    plan0, media0, base_offset, blocks = self._group_base(data)
+                    if len(blocks) == len(cur_wf):
+                        now = self._window_hashes(plan0, media0, base_offset, blocks, k0, n, len(cur_wf))
+                        whole, _ = self._group_inputs(plan0, media0, base_offset, blocks, k0, n, len(cur_wf))
+                        if renders.group_hash(whole) != g.get("hash") or cur_wf[k0:k0 + n] != windows:
+                            note = ("G%d changed since it was rendered and it is from before pieces kept their "
+                                    "own check, so the plugin cannot tell which part changed: mark the one "
+                                    "to redo yourself" % (gi + 1))
+                piece_hashes = now if now and len(now) == n else [g.get("hash")] * n
+                if not note and not now:
+                    note = "the timeline could not be read, so the pieces could not be checked"
+        return {"group": gi + 1, "gi": gi, "g": g, "n": n, "w0": k0, "src": src, "fps": fps,
+                "start": start, "edges": edges, "rec_windows": windows, "mode": sp["mode"],
+                "timeline_wf": cur_wf if sp["mode"] == "timeline" else None,
                 "piece_hashes": piece_hashes, "note": note}
 
     def _split_run(self, job, progress=None):
@@ -4296,6 +4377,21 @@ class H3Director2Plugin(WAN2GPPlugin):
                     pass
             raise
         fg[gi:gi + 1] = pieces
+        if job.get("timeline_wf"):
+            # The render now follows the timeline's windows: every clip that
+            # starts on one of them is numbered by it, so the clips after this
+            # one still follow on (a clip whose own window was also re-cut
+            # shows as changed until it is split too).
+            twf = [int(x) for x in job["timeline_wf"]]
+            fresh["window_frames"] = twf
+            cum = [0]
+            for x in twf:
+                cum.append(cum[-1] + x)
+            tol = self._edge_slack(fresh)
+            for other in fg:
+                at = self._near_edge(cum, int(other.get("start", -1)), tol)
+                if at is not None:
+                    other["first_window"] = at
         # The stitched video is the same frames: it stays up to date.
         was = fresh.get("joined_masters")
         if isinstance(was, list) and g["master"] in was:
@@ -4527,6 +4623,81 @@ class H3Director2Plugin(WAN2GPPlugin):
                 _real_plan_windows(int(target), win, ovl, self._grid)]
 
     # ---------------- regenerating marked clips ----------------
+    # Off until Dave decides: carrying more of the clip before shifts any
+    # timing written inside a prompt ("speaks from 2.5s") by the extra carry,
+    # because the model counts those seconds from the first carried frame.
+    REGEN_CARRY_MOST = False
+
+    def _regen_carry_plan(self, durs_in, target, prev, nxt, has_start, has_end, ovl):
+        """How a regen continues from the clip before it, and what it asks for.
+
+        With REGEN_CARRY_MOST off, a regen carries in the render's own overlap,
+        like every other join. With it on, it carries in AS MUCH of the clip before it as Wan2GP allows,
+        not just the render's overlap: the most the model can be given (its
+        largest legal overlap, 120 frames = 5 s at 24 fps for H3) or, when
+        the clip before is shorter, most of that clip. The new clip then sees
+        and hears much more of what it continues -- the voice, the delivery,
+        the movement -- instead of the last fraction of a second, so its
+        sound and look match the clip before it better. The carried frames
+        are cut off afterwards as always, so the clip's length and where it
+        sits on the timeline do not change; the cost is that the job
+        generates the carried frames too, so it takes longer.
+
+        Returns (carry, durs, total, r, shift, shift_next, extend_end): the
+        frames carried in, the declared window durations, the new frames they
+        produce, how many more than the slot that is, and where those extra
+        frames go -- never off a pinned frame: the start image is the first
+        frame of the piece, the end image the last, the landing frame the
+        first of the next clip."""
+        def placement(r):
+            shift = shift_next = extend_end = 0
+            if r and prev and (nxt or has_end):
+                shift = r                  # start early; the clip before gives up r frames
+            elif r and nxt and has_start:
+                shift_next = r             # land later; the clip after gives up r frames
+            elif r and has_end:
+                extend_end = r             # nothing either side: the piece ends r frames later
+            # (otherwise the extra frames are at an open end and simply cut)
+            return shift, shift_next, extend_end
+
+        if not prev:
+            durs, total = self._regen_request(durs_in, 0, target)
+            r = total - target
+            return (0, durs, total, r) + placement(r)
+        if not self.REGEN_CARRY_MOST:
+            # the render's own overlap, as every other join was made
+            durs, total = self._regen_request(durs_in, int(ovl), target)
+            r = total - target
+            shift, shift_next, extend_end = placement(r)
+            if shift and int(prev["frames_got"]) - shift <= int(ovl):
+                raise ValueError("the clip before is too short to give up %d frame(s)" % shift)
+            return (int(ovl), durs, total, r, shift, shift_next, extend_end)
+        step = max(1, int(self._grid.get("OVERLAP_STEP", 17)))
+        first = int(self._grid.get("OVERLAP_OFFSET", 1))
+        top = int(self._grid.get("OVERLAP_MAX", 120))
+        wmax = int(self._grid.get("WINDOW_MAX", 481))
+        legal = sorted({c for c in range(first, top + 1, step) if c >= int(ovl)} | {int(ovl)}, reverse=True)
+        why = []
+        for c in legal:
+            try:
+                durs, total = self._regen_request(durs_in, c, target)
+            except ValueError as exc:
+                why.append("%d: %s" % (c, exc))
+                continue
+            r = total - target
+            shift, shift_next, extend_end = placement(r)
+            if int(prev["frames_got"]) - shift <= c:
+                why.append("%d: the clip before has %d frame(s)" % (c, int(prev["frames_got"])))
+                continue
+            if max(int(d) for d in durs) + c > wmax:
+                why.append("%d: a window would pass the model's %d frames" % (c, wmax))
+                continue
+            if c != int(ovl):
+                trace("regen: continuing from the last %d frame(s) of the clip before (%.1fs), "
+                      "not just the %d-frame overlap" % (c, c / float(self._grid.get("FPS", 24)), int(ovl)))
+            return (c, durs, total, r, shift, shift_next, extend_end)
+        raise ValueError("the clip before is too short to continue from (%s)" % "; ".join(why[-2:]))
+
     def _regen_request(self, durs, carry, target):
         """Declared window durations whose REAL output is the smallest amount
         that is at least `target` new frames, and that amount.
@@ -4649,7 +4820,9 @@ class H3Director2Plugin(WAN2GPPlugin):
             w0, n = int(g["first_window"]), int(g["n_windows"])
             if wf[w0:w0 + n] != [int(x) for x in g["windows"]]:
                 yield frame("error", error="The windows under group %d were changed on the timeline, so its "
-                                           "clips cannot be replaced in place. Render again instead." % (gi + 1))
+                                           "clip cannot be replaced in place. If you cut its window into smaller "
+                                           "ones, split the clip at the new windows first (Split on the clip); "
+                                           "otherwise render again." % (gi + 1))
                 return
             if not (RENDERS_DIR / str(g.get("master") or "")).is_file():
                 yield frame("error", error="Group %d's clip is missing from the workspace." % (gi + 1))
@@ -4712,27 +4885,14 @@ class H3Director2Plugin(WAN2GPPlugin):
             E = int(nxt["start"]) if nxt else int(last["start"]) + int(last["frames_got"])
             w0 = int(groups[a]["first_window"])
             n_win = sum(int(groups[k]["n_windows"]) for k in run)
-            carry = ovl if prev else 0
             pg0, _ = self._group_inputs(plan0, media0, base_offset, blocks, w0, n_win, len(wf))
             has_start = a == 0 and bool((pg0.get("media") or {}).get("image_start"))
             has_end = (not nxt) and bool((pg0.get("media") or {}).get("image_end"))
             target = (E - S) + (1 if nxt else 0)       # + the landing frame
+            carry = 0
             try:
-                durs, total = self._regen_request(wf[w0:w0 + n_win], carry, target)
-                r = total - target
-                # Where the r extra frames go. Never off a pinned frame: the
-                # start image is the first frame of the piece, the end image
-                # the last, the landing frame the first of the next clip.
-                shift = shift_next = extend_end = 0
-                if r and prev and (nxt or has_end):
-                    shift = r                  # start early; the clip before gives up r frames
-                elif r and nxt and has_start:
-                    shift_next = r             # land later; the clip after gives up r frames
-                elif r and has_end:
-                    extend_end = r             # nothing either side: the piece ends r frames later
-                # (otherwise the extra frames are at an open end and simply cut)
-                if shift and int(prev["frames_got"]) - shift <= carry:
-                    raise ValueError("the clip before is too short to give up %d frame(s)" % shift)
+                carry, durs, total, r, shift, shift_next, extend_end = self._regen_carry_plan(
+                    wf[w0:w0 + n_win], target, prev, nxt, has_start, has_end, ovl)
                 if shift_next and int(nxt["frames_got"]) - shift_next <= ovl:
                     raise ValueError("the clip after is too short to give up %d frame(s)" % shift_next)
                 trace("regen %s: slot %d..%d (%d frame(s)), carry %d, landing %s, request %s -> %d new "
@@ -4757,6 +4917,10 @@ class H3Director2Plugin(WAN2GPPlugin):
                     pg["media"] = media_g
                 st = self._normalize_audio_guide(self._assemble_settings(pg))
                 st["seed"] = seed
+                if carry:
+                    # Wan2GP continues from the last `overlap` frames of the
+                    # source and no more, so the carry is the job's overlap.
+                    st["sliding_window_overlap"] = carry
 
                 # timeline frame of output frame 0, worked back from whatever
                 # is pinned at the end: the landing frame (at E, or r later

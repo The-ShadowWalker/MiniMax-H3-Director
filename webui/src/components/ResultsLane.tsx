@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { useDirector, type RenderClip } from "../lib/store";
+import { useDirector, splitPlan, type RenderClip } from "../lib/store";
 import { request, hasParent } from "../lib/bridge";
 
 /** Filmstrips by clip file and size: a re-rendered clip gets a new size, so
@@ -73,6 +73,10 @@ export function ResultsLane({ xOf }: { xOf: (frame: number) => number }) {
   const toggleMark = useDirector((z) => z.toggleRegenMark);
   const splitClip = useDirector((z) => z.splitClip);
   const splitting = useDirector((z) => z.splitting);
+  // the windows as they are on screen, so Split shows as soon as one is cut
+  const durationSec = useDirector((z) => z.duration_sec);
+  const timeline = useDirector((z) => z.timeline);
+  const layoutSrc = { duration_sec: durationSec, fps, timeline };
   // no split, mark or regen while a render, stitch or split is going on
   const busy = useDirector((z) => z.job.status === "running" || z.stitching || !!z.splitting);
   const clickTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -151,6 +155,13 @@ export function ResultsLane({ xOf }: { xOf: (frame: number) => number }) {
         const width = Math.max(6, xOf(c.start + (c.frames_got || c.frames)) - left);
         const img = posters.get(keyOf(c));
         const last = c.first_window + c.n_windows;
+        // where Split would cut, from the windows on screen right now: the
+        // timeline's new windows if they were re-cut inside it, else the
+        // windows it was rendered with
+        const plan = splitPlan(c, layoutSrc);
+        const pieces = plan?.pieces || 0;
+        const recut = plan?.mode === "timeline";
+        const cuts = plan?.cuts || [];
         return (
           <div
             key={`${c.group}-${c.master}`}
@@ -199,17 +210,19 @@ export function ResultsLane({ xOf }: { xOf: (frame: number) => number }) {
               `${STATUS_TEXT[c.status]}${c.why ? ` — ${c.why}` : ""}`,
               marks.includes(c.group) ? "Marked to regenerate - click to unmark" : "Click to mark for regen",
               "Double-click to open the results monitor here",
-              c.n_windows > 1 ? `Split it into its ${c.n_windows} windows with the Split button, or right-click` : "Right-click for more",
+              pieces > 1
+                ? recut
+                  ? `Its window was cut into ${pieces} on the timeline: Split cuts the clip to match, or right-click`
+                  : `Split it into its ${pieces} windows with the Split button, or right-click`
+                : "Right-click for more",
             ].join("\n")}
           >
             {img && <Filmstrip strip={img} width={width} />}
             <span className="rlab">G{c.group}{c.take && c.take > 1 ? ` · take ${c.take}` : ""}</span>
             {marks.includes(c.group) && <span className="rmark" title="Marked to regenerate">&#x21bb;</span>}
             {/* where the windows inside it meet */}
-            {c.n_windows > 1 && (c.windows || []).slice(0, -1).map((_, k) => {
-              const at = (c.windows || []).slice(0, k + 1).reduce((a, b) => a + b, 0);
-              return <span key={k} className="rwin" style={{ left: xOf(c.start + at) - left }} />;
-            })}
+            {pieces > 1 && cuts.map((at, k) =>
+              <span key={k} className="rwin" style={{ left: xOf(c.start + at) - left }} />)}
             {splitting?.group === c.group && (
               <span className="rsplitting" data-testid={`splitting-${c.group}`}>
                 <i style={{ width: `${splitting.total ? Math.round((100 * splitting.done) / splitting.total) : 0}%` }} />
@@ -217,9 +230,11 @@ export function ResultsLane({ xOf }: { xOf: (frame: number) => number }) {
                 &#x2702; Splitting... {splitting.total ? `${Math.min(splitting.done + 1, splitting.total)}/${splitting.total}` : ""}
               </span>
             )}
-            {c.n_windows > 1 && !busy && (
+            {pieces > 1 && !busy && (
               <button type="button" className="rsplit" data-testid={`split-${c.group}`}
-                title={`Split G${c.group} into ${c.n_windows} clips, one per window, so a single part can be regenerated. Nothing is re-rendered: each piece is the exact frames it already has.`}
+                title={recut
+                  ? `Cut G${c.group} at the timeline's new windows into ${pieces} clips, one per window, so a single part can be regenerated. Nothing is re-rendered: each piece is the exact frames it already has.`
+                  : `Split G${c.group} into ${pieces} clips, one per window, so a single part can be regenerated. Nothing is re-rendered: each piece is the exact frames it already has.`}
                 onClick={(e) => { e.stopPropagation(); void splitClip(c.group); }}
                 onDoubleClick={(e) => e.stopPropagation()}>
                 &#x2702; Split
@@ -232,10 +247,15 @@ export function ResultsLane({ xOf }: { xOf: (frame: number) => number }) {
         <div className="rmenu" data-testid="clip-menu" style={{ left: menu.x, top: menu.y }}
           onPointerDown={(e) => e.stopPropagation()} onContextMenu={(e) => e.preventDefault()}>
           <div className="rmenu-h">G{menu.c.group} · window{menu.c.n_windows > 1 ? `s ${menu.c.first_window + 1}–${menu.c.first_window + menu.c.n_windows}` : ` ${menu.c.first_window + 1}`}</div>
-          <button type="button" disabled={busy || menu.c.n_windows < 2} data-testid="menu-split"
-            title={menu.c.n_windows < 2 ? "This clip is already a single window" : undefined}
+          <button type="button" disabled={busy || (splitPlan(menu.c, layoutSrc)?.pieces || 0) < 2} data-testid="menu-split"
+            title={(splitPlan(menu.c, layoutSrc)?.pieces || 0) < 2 ? "This clip is already a single window" : undefined}
             onClick={() => { const g = menu.c.group; setMenu(null); void splitClip(g); }}>
-            &#x2702; Split into its {menu.c.n_windows > 1 ? `${menu.c.n_windows} windows` : "windows"}
+            &#x2702; {(() => {
+              const mp = splitPlan(menu.c, layoutSrc);
+              return mp?.mode === "timeline"
+                ? `Split at the new windows (${mp.pieces})`
+                : `Split into its ${mp && mp.pieces > 1 ? `${mp.pieces} windows` : "windows"}`;
+            })()}
           </button>
           <button type="button" disabled={busy} data-testid="menu-mark"
             onClick={() => { const g = menu.c.group; setMenu(null); toggleMark(g); }}>

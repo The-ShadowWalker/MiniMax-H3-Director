@@ -218,6 +218,79 @@ export interface RenderClip {
   take?: number;
   /** This clip's OWN prompt or media changed since it was rendered. */
   changed?: boolean;
+  /** How many clips Split would make of it (0: it cannot be split), where it
+   *  would cut (frames from its start), and whether at the windows it was
+   *  rendered with or at the timeline's windows re-cut inside it. */
+  split_into?: number;
+  split_cuts?: number[];
+  split_mode?: "recorded" | "timeline";
+}
+
+export interface SplitPlan {
+  /** clips it would become */
+  pieces: number;
+  /** where it would be cut, in frames from its first frame */
+  cuts: number[];
+  /** at the windows it was rendered with, or at the timeline's windows */
+  mode: "recorded" | "timeline";
+}
+
+/** Where Split would cut this clip, worked out from the timeline AS IT IS ON
+ *  SCREEN -- so the button shows the moment a window is cut, without waiting
+ *  for Python to check the clips again. The same rule as plugin.py's
+ *  _split_points (Python decides when Split is pressed):
+ *
+ *  - at the timeline's windows, when the clip starts and ends on window edges
+ *    and covers 2 or more windows that are not the ones it was rendered with.
+ *    "On an edge" allows a few frames (up to the overlap): a regen starts a
+ *    little early to land exactly on the next clip, moving the join;
+ *  - otherwise at the windows it was rendered with, when it has several. */
+export function splitPlan(
+  c: RenderClip | undefined | null,
+  st?: Pick<DirectorState, "duration_sec" | "fps" | "timeline"> | null,
+): SplitPlan | null {
+  if (!c) return null;
+  if (st) {
+    const spans = windowLayout(st).spans;
+    if (spans.length) {
+      const cum = [spans[0].start, ...spans.map((w) => w.end)];
+      const tol = Math.max(1, st.timeline.slidingWindowOverlap || 18);
+      const near = (f: number) => {
+        let best = 0;
+        cum.forEach((e, i) => { if (Math.abs(e - f) < Math.abs(cum[best] - f)) best = i; });
+        return Math.abs(cum[best] - f) <= tol ? best : -1;
+      };
+      const got = c.frames_got || c.frames;
+      const k = near(c.start), k2 = near(c.start + got);
+      if (k >= 0 && k2 - k >= 2) {
+        const wins = spans.slice(k, k2).map((w) => w.end - w.start);
+        const was = c.windows || [];
+        if (wins.length !== was.length || wins.some((w, i) => w !== was[i])) {
+          const cuts = cum.slice(k + 1, k2).map((e) => e - c.start);
+          if (cuts.every((x, i) => x > (i ? cuts[i - 1] : 0)) && cuts[cuts.length - 1] < got)
+            return { pieces: wins.length, cuts, mode: "timeline" };
+        }
+      }
+    }
+  }
+  if (c.n_windows > 1) {
+    const w = c.windows || [];
+    const cuts = c.split_mode === "recorded" && c.split_cuts
+      ? c.split_cuts
+      : w.slice(0, -1).map((_, i) => w.slice(0, i + 1).reduce((a, b) => a + b, 0));
+    return { pieces: c.n_windows, cuts, mode: "recorded" };
+  }
+  if (!st && (c.split_into || 0) > 1)
+    return { pieces: c.split_into as number, cuts: c.split_cuts || [], mode: c.split_mode || "timeline" };
+  return null;
+}
+
+/** How many clips Split would make of this clip (0: it cannot be split). */
+export function splitInto(
+  c: RenderClip | undefined | null,
+  st?: Pick<DirectorState, "duration_sec" | "fps" | "timeline"> | null,
+): number {
+  return splitPlan(c, st)?.pieces || 0;
 }
 
 /** Python's answer to render_state: the same check Continue itself makes. */
@@ -463,8 +536,15 @@ export const useDirector = create<DirectorState>()((set, get) => ({
 
       removeSelectedWindow: () => {
         const st = get();
-        const i = st.selectedWindow;
         const frames = st.timeline.windowFrames || [];
+        // the selected window, or else the one under the playhead
+        let i = st.selectedWindow;
+        if (i == null) {
+          const ph = st.timeline.playhead || 0;
+          const spans = windowLayout(st).spans;
+          const at = spans.findIndex((w) => ph >= w.start && ph < w.end);
+          i = at >= 0 ? at : spans.length - 1;
+        }
         if (i == null || i < 0 || i >= frames.length) return;
         if (frames.length < 2) { set({ toast: "The last window cannot be removed" }); return; }
         get().mergeWindow(i);
@@ -587,7 +667,7 @@ export const useDirector = create<DirectorState>()((set, get) => ({
           set({ splitMsg: { kind: "error", text: `Could not split: ${String(e)}` } });
           return;
         }
-        const n = (st.render?.clips || []).find((c) => c.group === group)?.n_windows || 0;
+        const n = splitInto((st.render?.clips || []).find((c) => c.group === group), st);
         set({ splitMsg: null, splitting: { group, done: 0, total: n, step: "starting", elapsed: 0 } });
         try {
           const r = await runSplit(group, plan, st);
@@ -612,9 +692,9 @@ export const useDirector = create<DirectorState>()((set, get) => ({
         // Highest first: splitting a clip renumbers the ones after it, never
         // the ones before, so the numbers still to do stay right.
         const todo = st.regenMarks
-          .filter((g) => (clips.find((c) => c.group === g)?.n_windows || 0) > 1)
+          .filter((g) => splitInto(clips.find((c) => c.group === g), st) > 1)
           .sort((a, b) => b - a);
-        if (!todo.length) { set({ toast: "None of the marked clips has more than one window to split into" }); return; }
+        if (!todo.length) { set({ toast: "None of the marked clips has windows to split into" }); return; }
         let plan;
         try {
           plan = assembleWanSettings(st as unknown as SessionPayload);
@@ -629,7 +709,7 @@ export const useDirector = create<DirectorState>()((set, get) => ({
         try {
           for (const [i, g] of todo.entries()) {
             const batch = todo.length > 1 ? { k: i + 1, of: todo.length } : undefined;
-            const n = clips.find((c) => c.group === g)?.n_windows || 0;
+            const n = splitInto(clips.find((c) => c.group === g), st);
             set({ splitting: { group: g, done: 0, total: n, step: "starting", elapsed: 0, batch } });
             try {
               const r = await runSplit(g, plan, st, batch);

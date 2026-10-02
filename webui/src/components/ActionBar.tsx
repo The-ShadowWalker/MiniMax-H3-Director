@@ -1,4 +1,4 @@
-import { useDirector, useWindowStats } from "../lib/store";
+import { useDirector, useWindowStats, splitInto } from "../lib/store";
 import { Confirm } from "./Confirm";
 
 function mmss(sec: number) {
@@ -16,7 +16,7 @@ export function ActionBar() {
   const r = s.render;
   const canContinue = !!r?.resumable && !busy;
   const marks = s.regenMarks;
-  const splittable = marks.filter((g) => ((r?.clips || []).find((c) => c.group === g)?.n_windows || 0) > 1).length;
+  const splittable = marks.filter((g) => splitInto((r?.clips || []).find((c) => c.group === g), s) > 1).length;
   const stale = !!r?.stitch_stale && !running;
   // Clips whose OWN prompt or media changed ("redo"). The ones after a change
   // ("after") are only stale for a straight-through render; a regen lands on

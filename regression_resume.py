@@ -653,6 +653,97 @@ try:
 except ValueError as e:
     check("a split that cannot be done says so straight away", "no clip" in str(e), str(e))
 
+print("\nsplitting a clip at windows re-cut on the timeline:")
+# One window per group, then two of the windows are each cut in two on the
+# timeline, each half with its own prompt -- the clips are cut to match, so
+# just one half can be regenerated.
+submitted.clear()
+fr = run(data_for(group=1), make_submit(), group=1)
+check("(a finished render, one window per clip)", fr[-1]["status"] == "done"
+      and [x["n_windows"] for x in record()["groups"]] == [1] * len(WF), [x["n_windows"] for x in record()["groups"]])
+WF2 = [60, 60, 96, 60, 60, 72, 110]               # windows 1 and 3 cut in half
+P2 = ["street, wide", "street, close", "a dog runs", "rain starts", "rain harder", "the dog shelters", "sun again"]
+
+
+def data_recut():
+    d = data_for(group=1)
+    d["settings"]["window_frames"] = list(WF2)
+    # the windows that were not cut keep exactly the prompt they had
+    orig = blocks(PROMPTS).split("\n\n")
+    keep = {2: orig[1], 5: orig[3], 6: orig[4]}
+    d["settings"]["prompt"] = "\n\n".join(keep.get(i) or "CUT=%d %s [/duration=%.4fs]" % (i, t, WF2[i] / FPS)
+                                          for i, t in enumerate(P2))
+    return d
+
+
+rs = p._render_state(data_recut())
+cl = rs["clips"]
+check("the clips under the re-cut windows offer a split at the new windows",
+      [c.get("split_into") for c in cl] == [2, 0, 2, 0, 0] and cl[0].get("split_mode") == "timeline"
+      and cl[0].get("split_cuts") == [60], [(c.get("split_into"), c.get("split_cuts")) for c in cl])
+check("  ... and until they are split, nothing from the first re-cut window on can be kept",
+      rs["kept_groups"] == 0, rs.get("reason"))
+g3_old = record()["groups"][2]["master"]
+out = p._render_split({**data_recut(), "group": 1})
+r1 = record()
+check("G1 became two clips, one per new window", out.get("pieces") == 2
+      and [(x["first_window"], x["frames_got"]) for x in r1["groups"][:2]] == [(0, 60), (1, 60)],
+      [(x["first_window"], x["frames_got"]) for x in r1["groups"]])
+for x in r1["groups"][:2]:
+    worst, count = matches_reference(m.RENDERS_DIR / x["master"], start=x["start"])
+    check("  piece at frame %d is exactly those frames (worst PSNR %.1f dB)" % (x["start"], worst),
+          worst > 30 and count == x["frames_got"], (worst, count))
+check("  ... and says each piece is taken as made for its new window", "new windows" in (out.get("note") or ""), out)
+check("the clips after it are numbered by the new windows",
+      [x["first_window"] for x in r1["groups"]] == [0, 1, 2, 3, 5, 6], [x["first_window"] for x in r1["groups"]])
+rs = p._render_state(data_recut())
+check("  ... so everything up to the next re-cut window is kept", rs["kept_groups"] == 3, (rs["kept_groups"], rs.get("reason")))
+out = p._render_split({**data_recut(), "group": 4})
+rs = p._render_state(data_recut())
+check("with that one split too, every clip matches the timeline and the render is complete",
+      rs["kept_groups"] == 7 and rs["complete"] and not rs.get("reason"), (rs["kept_groups"], rs.get("reason")))
+check("  ... and the old clip is gone", not (m.RENDERS_DIR / g3_old).exists())
+check("  ... and the stitched video is still up to date (same frames)", not rs["stitch_stale"], rs.get("stitch_why"))
+# regen's own precondition: every clip's windows are where the timeline has them
+wf_now = [int(x) for x in data_recut()["settings"]["window_frames"]]
+check("  ... so a single half can now be regenerated in place",
+      all(wf_now[g["first_window"]:g["first_window"] + g["n_windows"]] == g["windows"] for g in record()["groups"]))
+st = p._stitch({"name": "after-recut", "dir": str(TMP / "recut")})
+worst, count = matches_reference(st["path"])
+check("stitching the pieces gives the same piece, frame for frame (worst %.1f dB)" % worst,
+      worst > 30 and count == TOTAL, (worst, count))
+try:
+    p._render_split({**data_recut(), "group": 1})
+    check("a piece that is one whole window cannot be split again", False)
+except ValueError as e:
+    check("a piece that is one whole window cannot be split again", "single window" in str(e), str(e))
+# After a regen the join between two clips sits a few frames off the window
+# edge (it started early to land exactly on the next clip). Dave's own record:
+# G1 0..118 and G2 118..240 on windows of 122 and 118.
+rec_s = {"overlap": 18, "window_frames": [122, 118]}
+g1s = {"first_window": 0, "n_windows": 1, "windows": [122], "start": 0, "frames_got": 118}
+g2s = {"first_window": 1, "n_windows": 1, "windows": [118], "start": 118, "frames_got": 122}
+sp = p._split_points(rec_s, g1s, [61, 61, 118], 0)
+check("a clip whose end a regen moved 4 frames off the window edge still splits at the new windows",
+      sp["mode"] == "timeline" and sp["edges"] == [0, 61, 118] and sp["windows"] == [61, 61], sp)
+sp = p._split_points(rec_s, g2s, [122, 59, 59], 1)
+check("  ... and one whose start a regen moved 4 frames early",
+      sp["mode"] == "timeline" and sp["edges"] == [0, 63, 122] and sp["first_window"] == 1, sp)
+try:
+    p._split_points(rec_s, g1s, [122, 118], 0)
+    check("  ... while an unchanged one-window clip still cannot be split", False)
+except ValueError as e:
+    check("  ... while an unchanged one-window clip still cannot be split", "single window" in str(e), str(e))
+odd = data_for(group=1)
+odd["settings"]["window_frames"] = [30, 90, 96, 120, 72, 110]
+odd["settings"]["prompt"] = "\n\n".join("ODD=%d [/duration=1s]" % i for i in range(6))
+try:
+    p._render_split({**odd, "group": 1})
+    check("a clip whose ends are not on the new windows is not cut", False)
+except ValueError as e:
+    check("a clip whose ends are not on the new windows is not cut, and says why",
+          "start and end on the timeline" in str(e), str(e))
+
 print("\nthe run is active from first group to last:")
 seen = []
 actives = []

@@ -512,11 +512,17 @@ export function Timeline() {
             + window
           </button>
         )}
-        {s.timeline.manualWindows && s.selectedWindow != null && (
+        {s.timeline.manualWindows && (
           <button
             className="btn sm warn"
             type="button"
-            title="Remove the selected window (Delete or Backspace)."
+            data-testid="remove-window"
+            disabled={stats.frames.length < 2}
+            title={stats.frames.length < 2
+              ? "There is only one window."
+              : s.selectedWindow != null
+                ? `Remove window ${s.selectedWindow + 1}, the selected one (Delete or Backspace).`
+                : "Remove the window under the playhead. Click a window's band to pick another (then Delete or Backspace also removes it)."}
             onClick={() => s.removeSelectedWindow()}
           >
             &minus; window
