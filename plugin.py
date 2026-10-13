@@ -39,7 +39,7 @@ try:
 except ImportError:
     import compat
 
-PLUGIN_VERSION = "1.6.24"
+PLUGIN_VERSION = "1.6.25"
 PLUGIN_ID = "h3_director2"
 PLUGIN_NAME = "H3 Director"
 LOG_PREFIX = "[H3-D]"
@@ -852,6 +852,8 @@ class H3Director2Plugin(WAN2GPPlugin):
         self.request_global("switch_to_model")
         self.request_global("load_settings_from_file")
         self.request_global("goto_media_tab")
+        # so a Hybrid made by the builder shows up without a restart
+        self.request_global("refresh_model_defs")
         self.add_custom_js(_BRIDGE_JS)
         self.add_tab(tab_id=PLUGIN_ID, label=PLUGIN_NAME, component_constructor=self._build_ui)
         trace("setup_ui: tab '%s' registered (v%s)" % (PLUGIN_NAME, PLUGIN_VERSION))
@@ -1126,6 +1128,12 @@ class H3Director2Plugin(WAN2GPPlugin):
                 out = self._render_split_start(data)
             elif cmd == "split_state":
                 out = self._split_state()
+            elif cmd == "builder_scan":
+                out = self._builder_scan()
+            elif cmd == "builder_build":
+                out = self._builder_build_start(data)
+            elif cmd == "builder_state":
+                out = dict(getattr(self, "_builder_job", None) or {"state": "idle"})
             elif cmd == "diagnose":
                 out = {"report": self._diagnose()}
             elif cmd == "print_env":
@@ -4422,6 +4430,152 @@ class H3Director2Plugin(WAN2GPPlugin):
     # timeline rarely needs a new strip.
     POSTER_COUNTS = (4, 8, 16, 32, 48)
     POSTER_HEIGHT = 56          # twice the clip's height on the track: sharp on HiDPI screens
+
+    # ---------------- the Hybrid builder ----------------
+    @staticmethod
+    def _hb():
+        """The builder modules (imported only when the builder is used)."""
+        try:
+            from .hybrid_builder import builder as hb_builder, model_locator as hb_locator
+        except ImportError:
+            from hybrid_builder import builder as hb_builder, model_locator as hb_locator
+        return hb_builder, hb_locator
+
+    @staticmethod
+    def _hb_kind(name):
+        n = name.lower()
+        if "hybrid" in n:
+            return "hybrid"
+        if "fl2va" in n:
+            return "fl2va"
+        if "ref2va" in n:
+            return "ref2va"
+        return "other"
+
+    def _builder_scan(self):
+        """What the builder can work with on THIS install: Wan2GP's model
+        folders (from its own settings, first one first) and every H3 model
+        in them. Nothing is assumed about drives or folder names."""
+        _b, loc = self._hb()
+        roots = loc.checkpoint_roots_for_ui()
+        found = loc.discover_h3_checkpoints()
+        items = [{"path": str(p), "name": p.name, "folder": str(p.parent), "kind": self._hb_kind(p.name)}
+                 for p in found]
+
+        def pick(kind, stock):
+            exact = [i for i in items if i["name"].lower() == stock.lower()]
+            if exact:
+                return exact[0]["path"]
+            # a BF16 full model of that kind, before a pruned or quantised one
+            same = [i for i in items if i["kind"] == kind]
+            same.sort(key=lambda i: ("bf16" not in i["name"].lower(), "prun" in i["name"].lower(), i["name"]))
+            return same[0]["path"] if same else ""
+
+        out = {"roots": roots, "default_root": roots[0] if roots else "",
+               "wan2gp_root": str(loc.wan2gp_root()), "checkpoints": items,
+               "fl2va": pick("fl2va", loc.STOCK_FL2VA), "ref2va": pick("ref2va", loc.STOCK_REF2VA)}
+        trace("builder: %d H3 model(s) in %d Wan2GP model folder(s): %s"
+              % (len(items), len(roots), ", ".join(roots)))
+        return out
+
+    def _builder_build_start(self, data):
+        """Build a Hybrid in the background and register it with Wan2GP; the
+        page asks builder_state how it is going. A build reads two 33B
+        checkpoints, so it takes minutes and a lot of RAM."""
+        job = getattr(self, "_builder_job", None) or {}
+        if job.get("state") == "running":
+            raise ValueError("a Hybrid is already being built")
+        busy = self._busy_why()
+        if busy:
+            raise ValueError("%s - build once it has finished" % busy)
+        hb, loc = self._hb()
+        fl2va = str(data.get("fl2va") or "").strip()
+        ref2va = str(data.get("ref2va") or "").strip()
+        if not fl2va or not Path(fl2va).is_file():
+            raise ValueError("choose the FL2VA BF16 model (Rescan if the list is empty)")
+        if not ref2va or not Path(ref2va).is_file():
+            raise ValueError("choose the Ref2VA BF16 model (Rescan if the list is empty)")
+        a, b = int(data.get("start_block", 30)), int(data.get("end_block", 49))
+        if not (0 <= a <= 49 and 0 <= b <= 49 and a <= b):
+            raise ValueError("the AdaLN blocks must be between 0 and 49, start no later than end")
+        out_dir = str(data.get("save_to") or "").strip()
+        if not out_dir:
+            roots = loc.get_checkpoint_roots()
+            if not roots:
+                raise ValueError("Wan2GP has no model folder configured")
+            out_dir = str(roots[0])
+        out_dir = Path(out_dir)
+        if not out_dir.is_absolute():
+            out_dir = loc.wan2gp_root() / out_dir
+        out_dir.mkdir(parents=True, exist_ok=True)
+        spec = hb.HybridBuildSpec(base_checkpoint=fl2va, reference_checkpoint=ref2va,
+                                  start_block=a, end_block=b, include_final_adaln=bool(data.get("include_final")))
+        target = out_dir / spec.output_filename()
+        import threading
+        self._builder_job = {"state": "running", "done": 0, "total": 0, "message": "starting",
+                             "started": time.time(), "output": str(target), "error": "", "result": None}
+
+        def progress(done, total, message):
+            self._builder_job.update(done=int(done), total=int(total), message=str(message))
+
+        def work():
+            try:
+                trace("builder: building %s from %s + %s (AdaLN %d-%d%s)"
+                      % (target, Path(fl2va).name, Path(ref2va).name, a, b, ", final" if spec.include_final_adaln else ""))
+                res = hb.build_with_cache(spec, str(target), progress_cb=progress)
+                definition, model_id = self._register_hybrid_finetune(res["checkpoint"], spec)
+                refreshed = False
+                fn = getattr(self, "refresh_model_defs", None)
+                if callable(fn):
+                    try:
+                        fn()
+                        refreshed = True
+                    except Exception as exc:
+                        trace("builder: refresh_model_defs failed (%s)" % exc)
+                self._builder_job.update(state="done", message="done", result={
+                    "checkpoint": res["checkpoint"], "cached": bool(res.get("cached")),
+                    "definition": str(definition), "model_id": model_id, "recipe": spec.recipe_name,
+                    "refreshed": refreshed})
+                trace("builder: %s %s, registered as %s" % (
+                    "reused" if res.get("cached") else "built", res["checkpoint"], definition))
+            except Exception as exc:
+                trace("builder FAILED: %s" % exc)
+                self._builder_job.update(state="error", error=str(exc), message="failed")
+            finally:
+                self._builder_job["elapsed"] = round(time.time() - self._builder_job["started"], 1)
+
+        threading.Thread(target=work, name="h3d2-builder", daemon=True).start()
+        return {"ok": True, "started": True, "output": str(target)}
+
+    def _register_hybrid_finetune(self, checkpoint_path, spec):
+        """Register a built Hybrid with Wan2GP's own finetune system: a
+        finetunes/<id>.json in the running Wan2GP's folder, pointing at the
+        checkpoint by its full path, so it loads from wherever it was saved."""
+        _b, loc = self._hb()
+        finetunes = loc.wan2gp_root() / "finetunes"
+        finetunes.mkdir(parents=True, exist_ok=True)
+        ckpt = Path(checkpoint_path).resolve()
+        model_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", ckpt.stem).strip("._-") or "minimax_h3_hybrid_bf16"
+        definition_path = finetunes / ("%s.json" % model_id)
+        definition = {
+            "model": {
+                "name": ckpt.stem,
+                "architecture": "minimax_h3_hybrid",
+                "finetune_source_model": "minimax_h3_hybrid",
+                "description": "MiniMax H3 Hybrid AV BF16 - FL2VA audio conditioning with Ref2VA reference conditioning.",
+                "infos": "Built by H3 Director: the full FL2VA BF16 model with the chosen Ref2VA AdaLN blocks merged in.",
+                "URLs": [str(ckpt)],
+                # the merge is IN this file: no overlay at load time
+                "hybrid_prebuilt": True,
+                "hybrid_overlay_filename": "",
+                "hybrid_recipe": spec.recipe_name,
+                "hybrid_fingerprint": spec.fingerprint(),
+            },
+            "prompt": "Use the supplied reference images to preserve subject identity and use the supplied soundtrack as the target audio for visible lip/mouth synchronization.",
+        }
+        definition_path.write_text(json.dumps(definition, indent=2), encoding="utf-8")
+        trace("builder: registered Wan2GP finetune %s" % definition_path)
+        return definition_path, model_id
 
     def _render_poster(self, data):
         """A filmstrip of one finished group for its block on the results

@@ -192,7 +192,8 @@ export function demoSession(): SessionPayload {
       startBlock: 30,
       endBlock: 49,
       includeFinal: false,
-      saveTo: "D:\\Wan2GP\\ckpts",
+      // "" = Wan2GP's own model folder, read from Wan2GP at build time
+      saveTo: "",
       status: "Blocks 30–49 tested: reference identity holds while audio drives lip sync.",
     },
     timeline: {

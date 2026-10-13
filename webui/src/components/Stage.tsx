@@ -17,7 +17,7 @@ import {
 import { assembleWanSettings, downloadJson } from "../lib/session";
 import { AUDIO_MODE_NONE, H3, LIMITS, audioModeGap, deriveAudioMode } from "../lib/h3";
 import { registerMedia, getMedia, acceptAttr, fmtDuration, kindOf, servedUrl } from "../lib/media";
-import { request, send } from "../lib/bridge";
+import { request, send, hasParent } from "../lib/bridge";
 import { PromptBox } from "./PromptBox";
 import { Confirm } from "./Confirm";
 
@@ -2275,8 +2275,112 @@ function ExportPane() {
   );
 }
 
+interface BuilderScan {
+  roots: string[];
+  default_root: string;
+  wan2gp_root: string;
+  checkpoints: { path: string; name: string; folder: string; kind: string }[];
+  fl2va: string;
+  ref2va: string;
+}
+
+interface BuilderJob {
+  state: "idle" | "running" | "done" | "error";
+  done?: number;
+  total?: number;
+  message?: string;
+  output?: string;
+  error?: string;
+  elapsed?: number;
+  result?: { checkpoint: string; cached: boolean; definition: string; model_id: string; recipe: string; refreshed: boolean } | null;
+}
+
+/** The old built-in default, from before the folders were read from Wan2GP. */
+const LEGACY_SAVE_TO = "D:\\Wan2GP\\ckpts";
+
 function BuilderPane() {
   const s = useDirector();
+  const b = s.builder;
+  const [scan, setScan] = useState<BuilderScan | null>(null);
+  const [scanErr, setScanErr] = useState("");
+  const [job, setJob] = useState<BuilderJob | null>(null);
+  const building = job?.state === "running";
+
+  // Everything comes from the running Wan2GP: its model folders (from its own
+  // settings) and the H3 models in them. Nothing assumes a drive or a path.
+  const rescan = async () => {
+    if (!hasParent()) { setScanErr("Wan2GP is not connected."); return; }
+    setScanErr("");
+    try {
+      const r = await request<BuilderScan>("builder_scan", {}, 120000);
+      setScan(r);
+      const paths = new Set(r.checkpoints.map((c) => c.path));
+      const fix: Partial<typeof b> = {};
+      if (!paths.has(b.fl2va)) fix.fl2va = r.fl2va;
+      if (!paths.has(b.ref2va)) fix.ref2va = r.ref2va;
+      // a folder from another install (or the old built-in default) is not used
+      if (b.saveTo === LEGACY_SAVE_TO && !r.roots.includes(b.saveTo)) fix.saveTo = "";
+      if (Object.keys(fix).length) s.patchBuilder(fix);
+    } catch (e) {
+      setScanErr(String((e as Error)?.message || e));
+    }
+  };
+
+  useEffect(() => {
+    void rescan();
+    // pick up a build that is already going (the pane was closed, or the page reloaded)
+    if (hasParent()) {
+      void request<BuilderJob>("builder_state", {}, 15000).then((j) => { if (j && j.state !== "idle") setJob(j); }).catch(() => undefined);
+    }
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => {
+    if (!building) return;
+    const t = setInterval(() => {
+      void request<BuilderJob>("builder_state", {}, 15000).then((j) => {
+        if (!j) return;
+        setJob(j);
+        if (j.state === "done" && j.result) {
+          s.patchBuilder({ status: `${j.result.cached ? "Already built - reused" : "Built"}: ${j.result.checkpoint}` });
+        }
+      }).catch(() => undefined);
+    }, 1000);
+    return () => clearInterval(t);
+  }, [building]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const build = async () => {
+    try {
+      const r = await request<{ output: string }>("builder_build", {
+        fl2va: b.fl2va, ref2va: b.ref2va, start_block: b.startBlock, end_block: b.endBlock,
+        include_final: b.includeFinal, save_to: b.saveTo || "",
+      }, 60000);
+      setJob({ state: "running", done: 0, total: 0, message: "starting", output: r.output });
+    } catch (e) {
+      setJob({ state: "error", error: String((e as Error)?.message || e) });
+    }
+  };
+
+  const browse = async () => {
+    try {
+      const r = await request<{ dir?: string }>("browse_dir", {}, 180000);
+      if (r?.dir) s.patchBuilder({ saveTo: r.dir });
+    } catch { /* cancelled */ }
+  };
+
+  const items = scan?.checkpoints || [];
+  const option = (c: { path: string; name: string; folder: string }) => (
+    <option key={c.path} value={c.path}>{c.name}  [{c.folder}]</option>
+  );
+  const sourceChoices = (kind: string) => {
+    const mine = items.filter((c) => c.kind === kind);
+    const rest = items.filter((c) => c.kind !== kind && c.kind !== "hybrid");
+    return [...mine, ...rest];
+  };
+  const roots = scan?.roots || [];
+  const custom = b.saveTo && !roots.includes(b.saveTo) ? b.saveTo : "";
+  const where = b.saveTo || scan?.default_root || "";
+  const pct = job && job.total ? Math.round((100 * (job.done || 0)) / job.total) : 0;
+
   return (
     <div className="pane on">
       <div className="bar">
@@ -2286,56 +2390,84 @@ function BuilderPane() {
       <div className="card">
         <div className="two">
           <Row label="FL2VA base">
-            <select value={s.builder.fl2va} onChange={(e) => s.patchBuilder({ fl2va: e.target.value })}>
-              <option>MiniMax-H3-FL2VA_bf16</option>
+            <select data-testid="builder-fl2va" value={b.fl2va} disabled={building}
+              onChange={(e) => s.patchBuilder({ fl2va: e.target.value })}>
+              {!items.length && <option value="">{scan ? "no H3 models found" : "looking..."}</option>}
+              {sourceChoices("fl2va").map(option)}
             </select>
           </Row>
           <Row label="Ref2VA reference">
-            <select value={s.builder.ref2va} onChange={(e) => s.patchBuilder({ ref2va: e.target.value })}>
-              <option>MiniMax-H3-Ref2VA_bf16</option>
+            <select data-testid="builder-ref2va" value={b.ref2va} disabled={building}
+              onChange={(e) => s.patchBuilder({ ref2va: e.target.value })}>
+              {!items.length && <option value="">{scan ? "no H3 models found" : "looking..."}</option>}
+              {sourceChoices("ref2va").map(option)}
             </select>
           </Row>
           <Row label="AdaLN start block">
-            <input type="text" value={s.builder.startBlock} onChange={(e) => s.patchBuilder({ startBlock: Number(e.target.value) || 0 })} />
+            <input type="text" value={b.startBlock} disabled={building} onChange={(e) => s.patchBuilder({ startBlock: Number(e.target.value) || 0 })} />
           </Row>
           <Row label="AdaLN end block">
-            <input type="text" value={s.builder.endBlock} onChange={(e) => s.patchBuilder({ endBlock: Number(e.target.value) || 0 })} />
+            <input type="text" value={b.endBlock} disabled={building} onChange={(e) => s.patchBuilder({ endBlock: Number(e.target.value) || 0 })} />
           </Row>
           <Row label="Include final AdaLN">
-            <input
-              type="checkbox"
-              checked={s.builder.includeFinal}
-              onChange={(e) => s.patchBuilder({ includeFinal: e.target.checked })}
-            />
+            <input type="checkbox" checked={b.includeFinal} disabled={building}
+              onChange={(e) => s.patchBuilder({ includeFinal: e.target.checked })} />
             <span style={{ flex: 1 }} />
           </Row>
           <Row label="Save to">
-            <select value={s.builder.saveTo} onChange={(e) => s.patchBuilder({ saveTo: e.target.value })}>
-              <option>D:\Wan2GP\ckpts</option>
+            <select data-testid="builder-save-to" value={b.saveTo || ""} disabled={building}
+              title="Wan2GP's own model folders, from its settings. The first is where Wan2GP keeps what it downloads."
+              onChange={(e) => {
+                if (e.target.value === "__browse__") { void browse(); return; }
+                s.patchBuilder({ saveTo: e.target.value });
+              }}>
+              <option value="">{scan?.default_root ? `Wan2GP's model folder (${scan.default_root})` : "Wan2GP's model folder"}</option>
+              {roots.slice(1).map((r) => <option key={r} value={r}>{r}</option>)}
+              {custom && <option value={custom}>{custom}</option>}
+              <option value="__browse__">Another folder...</option>
             </select>
           </Row>
         </div>
         <Row label="">
-          <button
-            className="btn sm"
-            type="button"
-            onClick={() => s.patchBuilder({ status: "Rescanned — using the two BF16 checkpoints from the mock recipe." })}
-          >
+          <button className="btn sm" type="button" data-testid="builder-rescan" disabled={building} onClick={() => void rescan()}>
             Rescan model locations
           </button>
-          <button
-            className="btn sm"
-            type="button"
-            onClick={() =>
-              s.patchBuilder({
-                status: `Build finished — AdaLN ${s.builder.startBlock}–${s.builder.endBlock} merged into FL2VA. Register the finetune in Wan2GP to generate with it.`,
-              })
-            }
-          >
-            Build / use hybrid
+          <button className="btn sm go" type="button" data-testid="builder-build"
+            disabled={building || !b.fl2va || !b.ref2va} onClick={() => void build()}>
+            {building ? "Building..." : "Build / use hybrid"}
           </button>
         </Row>
-        <div className="note ok">{s.builder.status}</div>
+        {scanErr && <div className="note" data-testid="builder-scan-error">Could not look for the models: {scanErr}</div>}
+        {scan && (
+          <div className="note" data-testid="builder-found">
+            {items.length
+              ? `Found ${items.length} H3 model file(s) in Wan2GP's ${roots.length} model folder(s).`
+              : "No H3 models found in Wan2GP's model folders. Select MiniMax H3 FL2VA and Ref2VA once in Wan2GP so they download, then Rescan."}
+            {where ? ` The Hybrid will be saved in ${where}.` : ""}
+          </div>
+        )}
+        {building && (
+          <div className="splitstat" data-testid="builder-progress" role="status">
+            <span className="spin" aria-hidden="true" />
+            <span>{job?.message || "working"} - this reads two large models and takes several minutes</span>
+            <span className="bar"><i style={{ width: `${pct}%` }} /></span>
+          </div>
+        )}
+        {job?.state === "done" && job.result && (
+          <div className="note ok" data-testid="builder-done">
+            {job.result.cached ? "This Hybrid was already built - reused " : "Built "}<b>{job.result.checkpoint}</b>
+            {" "}and registered with Wan2GP as <b>{job.result.model_id}</b>.
+            {job.result.refreshed
+              ? " It is in the model list now (restart Wan2GP if its own model menu does not show it yet)."
+              : " Restart Wan2GP to see it in the model list."}
+          </div>
+        )}
+        {job?.state === "error" && (
+          <div className="splitstat error" data-testid="builder-error" role="alert">
+            <span>Build failed: {job.error}</span>
+          </div>
+        )}
+        {!job && <div className="note ok">{b.status}</div>}
       </div>
     </div>
   );
